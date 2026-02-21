@@ -27,7 +27,7 @@ _SYSTEM_PROMPT = """\
 You are a senior AWS Solutions Architect reviewing an AWS account scan.
 Analyze the provided infrastructure data and produce actionable recommendations.
 
-CRITICAL: You MUST respond with ONLY a valid JSON array. No markdown code blocks, no prose, no explanations.
+CRITICAL: You MUST respond with ONLY a valid JSON array. No markdown, prose, or explanations.
 Output format: [{"category":"...","title":"...","detail":"...","impact":"...","effort":"..."}]
 Each object MUST have these keys:
 - "category": one of "security", "cost", "reliability", "performance", "operational_excellence"
@@ -42,6 +42,22 @@ Example: [{"category": "security", "title": "Enable MFA", "detail": "...",
 Do NOT duplicate recommendations that match the existing rule-based findings.
 Focus on cross-cutting patterns and issues the deterministic rules might miss.
 """
+
+# JSON schema for Ollama structured output - forces valid array of recommendation objects
+_RECOMMENDATIONS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string"},
+            "title": {"type": "string"},
+            "detail": {"type": "string"},
+            "impact": {"type": "string"},
+            "effort": {"type": "string"},
+        },
+        "required": ["category", "title"],
+    },
+}
 
 _CATEGORY_CONTEXT = {
     "compute": (
@@ -125,7 +141,7 @@ class OllamaClient:
             "system": _SYSTEM_PROMPT,
             "prompt": prompt,
             "stream": False,
-            "format": "json",
+            "format": _RECOMMENDATIONS_SCHEMA,
             "options": {
                 "temperature": 0.3,
                 "num_predict": 4096,
