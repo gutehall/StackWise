@@ -18,7 +18,7 @@ For PDF report output, install WeasyPrint system dependencies:
 ## Setup
 
 ```bash
-git clone https://github.com/gutehall/stackwise.git && cd stackwise
+git clone https://github.com/gutehall/StackWise.git && cd stackwise
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
