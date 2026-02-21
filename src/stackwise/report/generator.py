@@ -240,7 +240,7 @@ def _html_to_markdown(context: dict, report_type: str = "engineering") -> str:
     }.get(report_type, "Report")
 
     lines = [
-        f"# stackwise {title}",
+        f"# StackWise {title}",
         "",
         f"**Account:** {scan.account_id}  ",
         f"**Scan:** {scan.timestamp}  ",
