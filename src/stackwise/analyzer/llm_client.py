@@ -27,7 +27,8 @@ _SYSTEM_PROMPT = """\
 You are a senior AWS Solutions Architect reviewing an AWS account scan.
 Analyze the provided infrastructure data and produce actionable recommendations.
 
-Respond ONLY with a JSON array of objects. No markdown, no explanation, no text outside the array.
+CRITICAL: You MUST respond with ONLY a valid JSON array. No markdown code blocks, no prose, no explanations.
+Output format: [{"category":"...","title":"...","detail":"...","impact":"...","effort":"..."}]
 Each object MUST have these keys:
 - "category": one of "security", "cost", "reliability", "performance", "operational_excellence"
 - "title": short summary (one sentence)
@@ -124,6 +125,7 @@ class OllamaClient:
             "system": _SYSTEM_PROMPT,
             "prompt": prompt,
             "stream": False,
+            "format": "json",
             "options": {
                 "temperature": 0.3,
                 "num_predict": 4096,
@@ -198,9 +200,16 @@ class OllamaClient:
 
         # Try direct parse first
         try:
-            data = json.loads(text)
-            if not isinstance(data, list):
-                return []
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                data = parsed
+            elif isinstance(parsed, dict):
+                # Handle wrapped format: {"recommendations": [...]} or similar
+                data = parsed.get("recommendations") or parsed.get("items") or []
+                if not isinstance(data, list):
+                    data = []
+            else:
+                data = []
         except json.JSONDecodeError:
             # Try to find a JSON array in the response (handles leading/trailing prose)
             start = text.find("[")
