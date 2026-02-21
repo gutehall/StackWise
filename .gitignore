@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Testing / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+reports/
+
+# StackWise data
+data/
+*.db
+
+# Ruff
+.ruff_cache/
+
+# Editors
+.cursor/
+.kiro/
+.vscode/
