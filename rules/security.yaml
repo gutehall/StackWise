@@ -1,0 +1,106 @@
+# StackWise security rules
+# IAM, KMS, Secrets Manager, GuardDuty, Security Hub
+
+# IAM
+- id: SEC-001
+  title: "IAM role has inline policies"
+  severity: MEDIUM
+  resource_type: role
+  service: iam
+  condition: |
+    (resource.get('InlinePoliciesCount') or 0) > 0
+  remediation: >
+    Prefer managed policies over inline policies for easier audit and reuse.
+
+- id: SEC-002
+  title: "IAM user has no MFA"
+  severity: HIGH
+  resource_type: user
+  service: iam
+  condition: |
+    not resource.get('MFADevices') or len(resource.get('MFADevices', [])) == 0
+  remediation: >
+    Enable MFA for all IAM users with console access.
+
+- id: SEC-003
+  title: "IAM user has inline policies"
+  severity: MEDIUM
+  resource_type: user
+  service: iam
+  condition: |
+    (resource.get('InlinePoliciesCount') or 0) > 0
+  remediation: >
+    Prefer managed policies over inline policies.
+
+- id: SEC-004
+  title: "IAM role has no permissions boundary"
+  severity: LOW
+  resource_type: role
+  service: iam
+  condition: |
+    not resource.get('PermissionsBoundary')
+  remediation: >
+    Use permissions boundaries to limit maximum permissions for roles.
+
+# KMS
+- id: SEC-005
+  title: "KMS key has rotation disabled"
+  severity: MEDIUM
+  resource_type: key
+  service: kms
+  condition: |
+    resource.get('KeyRotationEnabled') is not True
+  remediation: >
+    Enable automatic key rotation for KMS keys (annual for customer keys).
+
+- id: SEC-006
+  title: "KMS key is AWS managed (not customer managed)"
+  severity: INFO
+  resource_type: key
+  service: kms
+  condition: |
+    resource.get('KeyManager') == 'AWS'
+  remediation: >
+    Consider customer-managed keys for full control over key policies.
+
+# Secrets Manager
+- id: SEC-007
+  title: "Secrets Manager secret has rotation disabled"
+  severity: MEDIUM
+  resource_type: secret
+  service: secretsmanager
+  condition: |
+    resource.get('RotationEnabled') is not True
+  remediation: >
+    Enable automatic rotation for database and service credentials.
+
+- id: SEC-008
+  title: "Secrets Manager secret has no rotation configured"
+  severity: LOW
+  resource_type: secret
+  service: secretsmanager
+  condition: |
+    not resource.get('RotationRules') and not resource.get('RotationEnabled')
+  remediation: >
+    Configure rotation rules for credentials that support rotation.
+
+# GuardDuty
+- id: SEC-009
+  title: "GuardDuty detector is disabled"
+  severity: HIGH
+  resource_type: detector
+  service: guardduty
+  condition: |
+    resource.get('Status') != 'ENABLED'
+  remediation: >
+    Enable GuardDuty for threat detection across the account.
+
+- id: SEC-010
+  title: "GuardDuty has findings"
+  severity: INFO
+  resource_type: finding
+  service: guardduty
+  condition: |
+    resource.get('Severity', 0) >= 4
+  remediation: >
+    Review and remediate high-severity GuardDuty findings.

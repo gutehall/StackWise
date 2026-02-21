@@ -1,0 +1,192 @@
+# StackWise compute rules
+# Each rule is evaluated against resources of the specified resource_type.
+# `condition` is a Python expression with `resource` (the metadata dict) in scope.
+
+- id: CMP-001
+  title: "EC2 instance has a public IP address"
+  severity: MEDIUM
+  priority: 1
+  resource_type: instance
+  service: ec2
+  condition: |
+    resource.get('PublicIpAddress') is not None
+  remediation: >
+    Remove the public IP and access the instance via a bastion host, VPN,
+    or SSM Session Manager. Disable auto-assign public IP on the subnet.
+
+- id: CMP-002
+  title: "EC2 instance is not EBS-optimized"
+  severity: LOW
+  resource_type: instance
+  service: ec2
+  condition: |
+    resource.get('EbsOptimized') is False
+  remediation: >
+    Enable EBS optimization for consistent I/O performance.
+    Most current-generation instance types support it at no extra cost.
+
+- id: CMP-003
+  title: "EC2 instance has detailed monitoring disabled"
+  severity: LOW
+  resource_type: instance
+  service: ec2
+  condition: |
+    resource.get('Monitoring') == 'disabled'
+  remediation: >
+    Enable detailed monitoring for 1-minute metric granularity.
+    Cost is $3.50/month per instance.
+
+- id: CMP-004
+  title: "Lambda function uses a deprecated runtime"
+  severity: HIGH
+  priority: 1
+  resource_type: function
+  service: lambda
+  condition: |
+    resource.get('Runtime', '') in ('python3.8', 'python3.7', 'nodejs14.x', 'nodejs16.x', 'java8', 'dotnetcore3.1', 'ruby2.7', 'go1.x')
+  remediation: >
+    Upgrade to a supported runtime to continue receiving security patches.
+    See https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html
+
+- id: CMP-005
+  title: "Lambda function has default memory (128 MB)"
+  severity: INFO
+  resource_type: function
+  service: lambda
+  condition: |
+    resource.get('MemorySize') == 128
+  remediation: >
+    Profile the function with AWS Lambda Power Tuning to find the optimal
+    memory/cost setting. Default 128 MB is rarely optimal.
+
+- id: CMP-006
+  title: "Lambda function timeout exceeds 5 minutes"
+  severity: INFO
+  resource_type: function
+  service: lambda
+  condition: |
+    (resource.get('Timeout') or 0) > 300
+  remediation: >
+    Consider breaking long-running functions into Step Functions workflows
+    or moving the workload to ECS/Fargate for better observability.
+
+- id: CMP-007
+  title: "Auto Scaling Group has min = max (no scaling)"
+  severity: MEDIUM
+  resource_type: auto_scaling_group
+  service: ec2
+  condition: |
+    resource.get('MinSize') == resource.get('MaxSize') and resource.get('MinSize') is not None
+  remediation: >
+    If fixed capacity is intentional, document it. Otherwise configure
+    scaling policies to handle load variations and reduce cost.
+
+- id: CMP-008
+  title: "EC2 instance metadata service requires IMDSv1"
+  severity: MEDIUM
+  resource_type: instance
+  service: ec2
+  condition: |
+    resource.get('MetadataOptions', {}).get('HttpTokens') != 'required'
+  remediation: >
+    Require IMDSv2 to prevent SSRF attacks. Set HttpTokens to required.
+
+- id: CMP-009
+  title: "EC2 instance has no launch template"
+  severity: INFO
+  resource_type: instance
+  service: ec2
+  condition: |
+    not resource.get('LaunchTemplate')
+  remediation: >
+    Use launch templates for consistent instance configuration and versioning.
+
+- id: CMP-010
+  title: "Lambda function has no VPC configuration"
+  severity: INFO
+  resource_type: function
+  service: lambda
+  condition: |
+    not resource.get('VpcConfig') or not resource.get('VpcConfig', {}).get('VpcId')
+  remediation: >
+    Place Lambda in VPC if it needs to access private resources.
+
+- id: CMP-011
+  title: "Lambda function has no dead-letter queue"
+  severity: LOW
+  resource_type: function
+  service: lambda
+  condition: |
+    not resource.get('DeadLetterConfig') or not resource.get('DeadLetterConfig', {}).get('TargetArn')
+  remediation: >
+    Configure a DLQ to capture failed invocations for debugging.
+
+- id: CMP-012
+  title: "Lambda function has no reserved concurrency"
+  severity: INFO
+  resource_type: function
+  service: lambda
+  condition: |
+    resource.get('ReservedConcurrentExecutions') is None
+  remediation: >
+    Set reserved concurrency to prevent one function from consuming all account concurrency.
+
+- id: CMP-013
+  title: "Auto Scaling Group has no health check type"
+  severity: LOW
+  resource_type: auto_scaling_group
+  service: ec2
+  condition: |
+    not resource.get('HealthCheckType') or resource.get('HealthCheckType') == 'EC2'
+  remediation: >
+    Use ELB health check for load balancer-backed ASGs.
+
+- id: CMP-014
+  title: "ECS service uses EC2 launch type"
+  severity: INFO
+  resource_type: service
+  service: ecs
+  condition: |
+    resource.get('launchType') == 'EC2'
+  remediation: >
+    Consider Fargate for simpler operations and no EC2 management.
+
+- id: CMP-015
+  title: "ECS task definition has low CPU/memory"
+  severity: INFO
+  resource_type: task_definition
+  service: ecs
+  condition: |
+    (resource.get('cpu') or 0) < 256 or (resource.get('memory') or 0) < 512
+  remediation: >
+    Ensure task has adequate CPU and memory for the workload.
+
+- id: CMP-016
+  title: "EKS cluster has public endpoint enabled"
+  severity: MEDIUM
+  resource_type: cluster
+  service: eks
+  condition: |
+    resource.get('resourcesVpcConfig', {}).get('endpointPublicAccess') is True
+  remediation: >
+    Disable public endpoint and use private access for production clusters.
+
+- id: CMP-017
+  title: "EKS cluster uses deprecated Kubernetes version"
+  severity: HIGH
+  resource_type: cluster
+  service: eks
+  condition: |
+    resource.get('version', '').startswith('1.2') or resource.get('version', '').startswith('1.21')
+  remediation: >
+    Upgrade to a supported Kubernetes version. See EKS version support policy.
+
+- id: CMP-018
+  title: "EKS node group has no scaling config"
+  severity: LOW
+  resource_type: nodegroup
+  service: eks
+  condition: |
+    not resource.get('scalingConfig') or resource.get('scalingConfig', {}).get('minSize') == resource.get('scalingConfig', {}).get('maxSize')
+  remediation: >
+    Configure scaling to handle workload variations.

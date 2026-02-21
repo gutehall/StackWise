@@ -1,0 +1,55 @@
+# StackWise observability rules
+# CloudWatch, Logs
+
+# CloudWatch
+- id: OBS-001
+  title: "CloudWatch alarm is in INSUFFICIENT_DATA state"
+  severity: LOW
+  resource_type: alarm
+  service: cloudwatch
+  condition: |
+    resource.get('StateValue') == 'INSUFFICIENT_DATA'
+  remediation: >
+    Check alarm configuration and ensure metrics are being published.
+
+- id: OBS-002
+  title: "CloudWatch alarm has no actions configured"
+  severity: MEDIUM
+  resource_type: alarm
+  service: cloudwatch
+  condition: |
+    (not resource.get('AlarmActions') or len(resource.get('AlarmActions', [])) == 0) and
+    (not resource.get('OKActions') or len(resource.get('OKActions', [])) == 0)
+  remediation: >
+    Configure SNS or other actions for alarm state changes.
+
+- id: OBS-003
+  title: "CloudWatch alarm uses single evaluation period"
+  severity: LOW
+  resource_type: alarm
+  service: cloudwatch
+  condition: |
+    (resource.get('EvaluationPeriods') or 1) < 2
+  remediation: >
+    Use multiple evaluation periods to reduce false positives.
+
+# Logs
+- id: OBS-004
+  title: "Log group has no retention period (never expire)"
+  severity: MEDIUM
+  resource_type: log_group
+  service: logs
+  condition: |
+    resource.get('retentionInDays') is None
+  remediation: >
+    Set a retention period to control storage costs and comply with retention policies.
+
+- id: OBS-005
+  title: "Log group has no encryption"
+  severity: LOW
+  resource_type: log_group
+  service: logs
+  condition: |
+    not resource.get('kmsKeyId')
+  remediation: >
+    Enable KMS encryption for sensitive log data.

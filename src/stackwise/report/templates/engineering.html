@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>StackWise Engineering Report — {{ scan.account_id }}</title>
+<link rel="stylesheet" href="static/report.css" type="text/css">
+<style>
+  :root {
+    --critical: #dc2626;
+    --high: #ea580c;
+    --medium: #ca8a04;
+    --low: #2563eb;
+    --info: #6b7280;
+    --bg: #ffffff;
+    --fg: #1f2937;
+    --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    color: var(--fg);
+    background: var(--bg);
+    padding: 2cm;
+  }
+  h1 { font-size: 1.6em; margin-bottom: 0.3em; }
+  h2 { font-size: 1.3em; margin-top: 1.5em; margin-bottom: 0.5em; border-bottom: 2px solid var(--border); padding-bottom: 0.2em; }
+  h3 { font-size: 1.1em; margin-top: 1em; margin-bottom: 0.3em; }
+  .meta { color: var(--info); font-size: 0.9em; margin-bottom: 1.5em; }
+  .meta span { margin-right: 2em; }
+
+  /* Summary boxes */
+  .summary-grid { display: flex; gap: 1em; margin-bottom: 1.5em; flex-wrap: wrap; }
+  .summary-box {
+    flex: 1; min-width: 120px; padding: 0.8em;
+    border: 1px solid var(--border); border-radius: 6px; text-align: center;
+  }
+  .summary-box .number { font-size: 2em; font-weight: 700; }
+  .summary-box .label { font-size: 0.8em; color: var(--info); }
+
+  /* Findings table */
+  table { width: 100%; border-collapse: collapse; margin-bottom: 1em; font-size: 0.9em; }
+  th, td { padding: 0.5em 0.7em; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: #f9fafb; font-weight: 600; }
+  tr:hover { background: #f3f4f6; }
+
+  .badge {
+    display: inline-block; padding: 0.15em 0.5em; border-radius: 4px;
+    font-size: 0.75em; font-weight: 600; color: white;
+  }
+  .badge-CRITICAL { background: var(--critical); }
+  .badge-HIGH { background: var(--high); }
+  .badge-MEDIUM { background: var(--medium); color: #1f2937; }
+  .badge-LOW { background: var(--low); }
+  .badge-INFO { background: var(--info); }
+
+  .remediation { font-size: 0.85em; color: #4b5563; margin-top: 0.3em; }
+
+  /* Recommendations */
+  .rec-card {
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 0.8em; margin-bottom: 0.8em;
+  }
+  .rec-card h4 { font-size: 0.95em; margin-bottom: 0.3em; }
+  .rec-meta { font-size: 0.8em; color: var(--info); }
+
+  /* Print */
+  @media print {
+    body { padding: 1cm; }
+    .no-print { display: none; }
+  }
+  @page {
+    size: A4;
+    margin: 1.5cm;
+    @bottom-center { content: "StackWise v0.1.0 — Page " counter(page); font-size: 8pt; color: #9ca3af; }
+  }
+</style>
+</head>
+<body>
+
+<h1>StackWise Engineering Report</h1>
+<div class="meta">
+  <span><strong>Account:</strong> {{ scan.account_id }}</span>
+  <span><strong>Scan:</strong> {{ scan.timestamp }}</span>
+  <span><strong>Regions:</strong> {{ scan.regions | join(', ') }}</span>
+</div>
+
+<!-- Summary -->
+<div class="summary-grid">
+  <div class="summary-box">
+    <div class="number">{{ summary.resources }}</div>
+    <div class="label">Resources</div>
+  </div>
+  {% for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'] %}
+  <div class="summary-box">
+    <div class="number" style="color: var(--{{ sev | lower }});">{{ summary.findings.get(sev, 0) }}</div>
+    <div class="label">{{ sev }}</div>
+  </div>
+  {% endfor %}
+  <div class="summary-box">
+    <div class="number">{{ summary.recommendations }}</div>
+    <div class="label">AI Recs</div>
+  </div>
+</div>
+
+<!-- Resource Inventory -->
+<h2>Resource Inventory</h2>
+{% for service, res_list in resources_by_service.items() %}
+<h3>{{ service }} ({{ res_list | length }})</h3>
+<table>
+  <thead>
+    <tr><th>ID</th><th>Type</th><th>Region</th></tr>
+  </thead>
+  <tbody>
+    {% for r in res_list %}
+    <tr>
+      <td><code>{{ r.resource_id }}</code></td>
+      <td>{{ r.resource_type }}</td>
+      <td>{{ r.region }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endfor %}
+
+<!-- Findings -->
+<h2>Findings</h2>
+{% if findings %}
+<table>
+  <thead>
+    <tr><th>Severity</th><th>Rule</th><th>Title</th><th>Detail</th></tr>
+  </thead>
+  <tbody>
+    {% for f in findings %}
+    <tr>
+      <td><span class="badge badge-{{ f.severity }}">{{ f.severity }}</span></td>
+      <td><code>{{ f.rule_id or '—' }}</code></td>
+      <td>{{ f.title }}</td>
+      <td>
+        {{ f.detail or '' }}
+        {% if f.remediation %}
+        <div class="remediation"><strong>Fix:</strong> {{ f.remediation }}</div>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No findings detected.</p>
+{% endif %}
+
+<!-- Recommendations -->
+<h2>AI Recommendations</h2>
+{% if recommendations %}
+{% for r in recommendations %}
+<div class="rec-card">
+  <h4>[{{ r.category }}] {{ r.title }}</h4>
+  {% if r.detail %}<p>{{ r.detail }}</p>{% endif %}
+  <div class="rec-meta">
+    {% if r.impact %}Impact: <strong>{{ r.impact }}</strong>{% endif %}
+    {% if r.effort %} · Effort: <strong>{{ r.effort }}</strong>{% endif %}
+    · Source: {{ r.source }}
+  </div>
+</div>
+{% endfor %}
+{% else %}
+<p>No AI recommendations generated (Ollama may not have been available).</p>
+{% endif %}
+
+</body>
+</html>

@@ -1,0 +1,187 @@
+# StackWise data rules
+# S3, RDS, DynamoDB, EFS, ElastiCache
+
+# S3
+- id: DAT-001
+  title: "S3 bucket has versioning disabled"
+  severity: MEDIUM
+  resource_type: bucket
+  service: s3
+  condition: |
+    (resource.get('Versioning') or {}).get('Status') != 'Enabled'
+  remediation: >
+    Enable versioning to protect against accidental deletion and enable point-in-time recovery.
+
+- id: DAT-002
+  title: "S3 bucket has no default encryption"
+  severity: HIGH
+  resource_type: bucket
+  service: s3
+  condition: |
+    not (resource.get('ServerSideEncryptionConfiguration') or {}).get('Rules')
+  remediation: >
+    Enable default encryption (SSE-S3 or SSE-KMS) for data at rest.
+
+- id: DAT-003
+  title: "S3 bucket has public access block disabled"
+  severity: HIGH
+  resource_type: bucket
+  service: s3
+  condition: |
+    not (resource.get('PublicAccessBlock') or {}).get('BlockPublicAcls')
+  remediation: >
+    Enable Block Public Access to prevent accidental public exposure.
+
+- id: DAT-004
+  title: "S3 bucket has no lifecycle policy"
+  severity: LOW
+  resource_type: bucket
+  service: s3
+  condition: |
+    not resource.get('LifecycleRules') or len(resource.get('LifecycleRules', [])) == 0
+  remediation: >
+    Add lifecycle rules to transition or expire objects and reduce storage costs.
+
+# RDS
+- id: DAT-005
+  title: "RDS instance is single-AZ"
+  severity: MEDIUM
+  resource_type: db_instance
+  service: rds
+  condition: |
+    resource.get('MultiAZ') is not True
+  remediation: >
+    Enable Multi-AZ for production databases to improve availability.
+
+- id: DAT-006
+  title: "RDS instance has encryption disabled"
+  severity: HIGH
+  resource_type: db_instance
+  service: rds
+  condition: |
+    resource.get('StorageEncrypted') is not True
+  remediation: >
+    Enable encryption at rest for RDS storage.
+
+- id: DAT-007
+  title: "RDS instance is publicly accessible"
+  severity: HIGH
+  resource_type: db_instance
+  service: rds
+  condition: |
+    resource.get('PubliclyAccessible') is True
+  remediation: >
+    Disable public accessibility; access via VPC or VPN.
+
+- id: DAT-008
+  title: "RDS instance uses deprecated engine version"
+  severity: MEDIUM
+  resource_type: db_instance
+  service: rds
+  condition: |
+    resource.get('Engine', '').startswith('mysql') and (resource.get('EngineVersion', '') or '').startswith('5.')
+  remediation: >
+    Upgrade to a supported engine version for security patches.
+
+- id: DAT-009
+  title: "RDS cluster is single-AZ"
+  severity: MEDIUM
+  resource_type: db_cluster
+  service: rds
+  condition: |
+    resource.get('MultiAZ') is not True
+  remediation: >
+    Enable Multi-AZ for Aurora clusters for high availability.
+
+- id: DAT-010
+  title: "RDS cluster has encryption disabled"
+  severity: HIGH
+  resource_type: db_cluster
+  service: rds
+  condition: |
+    resource.get('StorageEncrypted') is not True
+  remediation: >
+    Enable encryption at rest for Aurora storage.
+
+# DynamoDB
+- id: DAT-011
+  title: "DynamoDB table has point-in-time recovery disabled"
+  severity: MEDIUM
+  resource_type: table
+  service: dynamodb
+  condition: |
+    resource.get('PointInTimeRecoveryDescription', {}).get('PointInTimeRecoveryStatus') != 'ENABLED'
+  remediation: >
+    Enable point-in-time recovery for backup and restore capability.
+
+- id: DAT-012
+  title: "DynamoDB table has no server-side encryption"
+  severity: HIGH
+  resource_type: table
+  service: dynamodb
+  condition: |
+    not resource.get('SSEDescription') or resource.get('SSEDescription', {}).get('Status') != 'ENABLED'
+  remediation: >
+    Enable encryption at rest for DynamoDB tables.
+
+- id: DAT-013
+  title: "DynamoDB table uses provisioned capacity with low utilization"
+  severity: LOW
+  resource_type: table
+  service: dynamodb
+  condition: |
+    resource.get('BillingModeSummary', {}).get('BillingMode') == 'PROVISIONED'
+  remediation: >
+    Consider on-demand mode for unpredictable workloads to reduce cost.
+
+# EFS
+- id: DAT-014
+  title: "EFS file system has encryption disabled"
+  severity: HIGH
+  resource_type: file_system
+  service: efs
+  condition: |
+    resource.get('Encrypted') is not True
+  remediation: >
+    Enable encryption at rest for EFS file systems.
+
+- id: DAT-015
+  title: "EFS file system has no lifecycle policy"
+  severity: LOW
+  resource_type: file_system
+  service: efs
+  condition: |
+    not resource.get('LifeCycleState') or resource.get('LifeCycleState') == 'available'
+  remediation: >
+    Consider lifecycle policies to transition infrequently accessed files to Infrequent Access.
+
+# ElastiCache
+- id: DAT-016
+  title: "ElastiCache cluster is single-node (no replication)"
+  severity: MEDIUM
+  resource_type: cache_cluster
+  service: elasticache
+  condition: |
+    not resource.get('ReplicationGroupId')
+  remediation: >
+    Use replication groups for high availability and failover.
+
+- id: DAT-017
+  title: "ElastiCache cluster has encryption disabled"
+  severity: HIGH
+  resource_type: cache_cluster
+  service: elasticache
+  condition: |
+    resource.get('AtRestEncryptionEnabled') is not True
+  remediation: >
+    Enable encryption at rest for ElastiCache.
+
+- id: DAT-018
+  title: "ElastiCache replication group has encryption disabled"
+  severity: HIGH
+  resource_type: replication_group
+  service: elasticache
+  condition: |
+    resource.get('AtRestEncryptionEnabled') is not True
+  remediation: >
+    Enable encryption at rest for ElastiCache replication groups.

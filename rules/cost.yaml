@@ -1,0 +1,32 @@
+# StackWise cost rules
+# Cost Explorer, Compute Optimizer, Tagging
+
+- id: CST-001
+  title: "Resource has no cost allocation tags"
+  severity: LOW
+  resource_type: tagged_resource
+  service: resourcegroupstaggingapi
+  condition: |
+    not resource.get('Tags') or len(resource.get('Tags', [])) == 0
+  remediation: >
+    Add cost allocation tags (e.g. Environment, Project) for cost tracking.
+
+- id: CST-002
+  title: "Compute Optimizer recommends rightsizing"
+  severity: INFO
+  resource_type: ec2_recommendation
+  service: compute-optimizer
+  condition: |
+    resource.get('RecommendationSourceType') == 'Ec2Instance'
+  remediation: >
+    Review Compute Optimizer recommendations for EC2 rightsizing.
+
+- id: CST-003
+  title: "Lambda has Compute Optimizer recommendation"
+  severity: INFO
+  resource_type: lambda_recommendation
+  service: compute-optimizer
+  condition: |
+    resource.get('RecommendationSourceType') == 'LambdaFunction'
+  remediation: >
+    Review Compute Optimizer recommendations for Lambda memory optimization.

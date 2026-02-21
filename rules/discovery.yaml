@@ -1,0 +1,22 @@
+# StackWise discovery rules
+# Config, Resource Groups Tagging
+
+- id: DSC-001
+  title: "AWS Config recorder is not recording"
+  severity: MEDIUM
+  resource_type: recorder
+  service: config
+  condition: |
+    resource.get('recording') is not True
+  remediation: >
+    Enable AWS Config recording for compliance and drift detection.
+
+- id: DSC-002
+  title: "Resource is untagged"
+  severity: LOW
+  resource_type: tagged_resource
+  service: resourcegroupstaggingapi
+  condition: |
+    not resource.get('Tags') or len(resource.get('Tags', [])) == 0
+  remediation: >
+    Add tags for resource discovery and cost allocation.

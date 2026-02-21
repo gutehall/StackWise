@@ -1,0 +1,129 @@
+# StackWise network rules
+# VPC, Security Groups, ELB, NAT Gateway, API Gateway
+
+# VPC
+- id: NET-001
+  title: "VPC is the default VPC"
+  severity: LOW
+  resource_type: vpc
+  service: ec2
+  condition: |
+    resource.get('IsDefault') is True
+  remediation: >
+    Avoid using the default VPC for production; create dedicated VPCs.
+
+- id: NET-002
+  title: "VPC has no flow logs"
+  severity: MEDIUM
+  resource_type: vpc
+  service: ec2
+  condition: |
+    not resource.get('FlowLogsEnabled') and not resource.get('FlowLogs')
+  remediation: >
+    Enable VPC Flow Logs for network traffic monitoring and troubleshooting.
+
+# Security Groups
+- id: NET-003
+  title: "Security group allows 0.0.0.0/0 on SSH (port 22)"
+  severity: HIGH
+  resource_type: security_group
+  service: ec2
+  condition: |
+    any(
+      (perm.get('FromPort') == 22 or perm.get('ToPort') == 22) and
+      any(ipr.get('CidrIp') == '0.0.0.0/0' for ipr in (perm.get('IpRanges') or []))
+      for perm in (resource.get('IpPermissions') or [])
+    )
+  remediation: >
+    Restrict SSH access to specific IP ranges or use SSM Session Manager.
+
+- id: NET-004
+  title: "Security group allows 0.0.0.0/0 on RDP (port 3389)"
+  severity: HIGH
+  resource_type: security_group
+  service: ec2
+  condition: |
+    any(
+      (perm.get('FromPort') == 3389 or perm.get('ToPort') == 3389) and
+      any(ipr.get('CidrIp') == '0.0.0.0/0' for ipr in (perm.get('IpRanges') or []))
+      for perm in (resource.get('IpPermissions') or [])
+    )
+  remediation: >
+    Restrict RDP access to specific IP ranges or use a bastion host.
+
+- id: NET-005
+  title: "Security group allows unrestricted ingress (0.0.0.0/0)"
+  severity: MEDIUM
+  resource_type: security_group
+  service: ec2
+  condition: |
+    any(
+      ipr.get('CidrIp') == '0.0.0.0/0' or ipr.get('CidrIpv6') == '::/0'
+      for perm in (resource.get('IpPermissions') or [])
+      for ipr in (perm.get('IpRanges') or []) + (perm.get('Ipv6Ranges') or [])
+    )
+  remediation: >
+    Restrict ingress to minimum required CIDR blocks.
+
+# ELB
+- id: NET-006
+  title: "Load balancer has access logging disabled"
+  severity: LOW
+  resource_type: load_balancer
+  service: elbv2
+  condition: |
+    not any(a.get('Key') == 'access_logs.s3.enabled' and a.get('Value') == 'true' for a in (resource.get('Attributes') or []))
+  remediation: >
+    Enable access logs for audit and troubleshooting.
+
+- id: NET-007
+  title: "Load balancer listener uses HTTP only"
+  severity: MEDIUM
+  resource_type: load_balancer
+  service: elbv2
+  condition: |
+    resource.get('Scheme') == 'http'
+  remediation: >
+    Use HTTPS listeners with ACM certificates for encrypted traffic.
+
+- id: NET-008
+  title: "Load balancer has no deletion protection"
+  severity: LOW
+  resource_type: load_balancer
+  service: elbv2
+  condition: |
+    not any(a.get('Key') == 'deletion_protection.enabled' and a.get('Value') == 'true' for a in (resource.get('Attributes') or []))
+  remediation: >
+    Enable deletion protection for production load balancers.
+
+# NAT Gateway
+- id: NET-009
+  title: "NAT Gateway is in use (consider cost optimization)"
+  severity: INFO
+  resource_type: nat_gateway
+  service: ec2
+  condition: |
+    resource.get('State') == 'available'
+  remediation: >
+    Consider VPC Lattice or PrivateLink for private connectivity to reduce NAT costs.
+
+# API Gateway
+- id: NET-010
+  title: "API Gateway REST API has no throttling configured"
+  severity: LOW
+  resource_type: rest_api
+  service: apigateway
+  condition: |
+    not resource.get('Throttle', {}).get('rateLimit') and not resource.get('Throttle', {}).get('burstLimit')
+  remediation: >
+    Configure throttling to protect against abuse and control costs.
+
+- id: NET-011
+  title: "API Gateway REST API has no API key requirement"
+  severity: INFO
+  resource_type: rest_api
+  service: apigateway
+  condition: |
+    not resource.get('ApiKeySource') or resource.get('ApiKeySource') == 'HEADER'
+  remediation: >
+    Consider API keys or IAM auth for internal APIs to track usage.

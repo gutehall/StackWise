@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>StackWise Architecture Report — {{ scan.account_id }}</title>
+<link rel="stylesheet" href="static/report.css" type="text/css">
+<style>
+  :root {
+    --critical: #dc2626;
+    --high: #ea580c;
+    --medium: #ca8a04;
+    --low: #2563eb;
+    --info: #6b7280;
+    --bg: #ffffff;
+    --fg: #1f2937;
+    --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Consolas", monospace;
+    font-size: 10pt;
+    line-height: 1.5;
+    color: var(--fg);
+    background: var(--bg);
+    padding: 2cm;
+  }
+  h1 { font-size: 1.8em; margin-bottom: 0.3em; }
+  h2 { font-size: 1.3em; margin-top: 1.5em; margin-bottom: 0.5em; border-bottom: 2px solid var(--border); padding-bottom: 0.2em; }
+  .meta { color: var(--info); font-size: 0.9em; margin-bottom: 1.5em; }
+  .meta span { margin-right: 2em; }
+
+  .topology-block {
+    font-family: "Consolas", "Monaco", monospace;
+    font-size: 9pt;
+    background: #f9fafb;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1em;
+    margin: 1em 0;
+    white-space: pre-wrap;
+    overflow-x: auto;
+  }
+  .topology-region { font-weight: 700; color: var(--low); margin-bottom: 0.5em; }
+  .topology-service { font-weight: 600; color: #059669; margin-left: 1em; margin-top: 0.5em; }
+  .topology-resource { margin-left: 2em; color: var(--fg); }
+  .topology-resource code { font-size: 0.9em; }
+
+  .summary-inline { display: flex; gap: 2em; margin-bottom: 1em; flex-wrap: wrap; }
+  .summary-inline span { color: var(--info); font-size: 0.9em; }
+
+  @media print {
+    body { padding: 1cm; }
+    .no-print { display: none; }
+  }
+  @page {
+    size: A4 landscape;
+    margin: 1.5cm;
+    @bottom-center { content: "StackWise Architecture Report — Page " counter(page); font-size: 8pt; color: #9ca3af; }
+  }
+</style>
+</head>
+<body>
+
+<h1>StackWise Architecture Report</h1>
+<div class="meta">
+  <span><strong>Account:</strong> {{ scan.account_id }}</span>
+  <span><strong>Scan:</strong> {{ scan.timestamp }}</span>
+  <span><strong>Regions:</strong> {{ scan.regions | join(', ') }}</span>
+</div>
+
+<div class="summary-inline">
+  <span><strong>{{ summary.resources }}</strong> resources</span>
+  <span><strong>{{ topology | length }}</strong> regions</span>
+  <span><strong>{{ total_findings }}</strong> findings</span>
+</div>
+
+<!-- Text-based topology by region -->
+<h2>Infrastructure Topology</h2>
+<p>Resource inventory grouped by region and service. Use this view to understand account layout.</p>
+
+{% for region, services in topology.items() %}
+<div class="topology-block">
+<span class="topology-region">[Region: {{ region }}]</span>
+{% for service, res_list in services.items() %}
+<span class="topology-service">{{ service }}</span>
+{% for r in res_list %}
+<div class="topology-resource">  ├── <code>{{ r.resource_id }}</code> ({{ r.resource_type }})</div>
+{% endfor %}
+{% endfor %}
+</div>
+{% endfor %}
+
+<!-- Connectivity hints (when metadata available) -->
+<h2>Notable Connections</h2>
+<p>Inferred from resource metadata (VpcId, SubnetId).</p>
+<div class="topology-block">
+{% if connections %}
+{% for res_id, vpc_id, subnet_id in connections %}
+EC2 {{ res_id }} → VPC {{ vpc_id }}{% if subnet_id %} ({{ subnet_id }}){% endif %}
+{% endfor %}
+{% else %}
+No VPC connectivity metadata available. Run full scan with network module for richer topology.
+{% endif %}
+</div>
+
+</body>
+</html>
