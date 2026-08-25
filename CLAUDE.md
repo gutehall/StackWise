@@ -37,6 +37,14 @@ stackwise list-scans
 CI (`.github/workflows/ci.yml`) runs `pytest -v --cov=...` and `ruff check src/ tests/` on
 Python 3.11 and 3.12, Ubuntu and macOS. Match that before considering work done.
 
+## Releases
+
+Tagging is manual — nothing auto-tags on merge to main. Run the `/release` skill after landing a
+bigger chunk of work (a feature, a batch of fixes, anything a user would want to pin to) to cut a
+GitHub release and bump `CHANGELOG.md`. `.github/workflows/docker.yml` reacts to pushed `v*` tags
+by building and pushing a matching `ghcr.io/gutehall/stackwise` image tag — releasing is what
+makes that happen, not the other way around.
+
 AWS calls in tests are mocked with `moto` (`@mock_aws`) or `unittest.mock` — never hit real AWS.
 `tests/conftest.py` sets fake AWS credentials via env vars for every test automatically and
 provides `settings` (temp-dir `Settings`) and `scan_db` (temp `ScanDB`) fixtures.
