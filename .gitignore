@@ -34,3 +34,6 @@ data/
 .cursor/
 .kiro/
 .vscode/
+
+# Remember plugin (local session memory)
+.remember/
