@@ -2,7 +2,14 @@
 
 AWS infrastructure scanner with local AI-powered recommendations.
 
-Scans your AWS account, analyzes the infrastructure using a local LLM (via Ollama), and generates engineering reports — all without sending data to the cloud.
+StackWise scans an AWS account read-only, checks every resource against a built-in rule set
+(security, cost, reliability, performance), and — if [Ollama](https://ollama.com) is running —
+asks a local LLM for cross-cutting recommendations the rules miss. Nothing leaves the machine.
+
+Pipeline: `scan` (inventory compute/data/network/security/observability/cost resources into a
+SQLite file) → `analyze` (rules + optional LLM) → `report` (HTML/PDF/Markdown/JSON, in
+engineering/executive/architecture flavors). `stackwise run` does all three in one command, and
+`stackwise diff` shows drift between any two scans.
 
 ## Prerequisites
 
