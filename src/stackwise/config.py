@@ -27,7 +27,7 @@ class Severity(StrEnum):
 ALL_MODULES = ["compute", "data", "network", "security", "observability", "cost", "discovery"]
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "qwen2.5:14b"
+DEFAULT_MODEL = "qwen3:14b"
 DEFAULT_REGIONS = ["us-east-1"]
 
 

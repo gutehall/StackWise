@@ -27,7 +27,7 @@ pip install -e .
 To use Ollama for AI-enriched recommendations:
 
 ```bash
-ollama pull qwen2.5:14b
+ollama pull qwen3:14b
 ```
 
 StackWise talks to Ollama's REST API at `http://localhost:11434` by default. Override with:

@@ -270,7 +270,7 @@ aws ecs run-task \
 | `AWS_DEFAULT_REGION` | Default region for SDK | `eu-west-1` |
 | `STACKWISE_DATA_DIR` | Scan DB and metadata directory | `/data` |
 | `STACKWISE_REGIONS` | Comma-separated regions to scan | `eu-west-1,us-east-1` |
-| `STACKWISE_MODEL` | Ollama model (if using LLM) | `qwen2.5:14b` |
+| `STACKWISE_MODEL` | Ollama model (if using LLM) | `qwen3:14b` |
 | `OLLAMA_HOST` | Ollama API URL (if using LLM) | `http://localhost:11434` |
 | `STACKWISE_SCAN_MAX_WORKERS` | Parallel regions per scanner | `4` |
 
@@ -281,7 +281,7 @@ aws ecs run-task \
 By default, stackwise uses **Ollama** for AI-enriched recommendations when available. On EC2/ECS:
 
 - **Rules-only**: No Ollama. Add `--engine rules-only` to the command or ensure Ollama is not installed. Fastest, no extra dependencies.
-- **With Ollama**: Run Ollama as a sidecar or on the same host. Requires more memory (e.g. 4 GB+ for `qwen2.5:14b`). For ECS, use a multi-container task with an Ollama sidecar and `OLLAMA_HOST=http://localhost:11434`.
+- **With Ollama**: Run Ollama as a sidecar or on the same host. Requires more memory (e.g. 4 GB+ for `qwen3:14b`). For ECS, use a multi-container task with an Ollama sidecar and `OLLAMA_HOST=http://localhost:11434`.
 
 For most scheduled/CI use cases, **rules-only** is sufficient and keeps resource usage low.
 
