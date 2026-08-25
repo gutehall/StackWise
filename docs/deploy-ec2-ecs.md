@@ -2,6 +2,19 @@
 
 This guide covers deploying StackWise as a scheduled job on **Amazon EC2** or **Amazon ECS**. Both options use IAM roles for credentials (no AWS profile files required) and are suitable for automated scans in CI/CD or scheduled infrastructure audits.
 
+> **Fully automated, single-instance option:** [`docs/stackwise-ec2.yaml`](stackwise-ec2.yaml) is a one-shot CloudFormation template — one EC2 instance, IAM role, and a UserData script that installs Python, clones StackWise, installs Ollama, pulls the model, and sets up a systemd timer, all in one launch. No Docker, no manual steps. Deploy with:
+>
+> ```bash
+> aws cloudformation create-stack \
+>   --stack-name stackwise \
+>   --template-body file://docs/stackwise-ec2.yaml \
+>   --capabilities CAPABILITY_IAM \
+>   --parameters ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
+>                ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx
+> ```
+>
+> The manual EC2/ECS walkthroughs below are for customizing beyond what that template covers (Docker-based deploys, ECS/Fargate, EFS/S3 persistence options).
+
 ## Overview
 
 | Aspect | EC2 | ECS |

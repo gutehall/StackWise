@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Single self-contained EC2 instance that runs StackWise end to end: Python,
+  StackWise itself (cloned from GitHub), and Ollama + model are all installed
+  on the instance at boot via UserData. No ECS, no container registry, no
+  external orchestration. A systemd timer re-runs `stackwise run` on a
+  schedule; reports land in /opt/stackwise/reports (and optionally sync to
+  S3). Access is via AWS Systems Manager Session Manager — no SSH port is
+  opened.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the instance into.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet with outbound internet access (IGW or NAT) — needed to reach GitHub, PyPI, and ollama.com.
+
+  InstanceType:
+    Type: String
+    Default: m6i.2xlarge
+    Description: >
+      Needs enough RAM to hold the Ollama model in memory alongside the OS
+      (8 vCPU / 32 GiB comfortably runs a 14b q4 model). Use an arm64 type
+      (e.g. m7g.2xlarge) only if you also override AmiId with an arm64 AMI.
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 AMI (x86_64 by default — override for arm64 instance types).
+
+  VolumeSizeGiB:
+    Type: Number
+    Default: 60
+    Description: Root EBS volume size — must fit the OS, StackWise venv, and the Ollama model weights.
+
+  KeyPairName:
+    Type: String
+    Default: ""
+    Description: Optional EC2 key pair for SSH fallback. Leave blank to rely on SSM Session Manager only (recommended).
+
+  SshAllowedCidr:
+    Type: String
+    Default: ""
+    Description: CIDR allowed to SSH in. Only used if KeyPairName is set.
+
+  OllamaModel:
+    Type: String
+    Default: qwen3:14b
+    Description: Ollama model pulled at boot for LLM-enriched recommendations.
+
+  ScanRegions:
+    Type: String
+    Default: us-east-1
+    Description: Comma-separated AWS regions to scan (us-east-1 is always included by StackWise for global services).
+
+  ScanModules:
+    Type: String
+    Default: "compute,data,network,security,observability,cost,discovery"
+    Description: Comma-separated StackWise scanner modules to run.
+
+  SkipCostExplorer:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set true to skip Cost Explorer (ce:GetCostAndUsage bills $0.01/request).
+
+  ScheduleOnCalendar:
+    Type: String
+    Default: "*-*-* 02:00:00"
+    Description: systemd OnCalendar expression for the recurring scan (default daily at 02:00 instance-local time).
+
+  ReportsBucketName:
+    Type: String
+    Default: ""
+    Description: Optional S3 bucket to sync generated reports to after each run. Leave blank to keep reports on the instance only.
+
+  StackWiseGitRef:
+    Type: String
+    Default: main
+    Description: Git branch/tag of gutehall/StackWise to deploy.
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyPairName, ""]]
+  HasReportsBucket: !Not [!Equals [!Ref ReportsBucketName, ""]]
+
+Resources:
+  StackWiseInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: stackwise-readonly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StackWiseReadOnly
+                Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - autoscaling:Describe*
+                  - ecs:Describe*
+                  - ecs:List*
+                  - eks:Describe*
+                  - eks:List*
+                  - lambda:List*
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - rds:Describe*
+                  - dynamodb:Describe*
+                  - dynamodb:List*
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketEncryption
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:GetBucketLogging
+                  - s3:GetLifecycleConfiguration
+                  - s3:ListAllMyBuckets
+                  - elasticfilesystem:Describe*
+                  - elasticache:Describe*
+                  - elasticloadbalancing:Describe*
+                  - apigateway:GET
+                  - iam:List*
+                  - iam:Get*
+                  - kms:List*
+                  - kms:Describe*
+                  - kms:GetKeyRotationStatus
+                  - kms:GetKeyPolicy
+                  - secretsmanager:ListSecrets
+                  - secretsmanager:DescribeSecret
+                  - config:Describe*
+                  - config:Get*
+                  - securityhub:GetFindings
+                  - securityhub:List*
+                  - guardduty:List*
+                  - guardduty:Get*
+                  - cloudwatch:DescribeAlarms
+                  - logs:DescribeLogGroups
+                  - ce:GetCostAndUsage
+                  - ce:GetCostForecast
+                  - compute-optimizer:GetEc2InstanceRecommendations
+                  - compute-optimizer:GetLambdaFunctionRecommendations
+                  - tag:GetResources
+                  - sts:GetCallerIdentity
+                Resource: "*"
+        - !If
+          - HasReportsBucket
+          - PolicyName: stackwise-reports-export
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: StackWiseReportsExport
+                  Effect: Allow
+                  Action:
+                    - s3:PutObject
+                  Resource: !Sub "arn:aws:s3:::${ReportsBucketName}/stackwise/*"
+          - !Ref AWS::NoValue
+
+  StackWiseInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref StackWiseInstanceRole
+
+  StackWiseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: StackWise EC2 instance — no inbound by default (use SSM Session Manager)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  StackWiseSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasKeyName
+    Properties:
+      GroupId: !Ref StackWiseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshAllowedCidr
+
+  StackWiseInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT40M
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref StackWiseInstanceProfile
+      SecurityGroupIds:
+        - !Ref StackWiseSecurityGroup
+      KeyName: !If [HasKeyName, !Ref KeyPairName, !Ref AWS::NoValue]
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSizeGiB
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: stackwise
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eu
+          exec > >(tee -a /var/log/stackwise-bootstrap.log) 2>&1
+
+          dnf update -y
+          dnf install -y aws-cfn-bootstrap unzip git python3.11 python3.11-pip \
+            pango cairo harfbuzz gdk-pixbuf2 libffi-devel shared-mime-info
+
+          trap 'code=$?; /opt/aws/bin/cfn-signal -e "$code" --stack "${AWS::StackName}" --resource StackWiseInstance --region "${AWS::Region}"; exit "$code"' ERR
+
+          if ! command -v aws >/dev/null 2>&1; then
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "aarch64" ]; then
+              AWSCLI_URL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"
+            else
+              AWSCLI_URL="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+            fi
+            curl -fsSL "$AWSCLI_URL" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            /tmp/aws/install
+          fi
+
+          STACKWISE_HOME=/opt/stackwise
+          mkdir -p "$STACKWISE_HOME/data" "$STACKWISE_HOME/reports"
+
+          git clone --branch '${StackWiseGitRef}' --depth 1 \
+            https://github.com/gutehall/StackWise.git "$STACKWISE_HOME/src"
+
+          python3.11 -m venv "$STACKWISE_HOME/venv"
+          "$STACKWISE_HOME/venv/bin/pip" install --upgrade pip
+          "$STACKWISE_HOME/venv/bin/pip" install "$STACKWISE_HOME/src"
+
+          curl -fsSL https://ollama.com/install.sh | sh
+          systemctl enable --now ollama
+
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:11434/api/tags >/dev/null && break
+            sleep 2
+          done
+
+          ollama pull '${OllamaModel}'
+
+          cat > /etc/systemd/system/stackwise.service <<UNIT
+          [Unit]
+          Description=StackWise AWS infrastructure scan
+          After=network-online.target ollama.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          Environment=STACKWISE_DATA_DIR=$STACKWISE_HOME/data
+          Environment=STACKWISE_MODEL=${OllamaModel}
+          Environment=STACKWISE_REGIONS=${ScanRegions}
+          Environment=STACKWISE_SKIP_COST_EXPLORER=${SkipCostExplorer}
+          ExecStart=$STACKWISE_HOME/venv/bin/stackwise run --modules ${ScanModules} -o $STACKWISE_HOME/reports
+          ExecStartPost=-/bin/bash -c 'test -n "${ReportsBucketName}" && aws s3 sync $STACKWISE_HOME/reports s3://${ReportsBucketName}/stackwise/ || true'
+          UNIT
+
+          cat > /etc/systemd/system/stackwise.timer <<UNIT
+          [Unit]
+          Description=Run StackWise on a schedule
+
+          [Timer]
+          OnCalendar=${ScheduleOnCalendar}
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable --now stackwise.timer
+
+          systemctl start stackwise.service || echo "initial scan failed — will retry on next timer trigger" >> /var/log/stackwise-bootstrap.log
+
+          /opt/aws/bin/cfn-signal -e 0 --stack "${AWS::StackName}" --resource StackWiseInstance --region "${AWS::Region}"
+
+Outputs:
+  InstanceId:
+    Value: !Ref StackWiseInstance
+
+  SsmSessionCommand:
+    Description: Connect without opening any inbound ports
+    Value: !Sub "aws ssm start-session --target ${StackWiseInstance} --region ${AWS::Region}"
+
+  ReportsPath:
+    Description: Reports directory on the instance
+    Value: /opt/stackwise/reports
+
+  BootstrapLog:
+    Description: Tail this to watch install/first-scan progress after launch
+    Value: /var/log/stackwise-bootstrap.log
