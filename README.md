@@ -112,6 +112,29 @@ Use one of:
 - **Attach policy to an existing role:** use the minimal read-only policy in [docs/iam-policy.json](docs/iam-policy.json).
 - **Create a dedicated role:** deploy the CloudFormation stack [docs/stackwise-role.yaml](docs/stackwise-role.yaml). It creates the IAM role `stackwise` and attaches the read-only policy. You must pass `TrustedPrincipalArn` (e.g. your IAM user ARN or `arn:aws:iam::ACCOUNT_ID:root`). For profile-based setup (credentials/config), see [docs/aws-profile-setup.md](docs/aws-profile-setup.md).
 
+## Deploying to AWS
+
+Run StackWise unattended on a schedule instead of from your laptop. The fastest path is a
+single self-contained EC2 instance — [docs/stackwise-ec2.yaml](docs/stackwise-ec2.yaml) is a
+CloudFormation template that installs everything (Python, StackWise, Ollama, model) via
+UserData at boot and sets up a systemd timer for recurring scans. No Docker, no ECS, no manual
+steps:
+
+```bash
+aws cloudformation create-stack \
+  --stack-name stackwise \
+  --template-body file://docs/stackwise-ec2.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameters ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
+               ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx
+```
+
+Access is via SSM Session Manager (no SSH port opened by default); reports land in
+`/opt/stackwise/reports` and optionally sync to S3 (`ReportsBucketName` parameter).
+
+For Docker-based deploys, ECS/Fargate, or EFS/S3 persistence options, see
+[docs/deploy-ec2-ecs.md](docs/deploy-ec2-ecs.md).
+
 ## Docker
 
 ```bash
