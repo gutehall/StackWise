@@ -78,3 +78,49 @@ def test_llm_analysis_chunks_large_categories(scan_db: ScanDB, tmp_path: Path):
     recs = scan_db.get_recommendations(scan.id)
     assert len(recs) == 1  # Deduplicated - same title from all chunks
     assert count == 1
+
+
+def test_llm_analysis_skips_discovery_category(scan_db: ScanDB, tmp_path: Path):
+    """Tag/inventory noise should never reach the LLM — rules already cover it."""
+    settings = Settings(
+        engine=Engine.OLLAMA,
+        llm_chunk_size=50,
+        llm_max_chunks=10,
+        data_dir=tmp_path / "stackwise",
+    )
+    scan = scan_db.create_scan("123", ["us-east-1"], ["discovery"])
+    scan_db.insert_resource(
+        scan.id, "resourcegroupstaggingapi", "resource", "r-1", "us-east-1",
+        metadata={"ResourceARN": "arn:aws:ec2:...:instance/i-1"},
+    )
+
+    client = MagicMock()
+    count = _run_llm_analysis(client, scan_db, scan.id, settings)
+
+    client.generate.assert_not_called()
+    assert count == 0
+
+
+def test_llm_analysis_caps_resources_at_chunk_limit(scan_db: ScanDB, tmp_path: Path):
+    """Resources beyond chunk_size * max_chunks are dropped, not sent unbounded."""
+    settings = Settings(
+        engine=Engine.OLLAMA,
+        llm_chunk_size=2,
+        llm_max_chunks=2,
+        data_dir=tmp_path / "stackwise",
+    )
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    for i in range(10):
+        scan_db.insert_resource(
+            scan.id, "ec2", "instance", f"i-{i}", "us-east-1",
+            metadata={"InstanceId": f"i-{i}"},
+        )
+
+    client = MagicMock()
+    client.generate.return_value = "[]"
+    client.parse_recommendations.return_value = []
+
+    _run_llm_analysis(client, scan_db, scan.id, settings)
+
+    # chunk_size=2 * max_chunks=2 → at most 4 resources → 2 chunks
+    assert client.generate.call_count == 2

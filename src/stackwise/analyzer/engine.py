@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rich.console import Console
 
@@ -40,6 +41,11 @@ _SERVICE_CATEGORY = {
     "resourcegroupstaggingapi": "discovery",
     "config": "discovery",
 }
+
+# Tag/resource-inventory noise (resourcegroupstaggingapi listings) — rules
+# already cover tagging gaps, and this category adds little cross-cutting
+# LLM value while often being the largest by resource count.
+_LLM_SKIP_CATEGORIES = {"discovery"}
 
 
 def run_analysis(settings: Settings, db: ScanDB, scan_id: str) -> dict:
@@ -117,48 +123,61 @@ def _run_llm_analysis(
     chunk_size = settings.llm_chunk_size
     max_chunks = settings.llm_max_chunks
 
-    total = 0
+    # Build every (category, chunk) task up front so independent Ollama
+    # requests can run concurrently instead of one at a time.
+    tasks: list[tuple[str, int, int, list[dict]]] = []
     for category, res_list in categories.items():
-        cat_findings = finding_by_cat.get(category, [])
-
-        # Chunk resources for large categories
-        chunks: list[list[dict]] = []
-        if len(res_list) <= chunk_size:
-            chunks = [res_list]
-        else:
-            for i in range(0, min(len(res_list), chunk_size * max_chunks), chunk_size):
-                chunks.append(res_list[i : i + chunk_size])
-                if len(chunks) >= max_chunks:
-                    break
-
-        category_recs: list[dict] = []
-        for chunk_idx, chunk in enumerate(chunks):
-            chunk_context = (
-                {"chunk_index": chunk_idx, "total_chunks": len(chunks)}
-                if len(chunks) > 1
-                else {}
+        if category in _LLM_SKIP_CATEGORIES:
+            console.print(
+                f"  Skipping [dim]{category}[/dim] "
+                f"({len(res_list)} resources — low LLM value, rules already cover it)"
             )
-            prompt = client.build_category_prompt(
-                category, chunk, cat_findings, **chunk_context
+            continue
+
+        capped = res_list[: chunk_size * max_chunks]
+        if len(capped) < len(res_list):
+            console.print(
+                f"  [yellow]⚠ {category}: analyzing {len(capped)}/{len(res_list)} "
+                f"resources — chunk cap reached, {len(res_list) - len(capped)} skipped[/yellow]"
             )
 
-            if len(chunks) > 1:
-                console.print(
-                    f"  Analyzing [cyan]{category}[/cyan] "
-                    f"({len(chunk)} resources, chunk {chunk_idx + 1}/{len(chunks)})…"
-                )
-            else:
-                console.print(
-                    f"  Analyzing [cyan]{category}[/cyan] ({len(chunk)} resources)…"
-                )
+        chunks = [capped[i : i + chunk_size] for i in range(0, len(capped), chunk_size)]
+        for idx, chunk in enumerate(chunks):
+            tasks.append((category, idx, len(chunks), chunk))
 
-            raw = client.generate(prompt)
+    def _run_task(task: tuple[str, int, int, list[dict]]) -> tuple[str, str]:
+        category, chunk_idx, total_chunks, chunk = task
+        chunk_context = (
+            {"chunk_index": chunk_idx, "total_chunks": total_chunks}
+            if total_chunks > 1
+            else {}
+        )
+        prompt = client.build_category_prompt(
+            category, chunk, finding_by_cat.get(category, []), **chunk_context
+        )
+        return category, client.generate(prompt)
+
+    results_by_category: dict[str, list[dict]] = {}
+    max_workers = max(1, settings.llm_max_workers)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_run_task, task): task for task in tasks}
+        for done, future in enumerate(as_completed(futures), start=1):
+            category, chunk_idx, total_chunks, chunk = futures[future]
+            label = (
+                f"chunk {chunk_idx + 1}/{total_chunks}" if total_chunks > 1 else "single chunk"
+            )
+            console.print(
+                f"  [{done}/{len(tasks)}] Analyzed [cyan]{category}[/cyan] "
+                f"({len(chunk)} resources, {label})"
+            )
+            _, raw = future.result()
             if not raw:
                 continue
-
             recs = client.parse_recommendations(raw)
-            category_recs.extend(recs)
+            results_by_category.setdefault(category, []).extend(recs)
 
+    total = 0
+    for category, category_recs in results_by_category.items():
         # Deduplicate by (category, normalized_title); keep first occurrence
         seen: set[tuple[str, str]] = set()
         for rec in category_recs:

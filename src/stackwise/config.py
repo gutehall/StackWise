@@ -47,8 +47,9 @@ class Settings:
         if (d := os.environ.get("STACKWISE_DATA_DIR"))
         else (Path.home() / ".stackwise")
     )
-    llm_chunk_size: int = 30
+    llm_chunk_size: int = 75
     llm_max_chunks: int = 10
+    llm_max_workers: int = 3  # max concurrent Ollama requests
     suppressed_rules: list[str] = field(default_factory=list)
     scan_max_workers: int = 4  # max parallel regions per scanner
     # Cost Explorer (ce:GetCostAndUsage) bills $0.01/request, unlike every other
@@ -156,6 +157,12 @@ def resolve_settings(
     if env_workers := os.environ.get("STACKWISE_SCAN_MAX_WORKERS"):
         try:
             s.scan_max_workers = max(1, int(env_workers))
+        except ValueError:
+            pass
+
+    if env_llm_workers := os.environ.get("STACKWISE_LLM_MAX_WORKERS"):
+        try:
+            s.llm_max_workers = max(1, int(env_llm_workers))
         except ValueError:
             pass
 

@@ -150,7 +150,7 @@ class OllamaClient:
             "format": _RECOMMENDATIONS_SCHEMA,
             "options": {
                 "temperature": 0.3,
-                "num_predict": 4096,
+                "num_predict": 1536,
             },
         }
 
