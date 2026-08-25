@@ -61,7 +61,7 @@ _RECOMMENDATIONS_SCHEMA = {
             "impact": {"type": "string"},
             "effort": {"type": "string"},
         },
-        "required": ["category", "title"],
+        "required": ["category", "title", "detail", "impact", "effort"],
     },
 }
 
@@ -150,7 +150,7 @@ class OllamaClient:
             "format": _RECOMMENDATIONS_SCHEMA,
             "options": {
                 "temperature": 0.3,
-                "num_predict": 1536,
+                "num_predict": 2048,
             },
         }
 
@@ -257,8 +257,14 @@ class OllamaClient:
                 continue
             category = item.get("category")
             title = item.get("title")
+            detail = item.get("detail")
             if not title or not isinstance(title, str):
                 logger.debug("Skipping item without valid title at index %d", i)
+                continue
+            if not detail or not isinstance(detail, str):
+                # Usually a truncated response cutting an array item short —
+                # a title with no explanation isn't actionable in a report.
+                logger.debug("Skipping item without detail at index %d", i)
                 continue
             if category and category not in valid_categories:
                 category = "operational_excellence"
@@ -266,7 +272,7 @@ class OllamaClient:
             result.append({
                 "category": category or "operational_excellence",
                 "title": str(title).strip(),
-                "detail": item.get("detail") if isinstance(item.get("detail"), str) else None,
+                "detail": detail,
                 "impact": item.get("impact") if item.get("impact") in valid_levels else None,
                 "effort": item.get("effort") if item.get("effort") in valid_levels else None,
             })

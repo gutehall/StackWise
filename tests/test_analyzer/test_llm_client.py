@@ -51,17 +51,25 @@ def test_parse_recommendations_empty_response():
 
 
 def test_parse_recommendations_validates_schema():
-    """Invalid or missing title should be skipped; valid category normalized."""
+    """Invalid/missing title or detail should be skipped; valid category normalized."""
     raw = (
-        '[{"category": "invalid_cat", "title": "Valid"},'
+        '[{"category": "invalid_cat", "title": "Valid", "detail": "d1"},'
         ' {"title": ""},'
-        ' {"category": "security", "title": "  Enable MFA  "}]'
+        ' {"category": "security", "title": "No detail"},'
+        ' {"category": "security", "title": "  Enable MFA  ", "detail": "d2"}]'
     )
     recs = OllamaClient.parse_recommendations(raw)
-    assert len(recs) == 2  # Empty title skipped
+    assert len(recs) == 2  # Empty title and missing-detail items skipped
     assert recs[0]["category"] == "operational_excellence"  # invalid normalized
     assert recs[0]["title"] == "Valid"
     assert recs[1]["title"] == "Enable MFA"  # stripped
+
+
+def test_parse_recommendations_skips_truncated_item_without_detail():
+    """A title-only item (e.g. from a response cut off mid-array) is not actionable."""
+    raw = '[{"category": "cost", "title": "Enable VPC flow logs"}]'
+    recs = OllamaClient.parse_recommendations(raw)
+    assert recs == []
 
 
 def test_build_category_prompt():
