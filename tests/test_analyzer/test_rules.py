@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from stackwise.analyzer.rules import evaluate_rules, load_rules
+import glob
+
+import pytest
+import yaml
+
+from stackwise.analyzer.rules import (
+    RuleConditionError,
+    _compile_condition,
+    evaluate_rules,
+    load_rules,
+)
 from stackwise.store.db import ScanDB
 
 
@@ -41,6 +51,96 @@ def test_load_rules_from_default_dir():
     # compute.yaml should have CMP-001
     ids = [r.id for r in rules]
     assert "CMP-001" in ids
+
+
+def test_all_bundled_rules_pass_condition_validation():
+    """Every shipped rule's condition must survive AST validation — a false
+    positive in the validator would silently drop a real rule with no test
+    failure elsewhere, since load_rules() just skips and logs."""
+    from stackwise.analyzer.rules import _default_rules_dir
+
+    total_entries = 0
+    for path in sorted(glob.glob(str(_default_rules_dir() / "*.yaml"))):
+        with open(path) as f:
+            entries = yaml.safe_load(f) or []
+        total_entries += len(entries)
+
+    rules = load_rules()
+    assert len(rules) == total_entries
+
+
+@pytest.mark.parametrize(
+    "malicious_condition",
+    [
+        "().__class__.__bases__[0].__subclasses__()",
+        "resource.__class__",
+        "resource.__init__.__globals__",
+        "().__class__",
+        "[].__class__.__base__.__subclasses__()",
+    ],
+)
+def test_dunder_attribute_access_is_rejected(malicious_condition):
+    """Attribute access to dunders is the classic eval() sandbox escape —
+    restricting __builtins__ alone does not block it, since attribute access
+    is a bytecode op, not a builtin call. The AST validator must reject it."""
+    with pytest.raises(RuleConditionError):
+        _compile_condition(malicious_condition, "TEST-EVIL")
+
+
+@pytest.mark.parametrize(
+    "malicious_condition",
+    [
+        "__import__('os').system('id')",
+        "exec('1')",
+        "eval('1')",
+        "open('/etc/passwd')",
+    ],
+)
+def test_disallowed_names_are_rejected(malicious_condition):
+    """Names outside {'resource'} | safe builtins | comprehension targets
+    must be rejected, even though __builtins__ restriction already blocks
+    these at eval() time — the AST check should catch them at load time too."""
+    with pytest.raises(RuleConditionError):
+        _compile_condition(malicious_condition, "TEST-EVIL")
+
+
+def test_getattr_based_dunder_bypass_is_rejected():
+    """getattr/hasattr must not be available — they'd let a condition reach
+    dunders by string name, bypassing the static attribute-name allowlist."""
+    with pytest.raises(RuleConditionError):
+        _compile_condition("getattr(resource, '__class__', None)", "TEST-EVIL")
+
+
+def test_obs002_fires_when_alarm_has_no_actions(scan_db: ScanDB):
+    """OBS-002's condition used to be a bare multi-line expression with no
+    enclosing bracket — a SyntaxError on every eval(), silently swallowed
+    per-resource. Confirm it now actually compiles and fires."""
+    rules = load_rules()
+    scan = scan_db.create_scan("123", ["us-east-1"], ["observability"])
+    scan_db.insert_resource(
+        scan.id, "cloudwatch", "alarm", "alarm-no-actions", "us-east-1",
+        metadata={"AlarmActions": [], "OKActions": []},
+    )
+    scan_db.insert_resource(
+        scan.id, "cloudwatch", "alarm", "alarm-with-actions", "us-east-1",
+        metadata={"AlarmActions": ["arn:aws:sns:us-east-1:1:topic"], "OKActions": []},
+    )
+    evaluate_rules(rules, scan_db, scan.id)
+    findings = [f for f in scan_db.get_findings(scan.id) if f.rule_id == "OBS-002"]
+    assert len(findings) == 1
+    assert "alarm-no-actions" in findings[0].detail
+
+
+def test_legitimate_comprehension_condition_compiles():
+    """Conditions with comprehension-bound loop variables (perm, ipr, etc.)
+    must still validate — those names aren't 'resource' or a safe builtin."""
+    condition = (
+        "any(ipr.get('CidrIp') == '0.0.0.0/0' "
+        "for perm in (resource.get('IpPermissions') or []) "
+        "for ipr in (perm.get('IpRanges') or []))"
+    )
+    code = _compile_condition(condition, "TEST-OK")
+    assert code is not None
 
 
 def test_evaluate_public_ip_rule(scan_db: ScanDB):
@@ -107,3 +207,105 @@ def test_data_rule_s3_versioning(scan_db: ScanDB):
     dat001 = [f for f in findings if f.rule_id == "DAT-001"]
     assert len(dat001) == 1
     assert "my-bucket" in dat001[0].detail
+
+
+def test_dat001_does_not_fire_when_versioning_check_failed(scan_db: ScanDB):
+    """A bucket whose versioning check failed (permissions/API error) must not
+    be reported as 'versioning disabled' — that would be a false positive."""
+    rules = load_rules()
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(
+        scan.id, "s3", "bucket", "locked-bucket", "us-east-1",
+        metadata={"Versioning": {}, "VersioningCheckFailed": True},
+    )
+    evaluate_rules(rules, scan_db, scan.id)
+    findings = scan_db.get_findings(scan.id)
+    assert not any(f.rule_id == "DAT-001" for f in findings)
+    assert any(f.rule_id == "DAT-019" for f in findings)
+
+
+def test_eks_deprecated_version_rule_does_not_flag_current_versions(scan_db: ScanDB):
+    """CMP-017 must not flag every 1.2x version — only ones below the threshold."""
+    rules = load_rules()
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(
+        scan.id, "eks", "cluster", "old-cluster", "us-east-1",
+        metadata={"version": "1.21"},
+    )
+    scan_db.insert_resource(
+        scan.id, "eks", "cluster", "current-cluster", "us-east-1",
+        metadata={"version": "1.30"},
+    )
+    evaluate_rules(rules, scan_db, scan.id)
+    findings = [f for f in scan_db.get_findings(scan.id) if f.rule_id == "CMP-017"]
+    assert len(findings) == 1
+    assert "old-cluster" in findings[0].detail
+
+
+def test_efs_lifecycle_rule_checks_actual_policies(scan_db: ScanDB):
+    """DAT-015 must key off LifecyclePolicies, not filesystem LifeCycleState."""
+    rules = load_rules()
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(
+        scan.id, "efs", "file_system", "fs-no-policy", "us-east-1",
+        metadata={"LifeCycleState": "available", "LifecyclePolicies": []},
+    )
+    scan_db.insert_resource(
+        scan.id, "efs", "file_system", "fs-with-policy", "us-east-1",
+        metadata={
+            "LifeCycleState": "available",
+            "LifecyclePolicies": [{"TransitionToIA": "AFTER_30_DAYS"}],
+        },
+    )
+    evaluate_rules(rules, scan_db, scan.id)
+    findings = [f for f in scan_db.get_findings(scan.id) if f.rule_id == "DAT-015"]
+    assert len(findings) == 1
+    assert "fs-no-policy" in findings[0].detail
+
+
+def test_sec002_does_not_fire_when_mfa_check_failed(scan_db: ScanDB):
+    """A throttled MFA check must not be reported as 'no MFA'."""
+    rules = load_rules()
+    scan = scan_db.create_scan("123", ["us-east-1"], ["security"])
+    scan_db.insert_resource(
+        scan.id, "iam", "user", "alice", "us-east-1",
+        metadata={"MFADevices": [], "MFACheckFailed": True, "InlinePoliciesCount": 0},
+    )
+    evaluate_rules(rules, scan_db, scan.id)
+    findings = scan_db.get_findings(scan.id)
+    assert not any(f.rule_id == "SEC-002" for f in findings)
+    assert any(f.rule_id == "SEC-012" for f in findings)
+
+
+def test_sec010_fires_on_medium_or_higher_guardduty_finding(scan_db: ScanDB):
+    rules = load_rules()
+    scan = scan_db.create_scan("123", ["us-east-1"], ["security"])
+    scan_db.insert_resource(
+        scan.id, "guardduty", "finding", "finding-1", "us-east-1",
+        metadata={"Severity": 5.0},
+    )
+    scan_db.insert_resource(
+        scan.id, "guardduty", "finding", "finding-2", "us-east-1",
+        metadata={"Severity": 2.0},
+    )
+    evaluate_rules(rules, scan_db, scan.id)
+    findings = [f for f in scan_db.get_findings(scan.id) if f.rule_id == "SEC-010"]
+    assert len(findings) == 1
+    assert "finding-1" in findings[0].detail
+
+
+def test_cmp019_fires_when_launch_template_allows_imdsv1(scan_db: ScanDB):
+    rules = load_rules()
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(
+        scan.id, "ec2", "launch_template", "lt-optional", "us-east-1",
+        metadata={"MetadataOptions": {"HttpTokens": "optional"}},
+    )
+    scan_db.insert_resource(
+        scan.id, "ec2", "launch_template", "lt-required", "us-east-1",
+        metadata={"MetadataOptions": {"HttpTokens": "required"}},
+    )
+    evaluate_rules(rules, scan_db, scan.id)
+    findings = [f for f in scan_db.get_findings(scan.id) if f.rule_id == "CMP-019"]
+    assert len(findings) == 1
+    assert "lt-optional" in findings[0].detail

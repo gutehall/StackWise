@@ -93,6 +93,20 @@ class EC2Scanner(BaseScanner):
             templates = paginate(ec2, "describe_launch_templates", "LaunchTemplates")
             for lt in templates:
                 lt_id = lt["LaunchTemplateId"]
+                default_version = lt.get("DefaultVersionNumber")
+                launch_template_data: dict = {}
+                if default_version is not None:
+                    try:
+                        versions = ec2.describe_launch_template_versions(
+                            LaunchTemplateId=lt_id, Versions=[str(default_version)]
+                        ).get("LaunchTemplateVersions", [])
+                        if versions:
+                            launch_template_data = versions[0].get("LaunchTemplateData", {})
+                    except Exception:
+                        logger.debug(
+                            "describe_launch_template_versions failed for %s", lt_id,
+                            exc_info=True,
+                        )
                 db.insert_resource(
                     scan_id=scan_id,
                     service="ec2",
@@ -102,8 +116,10 @@ class EC2Scanner(BaseScanner):
                     metadata={
                         "LaunchTemplateId": lt_id,
                         "LaunchTemplateName": lt.get("LaunchTemplateName"),
-                        "DefaultVersionNumber": lt.get("DefaultVersionNumber"),
+                        "DefaultVersionNumber": default_version,
                         "LatestVersionNumber": lt.get("LatestVersionNumber"),
+                        "MetadataOptions": launch_template_data.get("MetadataOptions", {}),
+                        "EbsOptimized": launch_template_data.get("EbsOptimized"),
                     },
                 )
                 count += 1
@@ -221,15 +237,24 @@ class ECSScanner(BaseScanner):
                     )
                     td = desc.get("taskDefinition", {})
                     td_family = td.get("family", td_arn.split("/")[-1].rsplit(":", 1)[0])
+                    td_revision = td.get("revision")
+                    # Include the revision in the identity: each revision is a
+                    # distinct AWS resource (own ARN), and collapsing them onto
+                    # the shared family name would make diff_scans silently miss
+                    # added/removed revisions.
+                    resource_id = (
+                        f"{td_family}:{td_revision}" if td_revision is not None else td_family
+                    )
                     db.insert_resource(
                         scan_id=scan_id,
                         service="ecs",
                         resource_type="task_definition",
-                        resource_id=td_family,
+                        resource_id=resource_id,
                         region=region,
                         arn=td.get("taskDefinitionArn"),
                         metadata={
                             "family": td_family,
+                            "revision": td_revision,
                             "cpu": td.get("cpu"),
                             "memory": td.get("memory"),
                             "status": td.get("status"),

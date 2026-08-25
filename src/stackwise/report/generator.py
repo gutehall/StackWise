@@ -139,7 +139,7 @@ def generate_report(
 
     if output_format == "html":
         out_path = settings.output_dir / f"{base_name}.html"
-        out_path.write_text(html_content)
+        out_path.write_text(html_content, encoding="utf-8")
         logger.info("HTML report written to %s", out_path)
         return out_path
 
@@ -158,20 +158,20 @@ def generate_report(
                 "Falling back to HTML output."
             )
             out_path = settings.output_dir / f"{base_name}.html"
-            out_path.write_text(html_content)
+            out_path.write_text(html_content, encoding="utf-8")
             return out_path
 
     if output_format == "md":
         out_path = settings.output_dir / f"{base_name}.md"
         md = _html_to_markdown(context, report_type)
-        out_path.write_text(md)
+        out_path.write_text(md, encoding="utf-8")
         logger.info("Markdown report written to %s", out_path)
         return out_path
 
     if output_format == "json":
         out_path = settings.output_dir / f"{base_name}.json"
         payload = _build_json_payload(context)
-        out_path.write_text(json.dumps(payload, indent=2, default=str))
+        out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         logger.info("JSON report written to %s", out_path)
         return out_path
 

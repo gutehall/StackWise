@@ -176,8 +176,11 @@
   severity: HIGH
   resource_type: cluster
   service: eks
+  # Compares (major, minor) against the oldest version still in EKS standard
+  # support. This threshold must be bumped periodically — see
+  # https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html
   condition: |
-    resource.get('version', '').startswith('1.2') or resource.get('version', '').startswith('1.21')
+    tuple(int(p) for p in (resource.get('version') or '0.0').split('.')[:2]) < (1, 28)
   remediation: >
     Upgrade to a supported Kubernetes version. See EKS version support policy.
 
@@ -190,3 +193,14 @@
     not resource.get('scalingConfig') or resource.get('scalingConfig', {}).get('minSize') == resource.get('scalingConfig', {}).get('maxSize')
   remediation: >
     Configure scaling to handle workload variations.
+
+- id: CMP-019
+  title: "EC2 launch template default version allows IMDSv1"
+  severity: MEDIUM
+  resource_type: launch_template
+  service: ec2
+  condition: |
+    resource.get('MetadataOptions', {}).get('HttpTokens') != 'required'
+  remediation: >
+    Require IMDSv2 (HttpTokens=required) in the launch template's default
+    version to prevent SSRF attacks on instances launched from it.

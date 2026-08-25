@@ -8,7 +8,7 @@
   resource_type: bucket
   service: s3
   condition: |
-    (resource.get('Versioning') or {}).get('Status') != 'Enabled'
+    not resource.get('VersioningCheckFailed') and (resource.get('Versioning') or {}).get('Status') != 'Enabled'
   remediation: >
     Enable versioning to protect against accidental deletion and enable point-in-time recovery.
 
@@ -18,7 +18,7 @@
   resource_type: bucket
   service: s3
   condition: |
-    not (resource.get('ServerSideEncryptionConfiguration') or {}).get('Rules')
+    not resource.get('EncryptionCheckFailed') and not (resource.get('ServerSideEncryptionConfiguration') or {}).get('Rules')
   remediation: >
     Enable default encryption (SSE-S3 or SSE-KMS) for data at rest.
 
@@ -28,7 +28,7 @@
   resource_type: bucket
   service: s3
   condition: |
-    not (resource.get('PublicAccessBlock') or {}).get('BlockPublicAcls')
+    not resource.get('PublicAccessBlockCheckFailed') and not (resource.get('PublicAccessBlock') or {}).get('BlockPublicAcls')
   remediation: >
     Enable Block Public Access to prevent accidental public exposure.
 
@@ -38,9 +38,21 @@
   resource_type: bucket
   service: s3
   condition: |
-    not resource.get('LifecycleRules') or len(resource.get('LifecycleRules', [])) == 0
+    not resource.get('LifecycleCheckFailed') and (not resource.get('LifecycleRules') or len(resource.get('LifecycleRules', [])) == 0)
   remediation: >
     Add lifecycle rules to transition or expire objects and reduce storage costs.
+
+- id: DAT-019
+  title: "S3 bucket security configuration could not be verified"
+  severity: INFO
+  resource_type: bucket
+  service: s3
+  condition: |
+    resource.get('VersioningCheckFailed') or resource.get('EncryptionCheckFailed') or resource.get('PublicAccessBlockCheckFailed') or resource.get('LifecycleCheckFailed')
+  remediation: >
+    A versioning/encryption/public-access-block/lifecycle check failed (permissions
+    or API error) — verify manually rather than trusting the other DAT rules for
+    this bucket.
 
 # RDS
 - id: DAT-005
@@ -125,14 +137,18 @@
     Enable encryption at rest for DynamoDB tables.
 
 - id: DAT-013
-  title: "DynamoDB table uses provisioned capacity with low utilization"
-  severity: LOW
+  title: "DynamoDB table uses provisioned capacity — review utilization"
+  severity: INFO
   resource_type: table
   service: dynamodb
+  # No consumed-capacity metric is collected (would need cloudwatch:GetMetricData,
+  # which isn't in the documented least-privilege IAM policy), so this can only
+  # flag PROVISIONED tables for manual review, not actually detect low utilization.
   condition: |
     resource.get('BillingModeSummary', {}).get('BillingMode') == 'PROVISIONED'
   remediation: >
-    Consider on-demand mode for unpredictable workloads to reduce cost.
+    Check CloudWatch ConsumedReadCapacityUnits/ConsumedWriteCapacityUnits against
+    provisioned throughput; consider on-demand mode if utilization is consistently low.
 
 # EFS
 - id: DAT-014
@@ -151,7 +167,7 @@
   resource_type: file_system
   service: efs
   condition: |
-    not resource.get('LifeCycleState') or resource.get('LifeCycleState') == 'available'
+    not resource.get('LifecyclePolicies') or len(resource.get('LifecyclePolicies', [])) == 0
   remediation: >
     Consider lifecycle policies to transition infrequently accessed files to Infrequent Access.
 

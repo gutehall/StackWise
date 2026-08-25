@@ -18,8 +18,10 @@
   resource_type: alarm
   service: cloudwatch
   condition: |
-    (not resource.get('AlarmActions') or len(resource.get('AlarmActions', [])) == 0) and
-    (not resource.get('OKActions') or len(resource.get('OKActions', [])) == 0)
+    (
+      (not resource.get('AlarmActions') or len(resource.get('AlarmActions', [])) == 0) and
+      (not resource.get('OKActions') or len(resource.get('OKActions', [])) == 0)
+    )
   remediation: >
     Configure SNS or other actions for alarm state changes.
 

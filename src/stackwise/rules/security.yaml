@@ -8,7 +8,7 @@
   resource_type: role
   service: iam
   condition: |
-    (resource.get('InlinePoliciesCount') or 0) > 0
+    not resource.get('InlinePoliciesCheckFailed') and (resource.get('InlinePoliciesCount') or 0) > 0
   remediation: >
     Prefer managed policies over inline policies for easier audit and reuse.
 
@@ -18,7 +18,7 @@
   resource_type: user
   service: iam
   condition: |
-    not resource.get('MFADevices') or len(resource.get('MFADevices', [])) == 0
+    not resource.get('MFACheckFailed') and (not resource.get('MFADevices') or len(resource.get('MFADevices', [])) == 0)
   remediation: >
     Enable MFA for all IAM users with console access.
 
@@ -28,7 +28,7 @@
   resource_type: user
   service: iam
   condition: |
-    (resource.get('InlinePoliciesCount') or 0) > 0
+    not resource.get('InlinePoliciesCheckFailed') and (resource.get('InlinePoliciesCount') or 0) > 0
   remediation: >
     Prefer managed policies over inline policies.
 
@@ -41,6 +41,28 @@
     not resource.get('PermissionsBoundary')
   remediation: >
     Use permissions boundaries to limit maximum permissions for roles.
+
+- id: SEC-011
+  title: "IAM role security configuration could not be verified"
+  severity: INFO
+  resource_type: role
+  service: iam
+  condition: |
+    resource.get('InlinePoliciesCheckFailed')
+  remediation: >
+    get_role/list_role_policies failed (permissions or API error) for this role —
+    verify inline policies manually.
+
+- id: SEC-012
+  title: "IAM user security configuration could not be verified"
+  severity: INFO
+  resource_type: user
+  service: iam
+  condition: |
+    resource.get('MFACheckFailed') or resource.get('InlinePoliciesCheckFailed')
+  remediation: >
+    An MFA or inline-policy check failed (permissions or API error) for this user —
+    verify manually rather than trusting SEC-002/SEC-003 for this user.
 
 # KMS
 - id: SEC-005

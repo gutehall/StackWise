@@ -31,6 +31,16 @@ class DiscoveryScanner(BaseScanner):
         try:
             config = regional_client(session, "config", region)
             recorders = config.describe_configuration_recorders()
+            recording_by_name: dict[str, bool] = {}
+            try:
+                statuses = config.describe_configuration_recorder_status()
+                for st in statuses.get("ConfigurationRecordersStatus", []):
+                    recording_by_name[st.get("name", "")] = st.get("recording", False)
+            except Exception:
+                logger.debug(
+                    "describe_configuration_recorder_status failed in %s", region, exc_info=True
+                )
+
             for rec in recorders.get("ConfigurationRecorders", []):
                 rec_name = rec.get("name", "default")
                 db.insert_resource(
@@ -45,7 +55,7 @@ class DiscoveryScanner(BaseScanner):
                     ),
                     metadata={
                         "name": rec_name,
-                        "recording": rec.get("recording", False),
+                        "recording": recording_by_name.get(rec_name, False),
                         "roleARN": rec.get("roleARN"),
                     },
                 )
@@ -54,12 +64,11 @@ class DiscoveryScanner(BaseScanner):
             logger.debug("Config recorder scan failed in %s", region, exc_info=True)
 
         # ── Tagged resources (same as cost, but discovery rules use it too) ─
-        # Cost scanner already runs get_resources; discovery DSC-002 uses same
-        # resource type. We could skip here to avoid duplicates, but get_resources
-        # returns all tagged resources - cost and discovery both need them.
-        # The cost scanner runs in cost module, discovery in discovery module.
-        # If user runs only discovery, they won't get tagged resources from cost.
-        # So we need to run get_resources in discovery too when discovery is enabled.
+        # Cost scanner also runs get_resources, since discovery DSC-002 and cost
+        # CST-001 both key off tagged_resource and a user may run either module
+        # alone. ScanDB.insert_resource dedups by (scan_id, service,
+        # resource_type, resource_id, region), so running both modules in the
+        # same scan stores each tagged resource once, not twice.
         try:
             tag_client = regional_client(session, "resourcegroupstaggingapi", region)
             resources = paginate(

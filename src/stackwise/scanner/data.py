@@ -5,12 +5,33 @@ from __future__ import annotations
 import logging
 
 import boto3
+from botocore.exceptions import ClientError
 
 from stackwise.scanner.base import BaseScanner
 from stackwise.store.db import ScanDB
 from stackwise.utils.aws import paginate, regional_client
 
 logger = logging.getLogger(__name__)
+
+# Error codes S3 returns when a config simply isn't set on the bucket — a normal,
+# legitimate "disabled" state, not a check failure. Anything else (AccessDenied,
+# throttling, etc.) means we couldn't verify and should not be treated the same
+# as "confirmed disabled".
+_S3_NOT_CONFIGURED_CODES = {
+    "ServerSideEncryptionConfigurationNotFoundError",
+    "NoSuchPublicAccessBlockConfiguration",
+    "NoSuchLifecycleConfiguration",
+}
+
+
+def _s3_check_failed(bucket_name: str, method: str, error: Exception) -> bool:
+    """True if *error* means the check genuinely couldn't be verified."""
+    if isinstance(error, ClientError):
+        code = error.response.get("Error", {}).get("Code", "")
+        if code in _S3_NOT_CONFIGURED_CODES:
+            return False
+    logger.warning("%s failed for bucket %s: %s", method, bucket_name, error)
+    return True
 
 
 class S3Scanner(BaseScanner):
@@ -53,30 +74,46 @@ class S3Scanner(BaseScanner):
             try:
                 ver = s3_client.get_bucket_versioning(Bucket=bucket_name)
                 metadata["Versioning"] = ver
-            except Exception:
+                metadata["VersioningCheckFailed"] = False
+            except Exception as e:
                 metadata["Versioning"] = {}
+                metadata["VersioningCheckFailed"] = _s3_check_failed(
+                    bucket_name, "get_bucket_versioning", e
+                )
 
             try:
                 enc = s3_client.get_bucket_encryption(Bucket=bucket_name)
                 metadata["ServerSideEncryptionConfiguration"] = enc.get(
                     "ServerSideEncryptionConfiguration", {}
                 )
-            except Exception:
+                metadata["EncryptionCheckFailed"] = False
+            except Exception as e:
                 metadata["ServerSideEncryptionConfiguration"] = {}
+                metadata["EncryptionCheckFailed"] = _s3_check_failed(
+                    bucket_name, "get_bucket_encryption", e
+                )
 
             try:
                 pab = s3_client.get_public_access_block(Bucket=bucket_name)
                 metadata["PublicAccessBlock"] = pab.get(
                     "PublicAccessBlockConfiguration", {}
                 )
-            except Exception:
+                metadata["PublicAccessBlockCheckFailed"] = False
+            except Exception as e:
                 metadata["PublicAccessBlock"] = {}
+                metadata["PublicAccessBlockCheckFailed"] = _s3_check_failed(
+                    bucket_name, "get_public_access_block", e
+                )
 
             try:
                 lc = s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
                 metadata["LifecycleRules"] = lc.get("Rules", [])
-            except Exception:
+                metadata["LifecycleCheckFailed"] = False
+            except Exception as e:
                 metadata["LifecycleRules"] = []
+                metadata["LifecycleCheckFailed"] = _s3_check_failed(
+                    bucket_name, "get_bucket_lifecycle_configuration", e
+                )
 
             db.insert_resource(
                 scan_id=scan_id,
@@ -224,10 +261,22 @@ class EFSScanner(BaseScanner):
     ) -> int:
         count = 0
         try:
-            efs = regional_client(session, "elasticfilesystem", region)
+            # boto3/botocore's client name is "efs" — "elasticfilesystem" is only
+            # the IAM action prefix (elasticfilesystem:Describe*), not a valid
+            # service name; using it here made client creation always raise and
+            # this scanner silently return 0 resources.
+            efs = regional_client(session, "efs", region)
             filesystems = paginate(efs, "describe_file_systems", "FileSystems")
             for fs in filesystems:
                 fs_id = fs.get("FileSystemId", "")
+                try:
+                    lc = efs.describe_lifecycle_configuration(FileSystemId=fs_id)
+                    lifecycle_policies = lc.get("LifecyclePolicies", [])
+                except Exception:
+                    logger.debug(
+                        "describe_lifecycle_configuration failed for %s", fs_id, exc_info=True
+                    )
+                    lifecycle_policies = []
                 db.insert_resource(
                     scan_id=scan_id,
                     service="efs",
@@ -240,6 +289,7 @@ class EFSScanner(BaseScanner):
                         "Name": fs.get("Name"),
                         "Encrypted": fs.get("Encrypted"),
                         "LifeCycleState": fs.get("LifeCycleState"),
+                        "LifecyclePolicies": lifecycle_policies,
                     },
                 )
                 count += 1

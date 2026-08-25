@@ -48,19 +48,25 @@ class SecurityScanner(BaseScanner):
         region: str,
     ) -> int:
         count = 0
-        iam = session.client("iam")
+        iam = regional_client(session, "iam", "us-east-1")
         try:
             roles = paginate(iam, "list_roles", "Roles")
             for role in roles:
                 role_name = role["RoleName"]
+                policy_check_failed = False
                 try:
                     detail = iam.get_role(RoleName=role_name)
                     r = detail["Role"]
                     inline = iam.list_role_policies(RoleName=role_name)
                     inline_count = len(inline.get("PolicyNames", []))
-                except Exception:
+                except Exception as e:
+                    logger.warning(
+                        "Failed to enrich IAM role %s (get_role/list_role_policies): %s",
+                        role_name, e,
+                    )
                     r = role
                     inline_count = 0
+                    policy_check_failed = True
                 db.insert_resource(
                     scan_id=scan_id,
                     service="iam",
@@ -72,6 +78,7 @@ class SecurityScanner(BaseScanner):
                         "RoleName": role_name,
                         "Arn": r.get("Arn"),
                         "InlinePoliciesCount": inline_count,
+                        "InlinePoliciesCheckFailed": policy_check_failed,
                         "PermissionsBoundary": (
                             r.get("PermissionsBoundary", {}).get("PermissionsBoundaryArn")
                             if isinstance(r.get("PermissionsBoundary"), dict)
@@ -84,16 +91,26 @@ class SecurityScanner(BaseScanner):
             users = paginate(iam, "list_users", "Users")
             for user in users:
                 user_name = user["UserName"]
+                mfa_check_failed = False
+                policy_check_failed = False
                 try:
                     mfa = iam.list_mfa_devices(UserName=user_name)
                     mfa_devices = mfa.get("MFADevices", [])
-                except Exception:
+                except Exception as e:
+                    logger.warning(
+                        "Failed to check MFA devices for IAM user %s: %s", user_name, e
+                    )
                     mfa_devices = []
+                    mfa_check_failed = True
                 try:
                     inline = iam.list_user_policies(UserName=user_name)
                     inline_count = len(inline.get("PolicyNames", []))
-                except Exception:
+                except Exception as e:
+                    logger.warning(
+                        "Failed to list inline policies for IAM user %s: %s", user_name, e
+                    )
                     inline_count = 0
+                    policy_check_failed = True
                 db.insert_resource(
                     scan_id=scan_id,
                     service="iam",
@@ -105,7 +122,9 @@ class SecurityScanner(BaseScanner):
                         "UserName": user_name,
                         "Arn": user.get("Arn"),
                         "MFADevices": mfa_devices,
+                        "MFACheckFailed": mfa_check_failed,
                         "InlinePoliciesCount": inline_count,
+                        "InlinePoliciesCheckFailed": policy_check_failed,
                     },
                 )
                 count += 1
@@ -218,9 +237,44 @@ class SecurityScanner(BaseScanner):
                     },
                 )
                 count += 1
+                count += self._scan_guardduty_findings(gd, db, scan_id, region, det_id)
 
         except Exception:
             logger.debug("GuardDuty scan failed in %s: %s", region, exc_info=True)
+        return count
+
+    def _scan_guardduty_findings(
+        self, gd, db: ScanDB, scan_id: str, region: str, detector_id: str
+    ) -> int:
+        count = 0
+        try:
+            finding_ids = paginate(gd, "list_findings", "FindingIds", DetectorId=detector_id)
+            for i in range(0, len(finding_ids), 50):  # get_findings takes at most 50 IDs
+                batch = finding_ids[i : i + 50]
+                resp = gd.get_findings(DetectorId=detector_id, FindingIds=batch)
+                for f in resp.get("Findings", []):
+                    finding_id = f.get("Id", "")
+                    db.insert_resource(
+                        scan_id=scan_id,
+                        service="guardduty",
+                        resource_type="finding",
+                        resource_id=finding_id,
+                        region=region,
+                        arn=f.get("Arn"),
+                        metadata={
+                            "Id": finding_id,
+                            "Type": f.get("Type"),
+                            "Title": f.get("Title"),
+                            "Severity": f.get("Severity"),
+                            "CreatedAt": f.get("CreatedAt"),
+                        },
+                    )
+                    count += 1
+        except Exception:
+            logger.debug(
+                "GuardDuty findings scan failed for detector %s in %s", detector_id, region,
+                exc_info=True,
+            )
         return count
 
 

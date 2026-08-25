@@ -94,6 +94,35 @@ def test_insert_and_get_recommendations(scan_db: ScanDB):
     assert recs[0].impact == "high"
 
 
+def test_insert_resource_dedups_same_identity(scan_db: ScanDB):
+    """Two scanner modules inserting the same resource in one scan should
+    produce a single row, not a duplicate."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["cost", "discovery"])
+
+    first = scan_db.insert_resource(
+        scan.id, "resourcegroupstaggingapi", "tagged_resource", "res-1", "us-east-1",
+        metadata={"Tags": []},
+    )
+    second = scan_db.insert_resource(
+        scan.id, "resourcegroupstaggingapi", "tagged_resource", "res-1", "us-east-1",
+        metadata={"Tags": []},
+    )
+
+    assert first.id == second.id
+    resources = scan_db.get_resources(scan.id)
+    assert len(resources) == 1
+
+
+def test_insert_resource_allows_same_id_different_region(scan_db: ScanDB):
+    """Same service/type/resource_id in a different region is a distinct resource."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1", "eu-west-1"], ["compute"])
+
+    scan_db.insert_resource(scan.id, "ec2", "vpc", "vpc-1", "us-east-1")
+    scan_db.insert_resource(scan.id, "ec2", "vpc", "vpc-1", "eu-west-1")
+
+    assert len(scan_db.get_resources(scan.id)) == 2
+
+
 def test_summary(scan_db: ScanDB):
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
     scan_db.insert_resource(scan.id, "ec2", "instance", "i-1", "us-east-1")

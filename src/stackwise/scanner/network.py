@@ -36,7 +36,7 @@ class NetworkScanner(BaseScanner):
             try:
                 flow_logs = paginate(ec2, "describe_flow_logs", "FlowLogs")
                 for fl in flow_logs:
-                    rid = fl.get("ResourceIds", [""])[0] if fl.get("ResourceIds") else ""
+                    rid = fl.get("ResourceId") or ""
                     if rid.startswith("vpc-"):
                         flow_logs_by_vpc.setdefault(rid, []).append(fl)
             except Exception:

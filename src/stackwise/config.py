@@ -51,6 +51,10 @@ class Settings:
     llm_max_chunks: int = 10
     suppressed_rules: list[str] = field(default_factory=list)
     scan_max_workers: int = 4  # max parallel regions per scanner
+    # Cost Explorer (ce:GetCostAndUsage) bills $0.01/request, unlike every other
+    # scanner call, which is a free control-plane API. Off by default cost stays
+    # opt-out rather than opt-in, but this lets a user avoid it entirely.
+    skip_cost_explorer: bool = False
 
     def scans_dir(self, account_id: str) -> Path:
         path = self.data_dir / "scans" / account_id
@@ -107,6 +111,7 @@ def resolve_settings(
     engine: str | None = None,
     output_dir: str | None = None,
     suppressed_rules: str | None = None,
+    skip_cost_explorer: bool = False,
 ) -> Settings:
     """Build Settings from CLI flags with env var fallbacks."""
     s = Settings()
@@ -124,6 +129,12 @@ def resolve_settings(
 
     if modules:
         s.modules = [m.strip() for m in modules.split(",")]
+        unknown = [m for m in s.modules if m not in ALL_MODULES]
+        if unknown:
+            raise ValueError(
+                f"Unknown module(s): {', '.join(unknown)}. "
+                f"Valid modules: {', '.join(ALL_MODULES)}"
+            )
 
     s.model = model or os.environ.get("STACKWISE_MODEL", DEFAULT_MODEL)
 
@@ -148,4 +159,10 @@ def resolve_settings(
         except ValueError:
             pass
 
+    s.skip_cost_explorer = skip_cost_explorer or _env_flag("STACKWISE_SKIP_COST_EXPLORER")
+
     return s
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")

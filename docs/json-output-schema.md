@@ -16,10 +16,10 @@ Output file: `stackwise-{type}-{account_id}-{date}.json`
     "modules": ["string"]
   },
   "summary": {
-    "resources": { "service": count },
+    "resources": number,
     "findings": { "CRITICAL": n, "HIGH": n, "MEDIUM": n, "LOW": n, "INFO": n },
     "findings_total": number,
-    "recommendations": { "rule": n, "llm": n }
+    "recommendations": number
   },
   "findings": [
     {

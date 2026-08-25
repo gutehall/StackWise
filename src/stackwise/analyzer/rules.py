@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import CodeType
 
 import yaml
 
@@ -12,7 +14,10 @@ from stackwise.store.db import ScanDB
 
 logger = logging.getLogger(__name__)
 
-# Safe builtins for rule condition evaluation (blocks open, exec, eval, __import__, etc.)
+# Safe builtins for rule condition evaluation (blocks open, exec, eval, __import__, etc.).
+# Deliberately excludes getattr/hasattr: those allow dynamic attribute lookup by string
+# (e.g. getattr(x, '__class__')), which would bypass the static attribute-name allowlist
+# in _validate_condition_ast below and reopen the sandbox-escape path it closes.
 _SAFE_BUILTINS = {
     "len": len,
     "any": any,
@@ -33,18 +38,108 @@ _SAFE_BUILTINS = {
     "sum": sum,
     "sorted": sorted,
     "isinstance": isinstance,
-    "hasattr": hasattr,
-    "getattr": getattr,
 }
 
+# Restricting __builtins__ alone does not make eval() safe: attribute access
+# (`().__class__.__bases__`) is a bytecode operation, not a builtin call, so it bypasses
+# any builtins allowlist entirely. Every condition is therefore parsed and validated against
+# this explicit AST allowlist before being compiled — only these node types, attribute names,
+# and identifiers may appear in a rule's `condition` string.
+_ALLOWED_NODE_TYPES = (
+    ast.Expression,
+    ast.BoolOp, ast.And, ast.Or,
+    ast.UnaryOp, ast.Not, ast.USub, ast.UAdd,
+    ast.BinOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod,
+    ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    ast.In, ast.NotIn, ast.Is, ast.IsNot,
+    ast.Call, ast.Attribute, ast.Subscript, ast.Slice,
+    ast.Name, ast.Load, ast.Store, ast.Constant,
+    ast.List, ast.Tuple, ast.Dict, ast.Set,
+    ast.comprehension, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp,
+    ast.IfExp,
+)
+
+# Only inert, no-escape methods on dict/list/str values — resource metadata is always
+# plain JSON-decoded data, so this covers every real use case without exposing dunders.
+_ALLOWED_METHOD_NAMES = {
+    "get", "keys", "values", "items",
+    "startswith", "endswith", "split", "rsplit", "strip", "lower", "upper",
+}
+
+
+class RuleConditionError(ValueError):
+    """A rule's `condition` failed AST validation or failed to compile."""
+
+
+def _comprehension_bound_names(tree: ast.AST) -> set[str]:
+    """Names bound by `for x in ...` inside the condition (e.g. generator expressions)."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.comprehension):
+            names |= _target_names(node.target)
+    return names
+
+
+def _target_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for elt in target.elts:
+            names |= _target_names(elt)
+        return names
+    return set()
+
+
+def _compile_condition(condition: str, rule_id: str) -> CodeType:
+    """Validate *condition* against the AST allowlist and compile it.
+
+    Raises RuleConditionError if the condition uses any syntax, name, or
+    attribute outside the allowlist.
+    """
+    try:
+        tree = ast.parse(condition, mode="eval")
+    except SyntaxError as e:
+        raise RuleConditionError(f"{rule_id}: syntax error in condition: {e}") from e
+
+    allowed_names = {"resource"} | set(_SAFE_BUILTINS) | _comprehension_bound_names(tree)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_NODE_TYPES):
+            raise RuleConditionError(
+                f"{rule_id}: disallowed syntax in condition: {type(node).__name__}"
+            )
+        if isinstance(node, ast.Attribute) and node.attr not in _ALLOWED_METHOD_NAMES:
+            raise RuleConditionError(
+                f"{rule_id}: disallowed attribute access '.{node.attr}' in condition"
+            )
+        if isinstance(node, ast.Name) and node.id not in allowed_names:
+            raise RuleConditionError(
+                f"{rule_id}: disallowed name '{node.id}' in condition"
+            )
+        if isinstance(node, ast.Call) and (
+            node.keywords or any(isinstance(a, ast.Starred) for a in node.args)
+        ):
+            raise RuleConditionError(
+                f"{rule_id}: keyword/starred call arguments are not allowed in condition"
+            )
+
+    return compile(tree, filename=f"<rule:{rule_id}>", mode="eval")
+
 def _default_rules_dir() -> Path:
-    """Resolve rules directory (project root or /app/rules in Docker)."""
-    base = Path(__file__).resolve().parent.parent.parent.parent / "rules"
-    if base.is_dir():
-        return base
-    # Docker: rules copied to /app/rules
+    """Resolve the bundled rules directory.
+
+    rules/ lives inside the stackwise package (src/stackwise/rules) so it is
+    included in built wheels/sdists and resolves the same way whether
+    installed editable, installed from a wheel, or run from Docker — no
+    special-casing needed. The /app/rules fallback is kept only for older
+    deployments that still COPY rules to that path explicitly.
+    """
+    packaged = Path(__file__).resolve().parent.parent / "rules"
+    if packaged.is_dir():
+        return packaged
     fallback = Path("/app/rules")
-    return fallback if fallback.is_dir() else base
+    return fallback if fallback.is_dir() else packaged
 
 
 @dataclass
@@ -57,10 +152,16 @@ class Rule:
     condition: str
     remediation: str
     priority: int = 999  # 1=highest; used for ordering when severity is equal
+    compiled_condition: CodeType | None = field(default=None, repr=False, compare=False)
 
 
 def load_rules(rules_dir: Path | None = None) -> list[Rule]:
-    """Load all YAML rule files from the rules directory."""
+    """Load all YAML rule files from the rules directory.
+
+    Each condition is validated and compiled once here (not per-resource in
+    evaluate_rules) — a rule whose condition fails validation is logged and
+    skipped rather than aborting the whole load.
+    """
     import os
     env_dir = os.environ.get("STACKWISE_RULES_DIR")
     base = rules_dir or (Path(env_dir) if env_dir else _default_rules_dir())
@@ -74,16 +175,24 @@ def load_rules(rules_dir: Path | None = None) -> list[Rule]:
             with open(path) as f:
                 entries = yaml.safe_load(f) or []
             for entry in entries:
+                rule_id = entry["id"]
+                condition = entry["condition"].strip()
+                try:
+                    compiled = _compile_condition(condition, rule_id)
+                except RuleConditionError:
+                    logger.exception("Rejecting rule %s from %s", rule_id, path)
+                    continue
                 rules.append(
                     Rule(
-                        id=entry["id"],
+                        id=rule_id,
                         title=entry["title"],
                         severity=entry["severity"],
                         resource_type=entry["resource_type"],
                         service=entry.get("service", ""),
-                        condition=entry["condition"].strip(),
+                        condition=condition,
                         remediation=entry.get("remediation", ""),
                         priority=entry.get("priority", 999),
+                        compiled_condition=compiled,
                     )
                 )
         except Exception:
@@ -120,9 +229,10 @@ def evaluate_rules(
 
         for res in matching:
             try:
-                # Evaluate condition with `resource` in scope
+                # Evaluate the pre-validated, pre-compiled condition with
+                # `resource` in scope — see _compile_condition for what's allowed.
                 result = eval(
-                    rule.condition,
+                    rule.compiled_condition,
                     {"__builtins__": _SAFE_BUILTINS},
                     {"resource": res.metadata},
                 )
@@ -138,7 +248,7 @@ def evaluate_rules(
                     )
                     findings_count += 1
             except Exception:
-                logger.debug(
+                logger.warning(
                     "Rule %s failed on resource %s: %s",
                     rule.id, res.resource_id, rule.condition,
                     exc_info=True,

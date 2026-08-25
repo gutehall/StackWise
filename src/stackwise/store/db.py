@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -10,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
@@ -58,6 +61,16 @@ CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_recommendations_scan ON recommendations(scan_id);
 """
+
+# Enforces one row per (scan_id, service, resource_type, resource_id, region) so a
+# resource discovered by two scanner modules in the same scan (e.g. cost + discovery
+# both walking resourcegroupstaggingapi) is stored once. Created separately from
+# _SCHEMA and best-effort: a pre-existing scan DB written before this constraint
+# existed may already contain duplicate rows, which would make index creation fail.
+_UNIQUE_RESOURCE_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_resources_identity "
+    "ON resources(scan_id, service, resource_type, resource_id, region)"
+)
 
 
 def _uid() -> str:
@@ -119,6 +132,15 @@ class ScanDB:
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        try:
+            self.conn.execute(_UNIQUE_RESOURCE_INDEX)
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "Could not enforce unique resource identity on %s — "
+                "existing scan data has duplicate rows from before this constraint.",
+                db_path,
+            )
 
     # ── Scans ──────────────────────────────────────────────
 
@@ -199,8 +221,8 @@ class ScanDB:
             arn=arn,
             metadata=metadata or {},
         )
-        self.conn.execute(
-            "INSERT INTO resources "
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO resources "
             "(id, scan_id, service, resource_type, resource_id, "
             "region, arn, metadata_json) VALUES (?,?,?,?,?,?,?,?)",
             (rec.id, rec.scan_id, rec.service, rec.resource_type,
@@ -208,6 +230,21 @@ class ScanDB:
              json.dumps(rec.metadata, default=str)),
         )
         self.conn.commit()
+        if cur.rowcount == 0:
+            # Same (scan_id, service, resource_type, resource_id, region) already
+            # stored by another scanner module in this scan — return that row.
+            existing = self.conn.execute(
+                "SELECT * FROM resources WHERE scan_id=? AND service=? AND "
+                "resource_type=? AND resource_id=? AND region=?",
+                (scan_id, service, resource_type, resource_id, region),
+            ).fetchone()
+            if existing:
+                return ResourceRecord(
+                    id=existing["id"], scan_id=existing["scan_id"],
+                    service=existing["service"], resource_type=existing["resource_type"],
+                    resource_id=existing["resource_id"], region=existing["region"],
+                    arn=existing["arn"], metadata=json.loads(existing["metadata_json"]),
+                )
         return rec
 
     def get_resources(self, scan_id: str, service: str | None = None) -> list[ResourceRecord]:

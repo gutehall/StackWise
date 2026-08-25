@@ -33,7 +33,11 @@ def settings(tmp_path: Path) -> Settings:
 
 
 @pytest.fixture
-def scan_db(tmp_path: Path) -> ScanDB:
-    """Return a fresh in-memory-like ScanDB."""
+def scan_db(tmp_path: Path):
+    """Yield a fresh ScanDB, closing it after the test regardless of outcome."""
     db_path = tmp_path / "test.db"
-    return ScanDB(db_path)
+    db = ScanDB(db_path)
+    try:
+        yield db
+    finally:
+        db.close()

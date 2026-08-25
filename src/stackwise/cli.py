@@ -53,13 +53,25 @@ def scan(
         None, "--modules", "-m",
         help="Comma-separated scanner modules",
     ),
+    skip_cost_explorer: bool = typer.Option(
+        False, "--skip-cost-explorer",
+        help="Skip the Cost Explorer call in the cost module — it's the one scanner "
+        "API that isn't free (ce:GetCostAndUsage bills $0.01/request).",
+    ),
 ) -> None:
     """Scan AWS account and store results."""
     from stackwise.scanner.compute import COMPUTE_SCANNERS
     from stackwise.store.db import ScanDB
     from stackwise.utils.aws import create_session, get_account_id
 
-    settings = resolve_settings(profile=profile, regions=regions, modules=modules)
+    try:
+        settings = resolve_settings(
+            profile=profile, regions=regions, modules=modules,
+            skip_cost_explorer=skip_cost_explorer,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
     session = create_session(settings)
 
     console.print(f"[bold]stackwise v{__version__}[/bold] — scanning AWS account")
@@ -100,8 +112,8 @@ def scan(
         from stackwise.scanner.observability import OBSERVABILITY_SCANNERS
         scanners.extend(OBSERVABILITY_SCANNERS)
     if "cost" in settings.modules:
-        from stackwise.scanner.cost import COST_SCANNERS
-        scanners.extend(COST_SCANNERS)
+        from stackwise.scanner.cost import CostScanner
+        scanners.append(CostScanner(skip_cost_explorer=settings.skip_cost_explorer))
     if "discovery" in settings.modules:
         from stackwise.scanner.discovery import DISCOVERY_SCANNERS
         scanners.extend(DISCOVERY_SCANNERS)
@@ -202,6 +214,7 @@ def report(
     db = ScanDB(db_path)
 
     types = ["engineering", "executive", "architecture"] if report_type == "all" else [report_type]
+    any_failed = False
     for rt in types:
         try:
             path = generate_report(
@@ -211,8 +224,12 @@ def report(
             console.print(f"  [green]✓[/green] {rt} report → {path}")
         except Exception as e:
             console.print(f"  [red]✗[/red] {rt} report failed: {e}")
+            any_failed = True
 
     db.close()
+
+    if any_failed:
+        raise typer.Exit(1)
 
 
 # ── run (convenience) ──────────────────────────────────────
@@ -222,6 +239,11 @@ def run(
     profile: str | None = typer.Option(None, "--profile", "-p"),
     regions: str | None = typer.Option(None, "--regions", "-r"),
     modules: str | None = typer.Option(None, "--modules", "-m"),
+    skip_cost_explorer: bool = typer.Option(
+        False, "--skip-cost-explorer",
+        help="Skip the Cost Explorer call in the cost module — it's the one scanner "
+        "API that isn't free (ce:GetCostAndUsage bills $0.01/request).",
+    ),
     model: str | None = typer.Option(None, "--model"),
     engine: str | None = typer.Option(None, "--engine"),
     suppress: str | None = typer.Option(None, "--suppress", "-s"),
@@ -230,7 +252,10 @@ def run(
     output_dir: str | None = typer.Option(None, "--output-dir", "-o"),
 ) -> None:
     """Scan → analyze → report in one command."""
-    scan(profile=profile, regions=regions, modules=modules)
+    scan(
+        profile=profile, regions=regions, modules=modules,
+        skip_cost_explorer=skip_cost_explorer,
+    )
     analyze(
         profile=profile,
         model=model,
@@ -370,12 +395,28 @@ def diff(
 def list_scans(
     profile: str | None = typer.Option(None, "--profile", "-p"),
 ) -> None:
-    """List previous scan snapshots."""
+    """List previous scan snapshots.
+
+    If --profile is given, only shows scans for the account last scanned under
+    that profile (scans are stored by account ID, not profile — there's no
+    other way to know which account a profile maps to without a live AWS call).
+    """
     settings = resolve_settings(profile=profile)
     scans_base = settings.data_dir / "scans"
     if not scans_base.exists():
         console.print("No scans found.")
         raise typer.Exit()
+
+    account_filter: str | None = None
+    if profile:
+        last_account = _last_account_file(settings)
+        if last_account.exists():
+            account_filter = last_account.read_text().strip()
+        else:
+            console.print(
+                f"[yellow]No recorded scan for profile '{profile}' — "
+                f"showing all accounts.[/yellow]"
+            )
 
     table = Table(title="Scan History")
     table.add_column("Account", style="cyan")
@@ -385,6 +426,8 @@ def list_scans(
 
     for account_dir in sorted(scans_base.iterdir()):
         if not account_dir.is_dir():
+            continue
+        if account_filter and account_dir.name != account_filter:
             continue
         for db_file in sorted(account_dir.glob("*.db"), reverse=True):
             size_kb = db_file.stat().st_size / 1024
@@ -405,9 +448,19 @@ def _latest_scan_file(settings, account_id: str) -> Path:
     return settings.data_dir / "scans" / account_id / ".latest"
 
 
+def _profile_key(settings) -> str:
+    """Filesystem-safe key identifying the active AWS profile (or 'default')."""
+    raw = settings.profile or "default"
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in raw)
+
+
 def _last_account_file(settings) -> Path:
-    """Path to file storing the last account scanned."""
-    return settings.data_dir / ".last_account"
+    """Path to file storing the last account scanned under the active profile.
+
+    Scoped per profile so switching --profile doesn't silently resolve
+    analyze/report against a stale account scanned under a different profile.
+    """
+    return settings.data_dir / f".last_account.{_profile_key(settings)}"
 
 
 def _write_latest_scan(settings, account_id: str, scan_id: str, db_path: Path) -> None:

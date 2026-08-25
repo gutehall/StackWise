@@ -18,7 +18,7 @@ For PDF report output, install WeasyPrint system dependencies:
 ## Setup
 
 ```bash
-git clone https://github.com/gutehall/StackWise.git && cd stackwise
+git clone https://github.com/gutehall/StackWise.git && cd StackWise
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -82,6 +82,18 @@ Suppress specific rules:
 ```bash
 stackwise analyze --suppress CMP-001,DAT-002
 # Or: STACKWISE_SUPPRESSED_RULES=CMP-001,DAT-002 stackwise analyze
+```
+
+## Cost
+
+Every scanner call is a free control-plane API (`Describe*`/`List*`/`Get*`) except one:
+Cost Explorer's `GetCostAndUsage` bills **$0.01 per request**. The `cost` module (enabled by
+default) makes exactly one such call per scan, to populate the "Cost by Service" chart. Skip it
+with:
+
+```bash
+stackwise scan --skip-cost-explorer
+# Or: STACKWISE_SKIP_COST_EXPLORER=true stackwise scan
 ```
 
 ## AWS Permissions
