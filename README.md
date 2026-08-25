@@ -30,6 +30,15 @@ To use Ollama for AI-enriched recommendations:
 ollama pull qwen2.5:14b
 ```
 
+StackWise talks to Ollama's REST API at `http://localhost:11434` by default. Override with:
+
+```bash
+OLLAMA_HOST=http://remote-host:11434 stackwise analyze
+STACKWISE_MODEL=llama3.1:8b stackwise analyze   # or: stackwise analyze --model llama3.1:8b
+```
+
+If Ollama isn't reachable or the model isn't pulled, analysis falls back to rules-only.
+
 ## Usage
 
 ### All-in-one
