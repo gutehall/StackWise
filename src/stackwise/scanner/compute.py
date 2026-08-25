@@ -13,6 +13,14 @@ from stackwise.utils.aws import paginate, regional_client
 logger = logging.getLogger(__name__)
 
 
+def _to_int(value):
+    """ECS task def cpu/memory come back as strings (e.g. "256"); coerce or drop."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class EC2Scanner(BaseScanner):
     """Scan EC2 instances, Auto Scaling Groups, and Launch Templates."""
 
@@ -255,8 +263,8 @@ class ECSScanner(BaseScanner):
                         metadata={
                             "family": td_family,
                             "revision": td_revision,
-                            "cpu": td.get("cpu"),
-                            "memory": td.get("memory"),
+                            "cpu": _to_int(td.get("cpu")),
+                            "memory": _to_int(td.get("memory")),
                             "status": td.get("status"),
                         },
                     )
