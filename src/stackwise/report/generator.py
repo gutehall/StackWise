@@ -6,7 +6,8 @@ import json
 import logging
 from pathlib import Path
 
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import FileSystemLoader, select_autoescape
+from jinja2.sandbox import SandboxedEnvironment
 
 from stackwise.analyzer.rules import load_rules
 from stackwise.config import Settings
@@ -23,10 +24,10 @@ _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
-def _get_env() -> Environment:
-    return Environment(
+def _get_env() -> SandboxedEnvironment:
+    return SandboxedEnvironment(
         loader=FileSystemLoader(str(TEMPLATES_DIR)),
-        autoescape=True,
+        autoescape=select_autoescape(default_for_string=True, default=True),
     )
 
 
