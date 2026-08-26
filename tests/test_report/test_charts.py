@@ -41,6 +41,12 @@ def test_cost_pie_chart_empty_returns_empty():
     assert cost_pie_chart({}) == ""
 
 
+def test_cost_pie_chart_all_zero_values_returns_empty():
+    """cost_pie_chart with only zero/negative values (nothing worth charting)
+    should return empty string, not a chart with no visible wedges."""
+    assert cost_pie_chart({"EC2": 0, "S3": 0}) == ""
+
+
 def test_resource_distribution_chart():
     """resource_distribution_chart should return base64 PNG."""
     data = resource_distribution_chart({"ec2": [1, 2, 3], "lambda": [1]})

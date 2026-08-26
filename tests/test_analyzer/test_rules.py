@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import glob
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
 
 from stackwise.analyzer.rules import (
+    Rule,
     RuleConditionError,
     _compile_condition,
+    _default_rules_dir,
     evaluate_rules,
     load_rules,
 )
@@ -309,3 +313,163 @@ def test_cmp019_fires_when_launch_template_allows_imdsv1(scan_db: ScanDB):
     findings = [f for f in scan_db.get_findings(scan.id) if f.rule_id == "CMP-019"]
     assert len(findings) == 1
     assert "lt-optional" in findings[0].detail
+
+
+def test_compile_condition_with_non_name_comprehension_target():
+    """A comprehension target that's neither a Name nor Tuple/List (e.g. a
+    subscript target) binds no names — _target_names must handle it instead
+    of crashing, even though it's an unusual thing for a rule to write."""
+    code = _compile_condition(
+        "any(True for resource['tags'][0] in [1, 2, 3])", "TEST-OK"
+    )
+    assert code is not None
+
+
+def test_compile_condition_with_tuple_destructuring_comprehension():
+    """A comprehension binding a tuple target ('for k, v in ...') must bind
+    both k and v as allowed names, not just the first."""
+    code = _compile_condition(
+        "any(v == 'x' for k, v in resource.get('Tags', {}).items())", "TEST-OK"
+    )
+    assert code is not None
+
+
+def test_compile_condition_syntax_error_is_rejected():
+    with pytest.raises(RuleConditionError, match="syntax error"):
+        _compile_condition("resource.get('X') ==", "TEST-BAD")
+
+
+def test_compile_condition_rejects_disallowed_syntax():
+    """A lambda is not in the AST allowlist and must be rejected."""
+    with pytest.raises(RuleConditionError, match="disallowed syntax"):
+        _compile_condition("(lambda: True)()", "TEST-BAD")
+
+
+def test_compile_condition_rejects_keyword_call_args():
+    with pytest.raises(RuleConditionError, match="keyword/starred"):
+        _compile_condition("len(resource, x=1)", "TEST-BAD")
+
+
+def test_compile_condition_rejects_starred_call_args():
+    with pytest.raises(RuleConditionError, match="keyword/starred"):
+        _compile_condition("len(*[resource])", "TEST-BAD")
+
+
+def test_default_rules_dir_falls_back_to_app_rules_when_it_exists():
+    """If the packaged rules/ dir isn't found but /app/rules exists (the
+    Docker image layout), that fallback must be used."""
+
+    def _is_dir(self: Path) -> bool:
+        return str(self) == "/app/rules"
+
+    with patch.object(Path, "is_dir", _is_dir):
+        assert _default_rules_dir() == Path("/app/rules")
+
+
+def test_default_rules_dir_returns_packaged_path_when_neither_exists():
+    """If neither the packaged dir nor /app/rules exists, fall back to
+    returning the (nonexistent) packaged path — load_rules() then logs and
+    returns an empty rule set rather than raising."""
+    import stackwise.analyzer.rules as rules_module
+
+    expected = Path(rules_module.__file__).resolve().parent.parent / "rules"
+    with patch.object(Path, "is_dir", return_value=False):
+        assert _default_rules_dir() == expected
+
+
+def test_load_rules_missing_directory_returns_empty_list(tmp_path: Path):
+    result = load_rules(rules_dir=tmp_path / "does-not-exist")
+    assert result == []
+
+
+def test_load_rules_skips_rule_with_invalid_condition(tmp_path: Path):
+    """A rule whose condition fails AST validation must be rejected and
+    logged, not abort loading the rest of the file."""
+    (tmp_path / "bad.yaml").write_text(
+        yaml.dump(
+            [
+                {
+                    "id": "BAD-001",
+                    "title": "Uses eval",
+                    "severity": "LOW",
+                    "resource_type": "thing",
+                    "condition": "eval('1')",
+                },
+                {
+                    "id": "GOOD-001",
+                    "title": "Fine",
+                    "severity": "LOW",
+                    "resource_type": "thing",
+                    "condition": "resource.get('x') is None",
+                },
+            ]
+        )
+    )
+    rules = load_rules(rules_dir=tmp_path)
+    ids = [r.id for r in rules]
+    assert "BAD-001" not in ids
+    assert "GOOD-001" in ids
+
+
+def test_load_rules_handles_malformed_yaml_file(tmp_path: Path):
+    """A YAML file that fails to parse entirely must not crash load_rules() —
+    it's logged and skipped, other files still load."""
+    (tmp_path / "broken.yaml").write_text("id: [unterminated")
+    (tmp_path / "good.yaml").write_text(
+        yaml.dump(
+            [
+                {
+                    "id": "GOOD-002",
+                    "title": "Fine",
+                    "severity": "LOW",
+                    "resource_type": "thing",
+                    "condition": "resource.get('x') is None",
+                }
+            ]
+        )
+    )
+    rules = load_rules(rules_dir=tmp_path)
+    assert [r.id for r in rules] == ["GOOD-002"]
+
+
+def test_evaluate_rules_skips_suppressed_rule_ids(scan_db: ScanDB):
+    """A rule ID in suppressed_rules must be skipped entirely, even for a
+    resource that would otherwise match."""
+    rules = load_rules()
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(
+        scan.id, "ec2", "instance", "i-public", "us-east-1",
+        metadata={"PublicIpAddress": "1.2.3.4"},
+    )
+
+    evaluate_rules(rules, scan_db, scan.id, suppressed_rules=["CMP-001"])
+
+    findings = scan_db.get_findings(scan.id)
+    assert not any(f.rule_id == "CMP-001" for f in findings)
+
+
+def test_evaluate_rules_catches_runtime_exception_in_condition(scan_db: ScanDB):
+    """A condition that passes AST validation but raises at eval() time
+    (e.g. comparing incompatible types) must be logged and skipped, not
+    crash the whole rule evaluation pass."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(
+        scan.id, "ec2", "instance", "i-1", "us-east-1",
+        metadata={"Count": "not-a-number"},
+    )
+    condition = "resource.get('Count') > 5"
+    rule = Rule(
+        id="RUNTIME-ERR",
+        title="Bad rule",
+        severity="LOW",
+        resource_type="instance",
+        service="ec2",
+        condition=condition,
+        remediation="",
+        compiled_condition=_compile_condition(condition, "RUNTIME-ERR"),
+    )
+
+    count = evaluate_rules([rule], scan_db, scan.id)
+
+    assert count == 0
+    assert scan_db.get_findings(scan.id) == []

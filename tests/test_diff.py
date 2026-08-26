@@ -86,3 +86,16 @@ def test_diff_scans_closes_connections_even_on_failure(tmp_path: Path):
             diff_scans(tmp_path / "scan1.db", tmp_path / "scan2.db")
 
     assert len(close_calls) == 2
+
+
+def test_diff_scans_raises_when_a_scan_has_no_record(tmp_path: Path):
+    """A DB file with no scan row (e.g. created but never populated) must raise
+    a clear ValueError rather than diffing against a None scan."""
+    db1 = ScanDB(tmp_path / "empty1.db")
+    db2 = ScanDB(tmp_path / "scan2.db")
+    db2.create_scan("123", ["us-east-1"], ["compute"])
+    db1.close()
+    db2.close()
+
+    with pytest.raises(ValueError, match="no scan record"):
+        diff_scans(tmp_path / "empty1.db", tmp_path / "scan2.db")
