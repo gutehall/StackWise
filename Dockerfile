@@ -18,9 +18,10 @@ RUN useradd --create-home --shell /bin/bash stackwise && \
 
 ENV STACKWISE_DATA_DIR=/data
 ENV PYTHONUNBUFFERED=1
-VOLUME /data
 
 USER stackwise
+
+VOLUME /data
 
 ENTRYPOINT ["stackwise"]
 CMD ["--help"]
