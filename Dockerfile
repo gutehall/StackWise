@@ -13,9 +13,14 @@ COPY src ./src
 
 RUN pip install --no-cache-dir .
 
+RUN useradd --create-home --shell /bin/bash stackwise && \
+    mkdir -p /data && chown stackwise:stackwise /data
+
 ENV STACKWISE_DATA_DIR=/data
 ENV PYTHONUNBUFFERED=1
 VOLUME /data
+
+USER stackwise
 
 ENTRYPOINT ["stackwise"]
 CMD ["--help"]
