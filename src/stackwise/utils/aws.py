@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Iterator
 from typing import Any
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
 
 from stackwise.config import Settings
 
@@ -63,22 +61,3 @@ def paginate(client, method: str, key: str, **kwargs) -> list[dict]:
     for page in paginator.paginate(**kwargs):
         results.extend(page.get(key, []))
     return results
-
-
-def retry_on_throttle(func, *args, max_retries: int = 5, **kwargs):
-    """Call *func* with exponential backoff on throttling errors."""
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code in ("Throttling", "TooManyRequestsException", "RequestLimitExceeded"):
-                wait = 2**attempt
-                logger.warning(
-                    "Throttled (%s), retrying in %ds (attempt %d)",
-                    code, wait, attempt + 1,
-                )
-                time.sleep(wait)
-            else:
-                raise
-    return func(*args, **kwargs)  # final attempt, let it raise

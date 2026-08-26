@@ -153,7 +153,7 @@ def generate_report(
             WeasyHTML(string=html_content, base_url=base_url).write_pdf(str(out_path))
             logger.info("PDF report written to %s", out_path)
             return out_path
-        except ImportError:
+        except (ImportError, OSError):
             logger.error(
                 "WeasyPrint is not installed or system deps are missing. "
                 "Falling back to HTML output."

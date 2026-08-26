@@ -101,6 +101,17 @@ class NetworkScanner(BaseScanner):
                     attrs = attr_resp.get("Attributes", [])
                 except Exception:
                     logger.debug("describe_load_balancer_attributes failed for %s", lb_arn)
+                listeners: list[dict] = []
+                try:
+                    listener_resp = paginate(
+                        elbv2, "describe_listeners", "Listeners", LoadBalancerArn=lb_arn
+                    )
+                    listeners = [
+                        {"Protocol": lst.get("Protocol"), "Port": lst.get("Port")}
+                        for lst in listener_resp
+                    ]
+                except Exception:
+                    logger.debug("describe_listeners failed for %s", lb_arn)
                 db.insert_resource(
                     scan_id=scan_id,
                     service="elbv2",
@@ -114,6 +125,7 @@ class NetworkScanner(BaseScanner):
                         "Type": lb.get("Type"),
                         "State": lb.get("State", {}).get("Code"),
                         "Attributes": attrs,
+                        "Listeners": listeners,
                     },
                 )
                 count += 1
@@ -155,6 +167,21 @@ class NetworkScanner(BaseScanner):
                     full = apigw.get_rest_api(restApiId=api_id)
                 except Exception:
                     full = api
+                # Throttling on a REST API is set per-stage (default method settings
+                # under the "*/*" key) — there is no API-level throttle field, so we
+                # take the first stage that has one configured.
+                throttle: dict = {}
+                try:
+                    stages = apigw.get_stages(restApiId=api_id).get("item", [])
+                    for stage in stages:
+                        settings = stage.get("methodSettings", {}).get("*/*", {})
+                        rate = settings.get("throttlingRateLimit")
+                        burst = settings.get("throttlingBurstLimit")
+                        if rate or burst:
+                            throttle = {"rateLimit": rate, "burstLimit": burst}
+                            break
+                except Exception:
+                    logger.debug("get_stages failed for %s", api_id, exc_info=True)
                 db.insert_resource(
                     scan_id=scan_id,
                     service="apigateway",
@@ -166,7 +193,7 @@ class NetworkScanner(BaseScanner):
                         "id": api_id,
                         "name": full.get("name", api.get("name")),
                         "ApiKeySource": full.get("apiKeySource"),
-                        "Throttle": {},
+                        "Throttle": throttle,
                     },
                 )
                 count += 1

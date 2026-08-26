@@ -221,7 +221,9 @@ class DynamoDBScanner(BaseScanner):
                     tbl = desc.get("Table", {})
                     pitr = ddb.describe_continuous_backups(TableName=table_name)
                     pitr_desc = pitr.get("ContinuousBackupsDescription", {})
-                    pitr_status = pitr_desc.get("PointInTimeRecoveryStatus")
+                    pitr_status = pitr_desc.get("PointInTimeRecoveryDescription", {}).get(
+                        "PointInTimeRecoveryStatus"
+                    )
                     db.insert_resource(
                         scan_id=scan_id,
                         service="dynamodb",

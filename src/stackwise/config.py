@@ -16,14 +16,6 @@ class Engine(StrEnum):
     RULES_ONLY = "rules-only"
 
 
-class Severity(StrEnum):
-    CRITICAL = "CRITICAL"
-    HIGH = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
-    INFO = "INFO"
-
-
 ALL_MODULES = ["compute", "data", "network", "security", "observability", "cost", "discovery"]
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"

@@ -40,6 +40,9 @@ class EC2Scanner(BaseScanner):
         # ── EC2 Instances ──────────────────────────────────
         reservations = paginate(ec2, "describe_instances", "Reservations")
         for res in reservations:
+            # OwnerId is on the reservation, not the instance — already free in this
+            # response, no separate STS call needed to build a real ARN.
+            owner_id = res.get("OwnerId", "")
             for inst in res.get("Instances", []):
                 instance_id = inst["InstanceId"]
                 db.insert_resource(
@@ -48,9 +51,7 @@ class EC2Scanner(BaseScanner):
                     resource_type="instance",
                     resource_id=instance_id,
                     region=region,
-                    arn=f"arn:aws:ec2:{region}:{session.client('sts').get_caller_identity()['Account']}:instance/{instance_id}"
-                    if False  # skip expensive STS call per instance
-                    else None,
+                    arn=f"arn:aws:ec2:{region}:{owner_id}:instance/{instance_id}",
                     metadata={
                         "InstanceId": instance_id,
                         "InstanceType": inst.get("InstanceType"),

@@ -82,7 +82,9 @@
   resource_type: load_balancer
   service: elbv2
   condition: |
-    resource.get('Scheme') == 'http'
+    bool(resource.get('Listeners')) and not any(
+      l.get('Protocol') in ('HTTPS', 'TLS') for l in resource.get('Listeners', [])
+    )
   remediation: >
     Use HTTPS listeners with ACM certificates for encrypted traffic.
 

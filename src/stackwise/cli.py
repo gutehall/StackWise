@@ -134,7 +134,6 @@ def scan(
             )
             total_resources += count
 
-    db.summary(scan_rec.id)
     console.print(
         f"\n[bold green]Scan complete:[/bold green] "
         f"{total_resources} resources collected"

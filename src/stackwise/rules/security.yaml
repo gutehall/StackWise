@@ -71,9 +71,21 @@
   resource_type: key
   service: kms
   condition: |
-    resource.get('KeyRotationEnabled') is not True
+    not resource.get('KeyRotationCheckFailed') and resource.get('KeyRotationEnabled') is not True
   remediation: >
     Enable automatic key rotation for KMS keys (annual for customer keys).
+
+- id: SEC-013
+  title: "KMS key rotation status could not be verified"
+  severity: INFO
+  resource_type: key
+  service: kms
+  condition: |
+    resource.get('KeyRotationCheckFailed') is True
+  remediation: >
+    get_key_rotation_status failed for this key (unsupported for asymmetric/HMAC
+    keys, imported key material, or a custom key store — or a permissions/API
+    error). Verify manually rather than trusting SEC-005 for this key.
 
 - id: SEC-006
   title: "KMS key is AWS managed (not customer managed)"

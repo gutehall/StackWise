@@ -146,12 +146,22 @@ class SecurityScanner(BaseScanner):
             for key in keys:
                 key_id = key["KeyId"]
                 try:
-                    desc = kms.describe_key(KeyId=key_id)
-                    key_meta = desc.get("KeyMetadata", {})
+                    key_meta = kms.describe_key(KeyId=key_id).get("KeyMetadata", {})
+                except Exception:
+                    logger.debug("describe_key failed for %s", key_id, exc_info=True)
+                    key_meta = {}
+                # Rotation status is unsupported for asymmetric/HMAC keys, keys with
+                # imported material, and keys in a custom key store — a failure here
+                # is not "rotation disabled" and must not blank out key_meta above.
+                rotation_check_failed = False
+                try:
                     rot = kms.get_key_rotation_status(KeyId=key_id)
                 except Exception:
-                    key_meta = {}
+                    logger.debug(
+                        "get_key_rotation_status failed for %s", key_id, exc_info=True
+                    )
                     rot = {}
+                    rotation_check_failed = True
                 db.insert_resource(
                     scan_id=scan_id,
                     service="kms",
@@ -165,6 +175,7 @@ class SecurityScanner(BaseScanner):
                         "KeyManager": key_meta.get("KeyManager"),
                         "KeyState": key_meta.get("KeyState"),
                         "KeyRotationEnabled": rot.get("KeyRotationEnabled"),
+                        "KeyRotationCheckFailed": rotation_check_failed,
                     },
                 )
                 count += 1

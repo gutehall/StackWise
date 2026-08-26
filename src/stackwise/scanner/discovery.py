@@ -43,16 +43,18 @@ class DiscoveryScanner(BaseScanner):
 
             for rec in recorders.get("ConfigurationRecorders", []):
                 rec_name = rec.get("name", "default")
+                # roleARN is normally "arn:aws:iam::<account>:role/...", account is
+                # segment [4]. Guard against a malformed/missing roleARN so one bad
+                # recorder doesn't raise IndexError and abort the whole region's scan.
+                role_arn_parts = rec.get("roleARN", "").split(":")
+                account_id = role_arn_parts[4] if len(role_arn_parts) > 4 else ""
                 db.insert_resource(
                     scan_id=scan_id,
                     service="config",
                     resource_type="recorder",
                     resource_id=rec_name,
                     region=region,
-                    arn=(
-                        f"arn:aws:config:{region}:"
-                        f"{rec.get('roleARN', '').split(':')[4]}:config-recorder/{rec_name}"
-                    ),
+                    arn=f"arn:aws:config:{region}:{account_id}:config-recorder/{rec_name}",
                     metadata={
                         "name": rec_name,
                         "recording": recording_by_name.get(rec_name, False),
