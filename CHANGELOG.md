@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.1 — 2026-08-26
+
+### Bug Fixes
+- Fix scanner/rule correctness bugs, remove dead code — NET-007/NET-010 rules that never matched or always fired, a KMS scanner bug that discarded key metadata on rotation-status failure, a DynamoDB PITR field read one level too shallow (fired on every table), a Config recorder IndexError on malformed roleARN, and a PDF report fallback that only caught ImportError
+- PR #3: fix: replace direct jinja2.Environment with SandboxedEnvironment to prevent XSS
+- PR #1: Add non-root USER to Dockerfile to fix container security finding
+- fix: PDF report test assumed WeasyPrint system libs present in CI
+
+### Chores
+- Bring test coverage to 100%, fix moto apigateway extra
+- ci: pin GitHub Actions to commit SHAs (mitigates supply-chain risk from mutable tag refs)
+
+### Documentation
+- Expand README intro to explain what StackWise does
+- Document release cadence in CLAUDE.md
+- Add CHANGELOG.md for v0.1.0
+
 ## v0.1.0 — 2026-08-25
 
 First release.
