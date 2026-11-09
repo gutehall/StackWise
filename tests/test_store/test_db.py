@@ -1,9 +1,12 @@
 """Tests for the SQLite data store."""
 
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 from stackwise.store.db import ScanDB
 
@@ -250,3 +253,53 @@ def test_opening_legacy_db_without_scan_errors_table_works(tmp_path: Path):
         assert db.get_scan_errors("scan1") == []
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("mode", ["rw", "ro"])
+def test_opening_a_missing_file_raises_and_creates_nothing(tmp_path: Path, mode: str):
+    path = tmp_path / "missing" / "scan.db"
+
+    with pytest.raises(FileNotFoundError, match="Scan database not found"):
+        ScanDB(path, mode=mode)
+
+    assert not path.parent.exists()
+
+
+def test_read_only_open_cannot_write_and_keeps_mtime(tmp_path: Path):
+    path = tmp_path / "scan.db"
+    db = ScanDB(path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    db.close()
+    os.utime(path, (1_000_000, 1_000_000))
+
+    ro = ScanDB(path, mode="ro")
+    try:
+        assert ro.get_scan(scan.id) is not None
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            ro.create_scan("123456789012", ["us-east-1"], ["compute"])
+    finally:
+        ro.close()
+
+    assert path.stat().st_mtime == 1_000_000
+
+
+def test_read_write_open_adds_newer_tables_to_an_existing_file(tmp_path: Path):
+    """Analyze writes to old scan files, so "rw" still applies the additive schema."""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE unrelated (id TEXT)")
+    conn.commit()
+    conn.close()
+
+    db = ScanDB(path, mode="rw")
+    try:
+        assert db.get_scan_errors("any") == []
+    finally:
+        db.close()
+
+
+def test_path_with_uri_characters_opens_read_only(tmp_path: Path):
+    path = tmp_path / "a b?c#d%e.db"
+    ScanDB(path).close()
+
+    ScanDB(path, mode="ro").close()

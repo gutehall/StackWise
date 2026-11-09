@@ -6,6 +6,7 @@ individual functions can't see."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -647,3 +648,98 @@ def test_run_stops_after_failed_scan(tmp_path: Path, monkeypatch):
     run_analysis.assert_not_called()
     generate_report.assert_not_called()
     assert not list(output_dir.glob("*"))
+
+
+_READ_COMMANDS = [["analyze", "--engine", "rules-only"], ["report"], ["diff"]]
+
+
+def _point_latest_at(db_path: Path, scan_id: str, monkeypatch, tmp_path: Path) -> None:
+    from stackwise.cli import _write_latest_scan
+    from stackwise.config import resolve_settings
+
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _write_latest_scan(resolve_settings(), "123456789012", scan_id, db_path)
+
+
+@pytest.mark.parametrize("command", _READ_COMMANDS, ids=lambda c: c[0])
+def test_pointer_to_deleted_database_exits_1_without_creating_it(
+    tmp_path: Path, monkeypatch, command: list[str]
+):
+    db_path = tmp_path / "deleted.db"
+    _point_latest_at(db_path, "gone", monkeypatch, tmp_path)
+
+    result = runner.invoke(app, command)
+
+    assert result.exit_code == 1
+    assert "Scan database not found" in result.output
+    assert "complete" not in result.output
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("command", _READ_COMMANDS, ids=lambda c: c[0])
+def test_pointer_whose_scan_id_is_absent_exits_1(
+    tmp_path: Path, monkeypatch, command: list[str]
+):
+    db_path = tmp_path / "other.db"
+    db = ScanDB(db_path)
+    db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    db.close()
+    _point_latest_at(db_path, "not-this-scan", monkeypatch, tmp_path)
+
+    result = runner.invoke(app, command)
+
+    assert result.exit_code == 1
+    assert "not-this-scan not found" in result.output
+
+
+@pytest.mark.parametrize("command", _READ_COMMANDS, ids=lambda c: c[0])
+def test_pointer_to_empty_file_exits_1_and_leaves_it_empty(
+    tmp_path: Path, monkeypatch, command: list[str]
+):
+    """An empty file left by an earlier run must not be given a schema."""
+    db_path = tmp_path / "empty.db"
+    db_path.touch()
+    _point_latest_at(db_path, "gone", monkeypatch, tmp_path)
+
+    result = runner.invoke(app, command)
+
+    assert result.exit_code == 1
+    assert "gone not found" in result.output
+    assert db_path.stat().st_size == 0
+
+
+def test_report_does_not_change_the_scan_file(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "scan.db"
+    db = ScanDB(db_path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    db.close()
+    os.utime(db_path, (1_000_000, 1_000_000))
+    _point_latest_at(db_path, scan.id, monkeypatch, tmp_path)
+
+    result = runner.invoke(app, ["report", "--output-dir", str(tmp_path / "out")])
+
+    assert result.exit_code == 0, result.output
+    assert db_path.stat().st_mtime == 1_000_000
+
+
+def test_analyze_can_still_write_findings(tmp_path: Path, monkeypatch):
+    """Analyze verifies read-only, then needs a writable connection for its results."""
+    db_path = tmp_path / "scan.db"
+    db = ScanDB(db_path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    db.insert_resource(
+        scan.id, "ec2", "instance", "i-1", "us-east-1",
+        metadata={"PublicIpAddress": "1.2.3.4"},
+    )
+    db.close()
+    _point_latest_at(db_path, scan.id, monkeypatch, tmp_path)
+
+    result = runner.invoke(app, ["analyze", "--engine", "rules-only"])
+
+    assert result.exit_code == 0, result.output
+    assert "Analysis complete" in result.output
+    db = ScanDB(db_path, mode="ro")
+    try:
+        assert db.get_findings(scan.id)
+    finally:
+        db.close()

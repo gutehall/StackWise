@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,12 +37,19 @@ def diff_scans(
     compare_db_path: Path,
 ) -> DiffResult:
     """Compare two scans and return added/removed resources and findings."""
-    base_db = ScanDB(base_db_path)
-    compare_db = ScanDB(compare_db_path)
+    base_db = ScanDB(base_db_path, mode="ro")
+    try:
+        compare_db = ScanDB(compare_db_path, mode="ro")
+    except Exception:
+        base_db.close()
+        raise
 
     try:
-        base_scan = base_db.latest_scan()
-        compare_scan = compare_db.latest_scan()
+        try:
+            base_scan = base_db.latest_scan()
+            compare_scan = compare_db.latest_scan()
+        except sqlite3.DatabaseError:  # empty file, or not a scan database at all
+            base_scan = compare_scan = None
         if not base_scan or not compare_scan:
             raise ValueError("One or both scans have no scan record")
 

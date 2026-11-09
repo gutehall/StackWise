@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -143,14 +143,29 @@ class ScanErrorRecord:
 
 
 class ScanDB:
-    """Thin wrapper around a per-scan SQLite database."""
+    """Thin wrapper around a per-scan SQLite database.
 
-    def __init__(self, db_path: Path) -> None:
+    ``mode`` is ``"create"`` for a new scan, ``"rw"`` to write to an existing file,
+    or ``"ro"`` to read one without changing it, including its mtime. ``"rw"`` and
+    ``"ro"`` raise FileNotFoundError for a missing file instead of creating it.
+    ``"ro"`` skips the schema, so a table newer than the file can be absent.
+    """
+
+    def __init__(self, db_path: Path, mode: Literal["create", "rw", "ro"] = "create") -> None:
         self.db_path = db_path
         self._lock = threading.Lock()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        if mode == "create":
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        else:
+            if not db_path.exists():
+                raise FileNotFoundError(f"Scan database not found: {db_path}")
+            self.conn = sqlite3.connect(
+                f"{db_path.resolve().as_uri()}?mode={mode}", uri=True, check_same_thread=False
+            )
         self.conn.row_factory = sqlite3.Row
+        if mode == "ro":
+            return
         self.conn.executescript(_SCHEMA)
         try:
             self.conn.execute(_UNIQUE_RESOURCE_INDEX)

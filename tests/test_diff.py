@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -99,3 +100,44 @@ def test_diff_scans_raises_when_a_scan_has_no_record(tmp_path: Path):
 
     with pytest.raises(ValueError, match="no scan record"):
         diff_scans(tmp_path / "empty1.db", tmp_path / "scan2.db")
+
+
+def test_diff_scans_does_not_change_either_file(tmp_path: Path):
+    """Reading an old scan must not make it look like the newest one."""
+    paths = [tmp_path / "scan1.db", tmp_path / "scan2.db"]
+    for path in paths:
+        db = ScanDB(path)
+        db.create_scan("123", ["us-east-1"], ["compute"])
+        db.close()
+        os.utime(path, (1_000_000, 1_000_000))
+
+    diff_scans(*paths)
+
+    assert [p.stat().st_mtime for p in paths] == [1_000_000, 1_000_000]
+
+
+def test_diff_scans_missing_compare_raises_and_creates_nothing(tmp_path: Path):
+    base = tmp_path / "base.db"
+    db = ScanDB(base)
+    db.create_scan("123", ["us-east-1"], ["compute"])
+    db.close()
+    missing = tmp_path / "missing.db"
+
+    with pytest.raises(FileNotFoundError):
+        diff_scans(base, missing)
+
+    assert not missing.exists()
+
+
+def test_diff_scans_empty_file_has_no_scan_record(tmp_path: Path):
+    base = tmp_path / "base.db"
+    db = ScanDB(base)
+    db.create_scan("123", ["us-east-1"], ["compute"])
+    db.close()
+    empty = tmp_path / "empty.db"
+    empty.touch()
+
+    with pytest.raises(ValueError, match="no scan record"):
+        diff_scans(base, empty)
+
+    assert empty.stat().st_size == 0

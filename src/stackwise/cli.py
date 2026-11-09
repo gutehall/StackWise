@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -15,6 +17,9 @@ from rich.table import Table
 from stackwise import __version__
 from stackwise.config import resolve_settings
 from stackwise.utils.logging import setup_logging
+
+if TYPE_CHECKING:
+    from stackwise.store.db import ScanDB
 
 app = typer.Typer(
     name="stackwise",
@@ -178,7 +183,6 @@ def analyze(
 ) -> None:
     """Run rule-based + AI analysis on the latest scan."""
     from stackwise.analyzer.engine import run_analysis
-    from stackwise.store.db import ScanDB
 
     settings = resolve_settings(
         profile=profile, model=model, engine=engine,
@@ -189,8 +193,8 @@ def analyze(
         console.print("[red]No scan found. Run 'stackwise scan' first.[/red]")
         raise typer.Exit(1)
 
+    db = _open_scan(db_path, scan_id, writable=True)
     console.print(f"[bold]Analyzing scan {scan_id}[/bold] from {db_path}")
-    db = ScanDB(db_path)
     run_analysis(settings, db, scan_id)
     db.close()
 
@@ -218,7 +222,6 @@ def report(
 ) -> None:
     """Generate reports from the latest analyzed scan."""
     from stackwise.report.generator import generate_report
-    from stackwise.store.db import ScanDB
 
     settings = resolve_settings(profile=profile, output_dir=output_dir)
     db_path, scan_id = _read_latest_scan(settings, account_id=account)
@@ -226,7 +229,7 @@ def report(
         console.print("[red]No scan found. Run 'stackwise scan' first.[/red]")
         raise typer.Exit(1)
 
-    db = ScanDB(db_path)
+    db = _open_scan(db_path, scan_id)
 
     types = ["engineering", "executive", "architecture"] if report_type == "all" else [report_type]
     any_failed = False
@@ -317,9 +320,10 @@ def diff(
             raise typer.Exit(1)
     else:
         db_path, scan_id = _read_latest_scan(settings)
-        if not db_path or not db_path.exists():
+        if not db_path:
             console.print("[red]No latest scan. Run 'stackwise scan' first.[/red]")
             raise typer.Exit(1)
+        _open_scan(db_path, scan_id).close()
         compare_path = db_path
 
     if base:
@@ -341,7 +345,7 @@ def diff(
 
     try:
         result = diff_scans(base_path, compare_path)
-    except ValueError as e:
+    except (ValueError, FileNotFoundError) as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
@@ -485,6 +489,43 @@ def _write_latest_scan(settings, account_id: str, scan_id: str, db_path: Path) -
     last_account = _last_account_file(settings)
     last_account.parent.mkdir(parents=True, exist_ok=True)
     last_account.write_text(account_id)
+
+
+def _open_scan(db_path: Path, scan_id: str, *, writable: bool = False) -> ScanDB:
+    """Open the scan a pointer names, or exit 1 if the file or scan is gone.
+
+    Checks on a read-only connection first, so that a missing file isn't created
+    and a file without this scan isn't given a schema.
+    """
+    from stackwise.store.db import ScanDB
+
+    try:
+        db = ScanDB(db_path, mode="ro")
+    except (FileNotFoundError, sqlite3.OperationalError):
+        console.print(
+            f"[red]Scan database not found: {escape(str(db_path))}. "
+            "Run 'stackwise scan' again.[/red]",
+            soft_wrap=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        found = db.get_scan(scan_id) is not None
+    except sqlite3.DatabaseError:  # empty file, or not a scan database at all
+        found = False
+    if not found:
+        db.close()
+        console.print(
+            f"[red]Scan {escape(scan_id)} not found in {escape(str(db_path))}. "
+            "Run 'stackwise scan' again.[/red]",
+            soft_wrap=True,
+        )
+        raise typer.Exit(1)
+
+    if writable:
+        db.close()
+        return ScanDB(db_path, mode="rw")
+    return db
 
 
 def _read_latest_scan(
