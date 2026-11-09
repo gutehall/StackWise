@@ -18,7 +18,7 @@
   resource_type: vpc
   service: ec2
   condition: |
-    not resource.get('FlowLogsEnabled') and not resource.get('FlowLogs')
+    not resource.get('FlowLogsCheckFailed') and not resource.get('FlowLogsEnabled') and not resource.get('FlowLogs')
   remediation: >
     Enable VPC Flow Logs for network traffic monitoring and troubleshooting.
 
@@ -72,7 +72,7 @@
   resource_type: load_balancer
   service: elbv2
   condition: |
-    not any(a.get('Key') == 'access_logs.s3.enabled' and a.get('Value') == 'true' for a in (resource.get('Attributes') or []))
+    not resource.get('AttributesCheckFailed') and not any(a.get('Key') == 'access_logs.s3.enabled' and a.get('Value') == 'true' for a in (resource.get('Attributes') or []))
   remediation: >
     Enable access logs for audit and troubleshooting.
 
@@ -82,7 +82,7 @@
   resource_type: load_balancer
   service: elbv2
   condition: |
-    bool(resource.get('Listeners')) and not any(
+    not resource.get('ListenersCheckFailed') and bool(resource.get('Listeners')) and not any(
       l.get('Protocol') in ('HTTPS', 'TLS') for l in resource.get('Listeners', [])
     )
   remediation: >
@@ -94,7 +94,7 @@
   resource_type: load_balancer
   service: elbv2
   condition: |
-    not any(a.get('Key') == 'deletion_protection.enabled' and a.get('Value') == 'true' for a in (resource.get('Attributes') or []))
+    not resource.get('AttributesCheckFailed') and not any(a.get('Key') == 'deletion_protection.enabled' and a.get('Value') == 'true' for a in (resource.get('Attributes') or []))
   remediation: >
     Enable deletion protection for production load balancers.
 
@@ -116,7 +116,7 @@
   resource_type: rest_api
   service: apigateway
   condition: |
-    not resource.get('Throttle', {}).get('rateLimit') and not resource.get('Throttle', {}).get('burstLimit')
+    not resource.get('ThrottleCheckFailed') and (resource.get('Throttle') or {}).get('rateLimit') is None and (resource.get('Throttle') or {}).get('burstLimit') is None
   remediation: >
     Configure throttling to protect against abuse and control costs.
 
@@ -129,3 +129,37 @@
     not resource.get('ApiKeySource') or resource.get('ApiKeySource') == 'HEADER'
   remediation: >
     Consider API keys or IAM auth for internal APIs to track usage.
+
+# Checks that could not run
+- id: NET-012
+  title: "VPC flow log configuration could not be verified"
+  severity: INFO
+  resource_type: vpc
+  service: ec2
+  condition: |
+    resource.get('FlowLogsCheckFailed')
+  remediation: >
+    The flow log check failed (permissions or API error), so NET-002 was skipped
+    for this VPC. Verify manually, and check for ec2:DescribeFlowLogs.
+
+- id: NET-013
+  title: "Load balancer configuration could not be verified"
+  severity: INFO
+  resource_type: load_balancer
+  service: elbv2
+  condition: |
+    resource.get('AttributesCheckFailed') or resource.get('ListenersCheckFailed')
+  remediation: >
+    An attribute or listener check failed (permissions or API error), so NET-006,
+    NET-007 or NET-008 was skipped for this load balancer. Verify manually.
+
+- id: NET-014
+  title: "API Gateway throttling could not be verified"
+  severity: INFO
+  resource_type: rest_api
+  service: apigateway
+  condition: |
+    resource.get('ThrottleCheckFailed')
+  remediation: >
+    The stage lookup failed (permissions or API error), so NET-010 was skipped for
+    this API. Verify manually.

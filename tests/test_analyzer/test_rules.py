@@ -473,3 +473,89 @@ def test_evaluate_rules_catches_runtime_exception_in_condition(scan_db: ScanDB):
 
     assert count == 0
     assert scan_db.get_findings(scan.id) == []
+
+
+_VPC = ("ec2", "vpc")
+_LB = ("elbv2", "load_balancer")
+_API = ("apigateway", "rest_api")
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like the insecure setting.
+        (_VPC, {"FlowLogsCheckFailed": True}, "NET-002", False),
+        (_LB, {"AttributesCheckFailed": True}, "NET-006", False),
+        (_LB, {"AttributesCheckFailed": True}, "NET-008", False),
+        (_LB, {"ListenersCheckFailed": True}, "NET-007", False),
+        (_API, {"ThrottleCheckFailed": True}, "NET-010", False),
+        # The real misconfiguration still fires.
+        (_VPC, {"FlowLogsCheckFailed": False, "FlowLogsEnabled": False, "FlowLogs": []},
+         "NET-002", True),
+        (_LB, {"AttributesCheckFailed": False, "Attributes": []}, "NET-006", True),
+        (_LB, {"AttributesCheckFailed": False,
+               "Attributes": [{"Key": "access_logs.s3.enabled", "Value": "false"}]},
+         "NET-006", True),
+        (_LB, {"AttributesCheckFailed": False, "Attributes": []}, "NET-008", True),
+        (_LB, {"ListenersCheckFailed": False, "Listeners": [{"Protocol": "HTTP", "Port": 80}]},
+         "NET-007", True),
+        (_API, {"ThrottleCheckFailed": False, "Throttle": {}}, "NET-010", True),
+        # A correct setting doesn't fire.
+        (_VPC, {"FlowLogsCheckFailed": False, "FlowLogsEnabled": True, "FlowLogs": [{}]},
+         "NET-002", False),
+        (_LB, {"AttributesCheckFailed": False,
+               "Attributes": [{"Key": "access_logs.s3.enabled", "Value": "true"}]},
+         "NET-006", False),
+        (_LB, {"AttributesCheckFailed": False,
+               "Attributes": [{"Key": "deletion_protection.enabled", "Value": "true"}]},
+         "NET-008", False),
+        (_LB, {"ListenersCheckFailed": False, "Listeners": [{"Protocol": "HTTPS", "Port": 443}]},
+         "NET-007", False),
+        # A limit of 0 blocks all traffic, so it counts as configured.
+        (_API, {"Throttle": {"rateLimit": 0, "burstLimit": None}}, "NET-010", False),
+        (_API, {"Throttle": {"rateLimit": None, "burstLimit": 0}}, "NET-010", False),
+        (_API, {"Throttle": {"rateLimit": 100, "burstLimit": 50}}, "NET-010", False),
+        # Older scans have no flag, and behave as before.
+        (_VPC, {"FlowLogsEnabled": False, "FlowLogs": []}, "NET-002", True),
+        (_API, {"Throttle": {}}, "NET-010", True),
+    ],
+)
+def test_network_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, kind: tuple[str, str], metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "res-1", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    found = any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id))
+    assert found is fires
+
+
+@pytest.mark.parametrize(
+    ("kind", "failed", "rule_id"),
+    [
+        (_VPC, {"FlowLogsCheckFailed": True}, "NET-012"),
+        (_LB, {"AttributesCheckFailed": True}, "NET-013"),
+        (_LB, {"ListenersCheckFailed": True}, "NET-013"),
+        (_API, {"ThrottleCheckFailed": True}, "NET-014"),
+    ],
+)
+def test_network_check_that_could_not_run_is_reported(
+    scan_db: ScanDB, kind: tuple[str, str], failed: dict, rule_id: str
+):
+    """A skipped check must stay visible, or the report reads as a clean pass."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    failing = scan_db.insert_resource(
+        scan.id, kind[0], kind[1], "bad", "us-east-1", metadata=failed
+    )
+    scan_db.insert_resource(
+        scan.id, kind[0], kind[1], "ok", "us-east-1",
+        metadata={name: False for name in failed},
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    matches = [f for f in scan_db.get_findings(scan.id) if f.rule_id == rule_id]
+    assert [f.resource_id for f in matches] == [failing.id]
+    assert matches[0].severity == "INFO"
