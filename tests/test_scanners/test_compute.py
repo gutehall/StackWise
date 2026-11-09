@@ -252,9 +252,9 @@ def test_ecs_cluster_and_service_scanned(scan_db: ScanDB):
 
 
 @mock_aws
-def test_ecs_describe_services_failure_does_not_abort_scan(scan_db: ScanDB):
-    """A describe_services failure for one service must not stop task
-    definitions from still being scanned."""
+def test_ecs_describe_services_failure_stores_flagged_service(scan_db: ScanDB):
+    """A describe_services failure must keep the service, flagged, under the id a
+    successful scan stores, and must not stop task definitions being scanned."""
     session = boto3.Session(region_name="us-east-1")
     ecs = session.client("ecs", region_name="us-east-1")
     ecs.create_cluster(clusterName="my-cluster")
@@ -271,14 +271,18 @@ def test_ecs_describe_services_failure_does_not_abort_scan(scan_db: ScanDB):
         ECSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     resources = scan_db.get_resources(scan.id, service="ecs")
-    assert [r for r in resources if r.resource_type == "service"] == []
+    services = [r for r in resources if r.resource_type == "service"]
+    assert [r.resource_id for r in services] == ["my-cluster/my-svc"]
+    assert services[0].metadata["ServiceCheckFailed"] is True
+    assert "launchType" not in services[0].metadata
     assert len([r for r in resources if r.resource_type == "task_definition"]) == 1
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 @mock_aws
-def test_ecs_describe_task_definition_failure_does_not_abort_scan(scan_db: ScanDB):
-    """A describe_task_definition failure for one task def must not stop other
-    task defs (or services already scanned) from being stored."""
+def test_ecs_describe_task_definition_failure_stores_flagged_row(scan_db: ScanDB):
+    """A describe_task_definition failure must keep the revision, flagged, under the
+    id a successful scan stores."""
     session = boto3.Session(region_name="us-east-1")
     ecs = session.client("ecs", region_name="us-east-1")
     ecs.register_task_definition(
@@ -290,7 +294,12 @@ def test_ecs_describe_task_definition_failure_does_not_abort_scan(scan_db: ScanD
     with patch("stackwise.scanner.compute.regional_client", return_value=ecs):
         count = ECSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
-    assert count == 0
+    assert count == 1
+    row = scan_db.get_resources(scan.id, service="ecs")[0]
+    assert row.resource_id == "broken-task:1"
+    assert row.metadata["TaskDefinitionCheckFailed"] is True
+    assert "cpu" not in row.metadata
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 @mock_aws
@@ -370,9 +379,9 @@ def test_eks_cluster_and_nodegroup_scanned(scan_db: ScanDB):
 
 
 @mock_aws
-def test_eks_describe_cluster_failure_does_not_abort_scan(scan_db: ScanDB):
-    """A describe_cluster failure for one cluster must not stop other clusters
-    from being scanned."""
+def test_eks_describe_cluster_failure_keeps_cluster_and_nodegroups(scan_db: ScanDB):
+    """A describe_cluster failure must keep the cluster, flagged, and must not skip
+    that cluster's node groups, which would look removed."""
     session = boto3.Session(region_name="us-east-1")
     iam = session.client("iam", region_name="us-east-1")
     role_arn = iam.create_role(RoleName="eks-role", AssumeRolePolicyDocument="{}")["Role"]["Arn"]
@@ -388,19 +397,27 @@ def test_eks_describe_cluster_failure_does_not_abort_scan(scan_db: ScanDB):
     eks.create_cluster(
         name="broken-cluster", roleArn=role_arn, resourcesVpcConfig={"subnetIds": subnet_ids}
     )
+    eks.create_nodegroup(
+        clusterName="broken-cluster", nodegroupName="ng1", subnets=subnet_ids, nodeRole=role_arn
+    )
     eks.describe_cluster = MagicMock(side_effect=RuntimeError("boom"))
 
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
     with patch("stackwise.scanner.compute.regional_client", return_value=eks):
         count = EKSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
-    assert count == 0
+    assert count == 2
+    rows = {r.resource_id: r.metadata for r in scan_db.get_resources(scan.id, service="eks")}
+    assert rows["broken-cluster"]["ClusterCheckFailed"] is True
+    assert "version" not in rows["broken-cluster"]
+    assert rows["broken-cluster/ng1"]["NodegroupCheckFailed"] is False
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 @mock_aws
-def test_eks_describe_nodegroup_failure_does_not_abort_cluster(scan_db: ScanDB):
-    """A describe_nodegroup failure for one node group must not stop the
-    cluster itself from being stored."""
+def test_eks_describe_nodegroup_failure_stores_flagged_nodegroup(scan_db: ScanDB):
+    """A describe_nodegroup failure must keep the node group, flagged, under the id a
+    successful scan stores, as well as the cluster."""
     session = boto3.Session(region_name="us-east-1")
     iam = session.client("iam", region_name="us-east-1")
     role_arn = iam.create_role(RoleName="eks-role", AssumeRolePolicyDocument="{}")["Role"]["Arn"]
@@ -428,7 +445,39 @@ def test_eks_describe_nodegroup_failure_does_not_abort_cluster(scan_db: ScanDB):
     resources = scan_db.get_resources(scan.id, service="eks")
     clusters = [r for r in resources if r.resource_type == "cluster"]
     assert len(clusters) == 1
-    assert [r for r in resources if r.resource_type == "nodegroup"] == []
+    nodegroups = [r for r in resources if r.resource_type == "nodegroup"]
+    assert [r.resource_id for r in nodegroups] == ["my-cluster/ng1"]
+    assert nodegroups[0].metadata["NodegroupCheckFailed"] is True
+    assert "scalingConfig" not in nodegroups[0].metadata
+    assert scan_db.get_scan_errors(scan.id) == []
+
+
+def test_eks_list_nodegroups_failure_keeps_cluster_and_fails_the_scan(scan_db: ScanDB):
+    """The node group ids are unknown, so no row can be stored for them. Only a scan
+    error keeps diff from reporting them as removed. Other clusters still get scanned."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    eks = MagicMock()
+    eks.describe_cluster.return_value = {"cluster": {"arn": "arn:c", "version": "1.31"}}
+
+    def _paginate(client, method, key, **kw):
+        if method == "list_clusters":
+            return ["bad", "good"]
+        if kw.get("clusterName") == "bad":
+            raise RuntimeError("denied")
+        return []
+
+    with (
+        patch("stackwise.scanner.compute.regional_client", return_value=eks),
+        patch("stackwise.scanner.compute.paginate", side_effect=_paginate),
+    ):
+        count = EKSScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    assert count == 2
+    stored = {r.resource_id for r in scan_db.get_resources(scan.id, service="eks")}
+    assert stored == {"bad", "good"}
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("eks", "list_nodegroups"),
+    ]
 
 
 def test_eks_top_level_failure_does_not_raise(scan_db: ScanDB):

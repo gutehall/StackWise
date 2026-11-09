@@ -732,3 +732,60 @@ def test_launch_template_rules_separate_failed_checks_from_misconfiguration(
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+_ECS_SVC = ("ecs", "service")
+_ECS_TD = ("ecs", "task_definition")
+_EKS_CLUSTER = ("eks", "cluster")
+_EKS_NG = ("eks", "nodegroup")
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like the setting. CMP-015, CMP-017 and CMP-018
+        # would all fire on a row with no values.
+        (_ECS_SVC, {"ServiceCheckFailed": True}, "CMP-014", False),
+        (_ECS_TD, {"TaskDefinitionCheckFailed": True}, "CMP-015", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": True}, "CMP-016", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": True}, "CMP-017", False),
+        (_EKS_NG, {"NodegroupCheckFailed": True}, "CMP-018", False),
+        # A check that could not run stays visible.
+        (_ECS_SVC, {"ServiceCheckFailed": True}, "CMP-021", True),
+        (_ECS_TD, {"TaskDefinitionCheckFailed": True}, "CMP-022", True),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": True}, "CMP-023", True),
+        (_EKS_NG, {"NodegroupCheckFailed": True}, "CMP-024", True),
+        # The real setting still fires.
+        (_ECS_SVC, {"ServiceCheckFailed": False, "launchType": "EC2"}, "CMP-014", True),
+        (_ECS_TD, {"TaskDefinitionCheckFailed": False, "cpu": 128, "memory": 2048},
+         "CMP-015", True),
+        (_ECS_TD, {"TaskDefinitionCheckFailed": False, "cpu": 512, "memory": 256},
+         "CMP-015", True),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False,
+                        "resourcesVpcConfig": {"endpointPublicAccess": True}}, "CMP-016", True),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.21"}, "CMP-017", True),
+        (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": None}, "CMP-018", True),
+        (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": {"minSize": 2, "maxSize": 2}},
+         "CMP-018", True),
+        # A correct setting doesn't fire, and neither do the visibility rules.
+        (_ECS_TD, {"TaskDefinitionCheckFailed": False, "cpu": 512, "memory": 2048},
+         "CMP-015", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.31"}, "CMP-017", False),
+        (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": {"minSize": 1, "maxSize": 3}},
+         "CMP-018", False),
+        (_ECS_SVC, {"ServiceCheckFailed": False}, "CMP-021", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.31"}, "CMP-023", False),
+        # Older scans have no flag, and behave as before.
+        (_ECS_SVC, {"launchType": "EC2"}, "CMP-014", True),
+        (_EKS_CLUSTER, {"version": "1.21"}, "CMP-017", True),
+    ],
+)
+def test_ecs_and_eks_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, kind: tuple[str, str], metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
