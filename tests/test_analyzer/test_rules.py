@@ -700,3 +700,35 @@ def test_guardduty_rules_separate_failed_checks_from_misconfiguration(
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like IMDSv1 allowed.
+        ({"MetadataOptionsCheckFailed": True}, "CMP-019", False),
+        ({"MetadataOptionsCheckFailed": True}, "CMP-020", True),
+        # A template that really allows IMDSv1 still fires, including no options set.
+        ({"MetadataOptionsCheckFailed": False, "MetadataOptions": {"HttpTokens": "optional"}},
+         "CMP-019", True),
+        ({"MetadataOptionsCheckFailed": False, "MetadataOptions": {}}, "CMP-019", True),
+        ({"MetadataOptionsCheckFailed": False, "MetadataOptions": {}}, "CMP-020", False),
+        # A template that requires IMDSv2 doesn't fire.
+        ({"MetadataOptionsCheckFailed": False, "MetadataOptions": {"HttpTokens": "required"}},
+         "CMP-019", False),
+        # Older scans have no flag, and behave as before.
+        ({"MetadataOptions": {}}, "CMP-019", True),
+        ({"MetadataOptions": {"HttpTokens": "required"}}, "CMP-019", False),
+    ],
+)
+def test_launch_template_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(
+        scan.id, "ec2", "launch_template", "lt", "us-east-1", metadata=metadata
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires

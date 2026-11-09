@@ -104,6 +104,9 @@ class EC2Scanner(BaseScanner):
                 lt_id = lt["LaunchTemplateId"]
                 default_version = lt.get("DefaultVersionNumber")
                 launch_template_data: dict = {}
+                # Stays set unless the default version is actually read: an empty result
+                # tells us nothing about the template's settings either.
+                metadata_check_failed = True
                 if default_version is not None:
                     try:
                         versions = ec2.describe_launch_template_versions(
@@ -111,25 +114,29 @@ class EC2Scanner(BaseScanner):
                         ).get("LaunchTemplateVersions", [])
                         if versions:
                             launch_template_data = versions[0].get("LaunchTemplateData", {})
+                            metadata_check_failed = False
                     except Exception:
                         logger.debug(
                             "describe_launch_template_versions failed for %s", lt_id,
                             exc_info=True,
                         )
+                metadata = {
+                    "LaunchTemplateId": lt_id,
+                    "LaunchTemplateName": lt.get("LaunchTemplateName"),
+                    "DefaultVersionNumber": default_version,
+                    "LatestVersionNumber": lt.get("LatestVersionNumber"),
+                    "EbsOptimized": launch_template_data.get("EbsOptimized"),
+                    "MetadataOptionsCheckFailed": metadata_check_failed,
+                }
+                if not metadata_check_failed:
+                    metadata["MetadataOptions"] = launch_template_data.get("MetadataOptions", {})
                 db.insert_resource(
                     scan_id=scan_id,
                     service="ec2",
                     resource_type="launch_template",
                     resource_id=lt_id,
                     region=region,
-                    metadata={
-                        "LaunchTemplateId": lt_id,
-                        "LaunchTemplateName": lt.get("LaunchTemplateName"),
-                        "DefaultVersionNumber": default_version,
-                        "LatestVersionNumber": lt.get("LatestVersionNumber"),
-                        "MetadataOptions": launch_template_data.get("MetadataOptions", {}),
-                        "EbsOptimized": launch_template_data.get("EbsOptimized"),
-                    },
+                    metadata=metadata,
                 )
                 count += 1
         except Exception as e:

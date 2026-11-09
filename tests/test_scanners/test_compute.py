@@ -195,7 +195,8 @@ def test_launch_template_version_lookup_failure_still_stores_template(scan_db: S
     resources = scan_db.get_resources(scan.id, service="ec2")
     lts = [r for r in resources if r.resource_type == "launch_template"]
     assert len(lts) == 1
-    assert lts[0].metadata["MetadataOptions"] == {}
+    assert lts[0].metadata["MetadataOptionsCheckFailed"] is True
+    assert "MetadataOptions" not in lts[0].metadata
 
 
 def test_launch_templates_top_level_failure_does_not_raise(scan_db: ScanDB):
@@ -487,3 +488,51 @@ def test_ecs_list_task_definitions_failure_names_the_operation(scan_db: ScanDB):
     assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
         ("ecs", "list_task_definitions"),
     ]
+
+
+def _scan_one_launch_template(scan_db: ScanDB, template: dict, versions: list[dict]) -> dict:
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    ec2 = MagicMock()
+    ec2.describe_launch_template_versions.return_value = {"LaunchTemplateVersions": versions}
+
+    def _paginate(client, method, key, **kw):
+        return [template] if method == "describe_launch_templates" else []
+
+    with (
+        patch("stackwise.scanner.compute.regional_client", return_value=ec2),
+        patch("stackwise.scanner.compute.paginate", side_effect=_paginate),
+    ):
+        EC2Scanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    rows = scan_db.get_resources(scan.id, service="ec2")
+    return next(r for r in rows if r.resource_type == "launch_template").metadata
+
+
+def test_launch_template_with_no_version_returned_is_flagged(scan_db: ScanDB):
+    """An empty result reads nothing, which must not look like IMDSv1 allowed."""
+    metadata = _scan_one_launch_template(
+        scan_db, {"LaunchTemplateId": "lt-1", "DefaultVersionNumber": 1}, []
+    )
+
+    assert metadata["MetadataOptionsCheckFailed"] is True
+    assert "MetadataOptions" not in metadata
+
+
+def test_launch_template_with_no_default_version_is_flagged(scan_db: ScanDB):
+    metadata = _scan_one_launch_template(scan_db, {"LaunchTemplateId": "lt-1"}, [])
+
+    assert metadata["MetadataOptionsCheckFailed"] is True
+
+
+def test_launch_template_version_without_metadata_options_is_not_a_failed_check(
+    scan_db: ScanDB,
+):
+    """The version was read and sets no options, so IMDSv1 really is allowed."""
+    metadata = _scan_one_launch_template(
+        scan_db,
+        {"LaunchTemplateId": "lt-1", "DefaultVersionNumber": 1},
+        [{"LaunchTemplateData": {"ImageId": "ami-1"}}],
+    )
+
+    assert metadata["MetadataOptionsCheckFailed"] is False
+    assert metadata["MetadataOptions"] == {}
