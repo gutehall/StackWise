@@ -672,3 +672,31 @@ def test_discovery_rules_separate_failed_checks_from_misconfiguration(
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like a disabled detector.
+        ({"DetectorCheckFailed": True}, "SEC-009", False),
+        ({"DetectorCheckFailed": True}, "SEC-011", True),
+        # A disabled detector, or none at all, still fires.
+        ({"DetectorCheckFailed": False, "Status": "DISABLED"}, "SEC-009", True),
+        ({"DetectorCheckFailed": False, "Status": "NOT_FOUND"}, "SEC-009", True),
+        ({"DetectorCheckFailed": False, "Status": "DISABLED"}, "SEC-011", False),
+        # An enabled detector doesn't fire.
+        ({"DetectorCheckFailed": False, "Status": "ENABLED"}, "SEC-009", False),
+        # Older scans have no flag, and behave as before.
+        ({"Status": "DISABLED"}, "SEC-009", True),
+        ({"Status": "ENABLED"}, "SEC-009", False),
+    ],
+)
+def test_guardduty_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["security"])
+    scan_db.insert_resource(scan.id, "guardduty", "detector", "d", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
