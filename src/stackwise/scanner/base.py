@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from rich.progress import Progress, TaskID
 
 from stackwise.store.db import ScanDB
+from stackwise.utils.aws import worker_session_factory
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +49,9 @@ class BaseScanner(ABC):
         if progress is not None:
             task = progress.add_task(f"[cyan]{self.name}", total=len(regions))
 
-        def do_region(region: str) -> int:
+        def do_region(region: str, get_session: Callable[[], boto3.Session]) -> int:
             try:
-                count = self._scan_region(session, db, scan_id, region)
+                count = self._scan_region(get_session(), db, scan_id, region)
                 logger.info("%s: %s → %d resources", self.name, region, count)
                 return count
             except Exception as exc:
@@ -60,13 +63,22 @@ class BaseScanner(ABC):
 
         if max_workers <= 1:
             for region in regions:
-                total += do_region(region)
+                total += do_region(region, lambda: session)
                 if progress is not None and task is not None:
                     progress.advance(task)
         else:
+            # Session.client() isn't thread-safe, so each worker gets its own session.
+            build_session = worker_session_factory(session)
+            worker = threading.local()
+
+            def worker_session() -> boto3.Session:
+                if not hasattr(worker, "session"):
+                    worker.session = build_session()
+                return worker.session
+
             workers = min(max_workers, len(regions))
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(do_region, r): r for r in regions}
+                futures = {executor.submit(do_region, r, worker_session): r for r in regions}
                 for future in as_completed(futures):
                     total += future.result()
                     if progress is not None and task is not None:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
-from unittest.mock import MagicMock
+import threading
+from unittest.mock import MagicMock, patch
 
+import boto3
 import pytest
 
 from stackwise.scanner.base import BaseScanner
@@ -63,6 +65,93 @@ def test_scan_parallel_regions_sums_counts():
 
     assert total == 6
     assert set(scanner.scanned_regions) == set(regions)
+
+
+class _SessionRecordingScanner(BaseScanner):
+    """Records the session each region ran with. The barrier holds every region
+    until all have started, so each one has to be on its own worker thread."""
+
+    name = "recording"
+
+    def __init__(self, parties: int):
+        self.barrier = threading.Barrier(parties, timeout=10)
+        self.sessions: dict[str, object] = {}
+
+    def _scan_region(self, session, db, scan_id, region) -> int:
+        self.barrier.wait()
+        self.sessions[region] = session
+        return 1
+
+
+def test_scan_parallel_regions_do_not_share_a_session():
+    """Each worker must build clients from its own session, never the caller's:
+    Session.client() is not thread-safe."""
+    caller_session = boto3.Session()
+    scanner = _SessionRecordingScanner(parties=2)
+
+    total = scanner.scan(
+        caller_session, MagicMock(), "scan-1", ["us-east-1", "eu-west-1"], max_workers=2
+    )
+
+    assert total == 2
+    east, west = scanner.sessions["us-east-1"], scanner.sessions["eu-west-1"]
+    assert east is not west
+    assert east is not caller_session and west is not caller_session
+    assert east.client("sts", region_name="us-east-1").meta.region_name == "us-east-1"
+
+
+def test_scan_reuses_a_workers_session_across_regions():
+    """One session per worker, not one per region."""
+    seen: list[object] = []
+
+    class _Scanner(BaseScanner):
+        name = "one-worker"
+
+        def _scan_region(self, session, db, scan_id, region) -> int:
+            seen.append(session)
+            return 1
+
+    regions = ["us-east-1", "eu-west-1", "ap-south-1"]
+    _Scanner().scan(boto3.Session(), MagicMock(), "scan-1", regions, max_workers=2)
+
+    assert len(seen) == 3
+    assert len({id(s) for s in seen}) <= 2
+
+
+def test_scan_records_a_worker_session_build_failure(scan_db: ScanDB):
+    """A session that can't be built fails that region visibly, like any region error."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+
+    with patch(
+        "stackwise.scanner.base.worker_session_factory",
+        return_value=MagicMock(side_effect=RuntimeError("no session")),
+    ):
+        total = _CountingScanner().scan(
+            MagicMock(), scan_db, scan.id, ["us-east-1"], max_workers=2
+        )
+
+    assert total == 0
+    errors = scan_db.get_scan_errors(scan.id)
+    assert [(e.region, e.operation, e.message) for e in errors] == [
+        ("us-east-1", "_scan_region", "no session")
+    ]
+
+
+def test_scan_sequential_uses_the_callers_session():
+    """Without a thread pool there is nothing to isolate."""
+    caller_session = MagicMock()
+    seen: list[object] = []
+
+    class _Scanner(BaseScanner):
+        name = "sequential"
+
+        def _scan_region(self, session, db, scan_id, region) -> int:
+            seen.append(session)
+            return 1
+
+    _Scanner().scan(caller_session, MagicMock(), "scan-1", ["us-east-1"])
+
+    assert seen == [caller_session]
 
 
 def test_scan_parallel_region_failure_is_recorded(scan_db: ScanDB):
