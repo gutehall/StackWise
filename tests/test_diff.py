@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from stackwise.diff import diff_scans
+from stackwise.diff import DiffResult, diff_scans, previous_completed_scan
 from stackwise.store.db import ScanDB
 
 
@@ -141,3 +141,64 @@ def test_diff_scans_empty_file_has_no_scan_record(tmp_path: Path):
         diff_scans(base, empty)
 
     assert empty.stat().st_size == 0
+
+
+def _make_scan(path: Path, *, in_progress: bool = False, error: bool = False) -> Path:
+    db = ScanDB(path)
+    scan = db.create_scan("123", ["us-east-1"], ["compute"], in_progress=in_progress)
+    if error:
+        db.insert_scan_error(scan.id, "ec2", "us-east-1", "describe_instances", "boom")
+    db.close()
+    return path
+
+
+def test_previous_completed_scan_goes_by_filename_not_mtime(tmp_path: Path):
+    old = _make_scan(tmp_path / "20240101T000000.db")
+    middle = _make_scan(tmp_path / "20240101T000001.db")
+    latest = _make_scan(tmp_path / "20240101T000002.db")
+    os.utime(old, (9_000_000_000, 9_000_000_000))
+
+    assert previous_completed_scan(latest) == middle
+
+
+def test_previous_completed_scan_is_older_than_compare(tmp_path: Path):
+    """--compare on an old scan must not pick a baseline from its future."""
+    old = _make_scan(tmp_path / "20240101T000000.db")
+    middle = _make_scan(tmp_path / "20240101T000001.db")
+    _make_scan(tmp_path / "20240101T000002.db")
+
+    assert previous_completed_scan(middle) == old
+    assert previous_completed_scan(old) is None
+
+
+def test_previous_completed_scan_skips_unusable_files(tmp_path: Path):
+    good = _make_scan(tmp_path / "20240101T000000.db")
+    _make_scan(tmp_path / "20240101T000001.db", error=True)
+    _make_scan(tmp_path / "20240101T000002.db", in_progress=True)
+    (tmp_path / "20240101T000003.db").touch()
+    (tmp_path / "20240101T000004.db").write_text("not a database, not even close " * 50)
+    ScanDB(tmp_path / "20240101T000005.db").close()  # schema, but no scan record
+    latest = _make_scan(tmp_path / "20240101T000006.db")
+
+    assert previous_completed_scan(latest) == good
+
+
+def test_previous_completed_scan_tolerates_file_vanishing(tmp_path: Path):
+    good = _make_scan(tmp_path / "20240101T000000.db")
+    latest = _make_scan(tmp_path / "20240101T000001.db")
+
+    with patch("stackwise.diff.ScanDB", side_effect=FileNotFoundError("gone")):
+        assert previous_completed_scan(latest) is None
+    assert previous_completed_scan(latest) == good
+
+
+def test_diff_result_scope_ignores_order():
+    same = DiffResult(
+        "a", "b",
+        base_regions=["us-east-1", "eu-west-1"],
+        compare_regions=["eu-west-1", "us-east-1"],
+    )
+    assert same.scope_differs is False
+
+    assert DiffResult("a", "b", base_modules=["compute"]).scope_differs is True
+    assert DiffResult("a", "b", compare_regions=["us-east-1"]).scope_differs is True

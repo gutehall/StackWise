@@ -303,3 +303,51 @@ def test_path_with_uri_characters_opens_read_only(tmp_path: Path):
     ScanDB(path).close()
 
     ScanDB(path, mode="ro").close()
+
+
+def test_in_progress_scan_is_incomplete_until_marked(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"], in_progress=True)
+    assert scan_db.is_complete() is False
+
+    scan_db.mark_scan_complete(scan.id)
+
+    assert scan_db.is_complete() is True
+
+
+def test_scan_with_scan_errors_is_incomplete(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    assert scan_db.is_complete() is True
+
+    scan_db.insert_scan_error(scan.id, "ec2", "us-east-1", "describe_instances", "boom")
+
+    assert scan_db.is_complete() is False
+
+
+def test_file_older_than_the_marker_tables_counts_as_complete(tmp_path: Path):
+    """A read-only open doesn't add newer tables, and older scans have no marker."""
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE scans (id TEXT)")
+    conn.commit()
+    conn.close()
+
+    db = ScanDB(path, mode="ro")
+    try:
+        assert db.is_complete() is True
+    finally:
+        db.close()
+
+
+def test_old_file_opened_writable_still_counts_as_complete(tmp_path: Path):
+    """Analyze opens old scans writable, which adds empty marker tables."""
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE unrelated (id TEXT)")
+    conn.commit()
+    conn.close()
+
+    db = ScanDB(path, mode="rw")
+    try:
+        assert db.is_complete() is True
+    finally:
+        db.close()

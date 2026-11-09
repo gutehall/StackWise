@@ -65,12 +65,25 @@ CREATE TABLE IF NOT EXISTS scan_errors (
     message     TEXT NOT NULL
 );
 
+-- Written when a scan starts and removed when it succeeds, so a crashed scan keeps
+-- its row. Inverted on purpose: files older than this table have no row and count
+-- as complete.
+CREATE TABLE IF NOT EXISTS incomplete_scans (
+    scan_id     TEXT PRIMARY KEY REFERENCES scans(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_resources_scan ON resources(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_recommendations_scan ON recommendations(scan_id);
 CREATE INDEX IF NOT EXISTS idx_scan_errors_scan ON scan_errors(scan_id);
 """
+
+# A row in any of these means the file holds a scan that must not be a diff baseline.
+_INCOMPLETE_SCAN_CHECKS = {
+    "scan_errors": "SELECT 1 FROM scan_errors LIMIT 1",
+    "incomplete_scans": "SELECT 1 FROM incomplete_scans LIMIT 1",
+}
 
 # Enforces one row per (scan_id, service, resource_type, resource_id, region) so a
 # resource discovered by two scanner modules in the same scan (e.g. cost + discovery
@@ -179,7 +192,15 @@ class ScanDB:
 
     # ── Scans ──────────────────────────────────────────────
 
-    def create_scan(self, account_id: str, regions: list[str], modules: list[str]) -> ScanRecord:
+    def create_scan(
+        self,
+        account_id: str,
+        regions: list[str],
+        modules: list[str],
+        in_progress: bool = False,
+    ) -> ScanRecord:
+        """Insert a scan. With *in_progress*, it counts as incomplete until
+        ``mark_scan_complete``, including if the process dies first."""
         scan = ScanRecord(
             id=_uid(),
             timestamp=datetime.now(UTC).isoformat(),
@@ -192,8 +213,30 @@ class ScanDB:
             (scan.id, scan.timestamp, scan.account_id,
              json.dumps(scan.regions), json.dumps(scan.modules)),
         )
+        if in_progress:
+            self.conn.execute("INSERT INTO incomplete_scans (scan_id) VALUES (?)", (scan.id,))
         self.conn.commit()
         return scan
+
+    def mark_scan_complete(self, scan_id: str) -> None:
+        self.conn.execute("DELETE FROM incomplete_scans WHERE scan_id = ?", (scan_id,))
+        self.conn.commit()
+
+    def is_complete(self) -> bool:
+        """False if a scan in this file failed or never finished.
+
+        Read-only connections skip the schema, so a table newer than the file can
+        be absent. That file predates the check and counts as complete.
+        """
+        tables = {
+            row["name"]
+            for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        return not any(
+            self.conn.execute(query).fetchone()
+            for table, query in _INCOMPLETE_SCAN_CHECKS.items()
+            if table in tables
+        )
 
     def get_scan(self, scan_id: str) -> ScanRecord | None:
         row = self.conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()

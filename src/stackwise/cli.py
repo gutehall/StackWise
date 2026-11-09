@@ -97,7 +97,7 @@ def scan(
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
     db_path = settings.scans_dir(account_id) / f"{ts}.db"
     db = ScanDB(db_path)
-    scan_rec = db.create_scan(account_id, settings.regions, settings.modules)
+    scan_rec = db.create_scan(account_id, settings.regions, settings.modules, in_progress=True)
     console.print(f"  Scan ID: [green]{scan_rec.id}[/green]")
     console.print(f"  DB: {db_path}")
 
@@ -141,6 +141,8 @@ def scan(
                 )
                 total_resources += count
         scan_errors = db.get_scan_errors(scan_rec.id)
+        if not scan_errors:
+            db.mark_scan_complete(scan_rec.id)
     finally:
         db.close()
 
@@ -309,7 +311,7 @@ def diff(
     ),
 ) -> None:
     """Compare two scans for drift detection (resources and findings)."""
-    from stackwise.diff import diff_scans
+    from stackwise.diff import diff_scans, previous_completed_scan
 
     settings = resolve_settings(profile=profile)
 
@@ -333,21 +335,36 @@ def diff(
             raise typer.Exit(1)
     else:
         # Only consider DBs from the same account as compare
-        compare_account_dir = compare_path.parent
-        all_dbs: list[tuple[Path, float]] = []
-        for db_file in compare_account_dir.glob("*.db"):
-            if db_file.resolve() != compare_path.resolve():
-                all_dbs.append((db_file, db_file.stat().st_mtime))
-        if not all_dbs:
-            console.print("[red]No previous scan to compare. Use --base to specify.[/red]")
+        base_path = previous_completed_scan(compare_path)
+        if base_path is None:
+            console.print(
+                "[red]No previous scan to compare (failed or unfinished scans don't count). "
+                "Use --base to specify.[/red]"
+            )
             raise typer.Exit(1)
-        base_path = max(all_dbs, key=lambda x: x[1])[0]
 
     try:
         result = diff_scans(base_path, compare_path)
     except (ValueError, FileNotFoundError) as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
+
+    # On stderr, so it comes before the lists and can't corrupt --format json.
+    if result.scope_differs:
+        console.print(
+            "[yellow]Warning: these scans cover different scopes, so anything outside "
+            "the overlap shows as added or removed.[/yellow]",
+            soft_wrap=True,
+        )
+        for label, regions, modules in (
+            ("Base", result.base_regions, result.base_modules),
+            ("Compare", result.compare_regions, result.compare_modules),
+        ):
+            console.print(
+                f"  {label}: modules {escape(','.join(modules))}; "
+                f"regions {escape(','.join(regions))}",
+                soft_wrap=True,
+            )
 
     if output_format == "json":
         payload = {

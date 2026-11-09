@@ -30,6 +30,45 @@ class DiffResult:
     findings_added: list = field(default_factory=list)
     findings_removed: list = field(default_factory=list)
     findings_unchanged: int = 0
+    base_regions: list[str] = field(default_factory=list)
+    base_modules: list[str] = field(default_factory=list)
+    compare_regions: list[str] = field(default_factory=list)
+    compare_modules: list[str] = field(default_factory=list)
+
+    @property
+    def scope_differs(self) -> bool:
+        """True if the scans covered different regions or modules, in which case
+        anything outside the overlap shows up as added or removed."""
+        return (
+            set(self.base_regions) != set(self.compare_regions)
+            or set(self.base_modules) != set(self.compare_modules)
+        )
+
+
+def _is_completed_scan(db_path: Path) -> bool:
+    try:
+        db = ScanDB(db_path, mode="ro")
+    except (FileNotFoundError, sqlite3.DatabaseError):
+        return False
+    try:
+        return db.latest_scan() is not None and db.is_complete()
+    except sqlite3.DatabaseError:  # empty file, or not a scan database at all
+        return False
+    finally:
+        db.close()
+
+
+def previous_completed_scan(compare_db_path: Path) -> Path | None:
+    """Return the newest completed scan older than *compare_db_path*, or None.
+
+    Scan filenames sort in scan order, unlike mtime. A scan that failed or never
+    finished is skipped: everything it missed would look removed.
+    """
+    earlier = [p for p in compare_db_path.parent.glob("*.db") if p.stem < compare_db_path.stem]
+    for path in sorted(earlier, key=lambda p: p.stem, reverse=True):
+        if _is_completed_scan(path):
+            return path
+    return None
 
 
 def diff_scans(
@@ -106,4 +145,8 @@ def diff_scans(
         findings_added=findings_added,
         findings_removed=findings_removed,
         findings_unchanged=findings_unchanged,
+        base_regions=base_scan.regions,
+        base_modules=base_scan.modules,
+        compare_regions=compare_scan.regions,
+        compare_modules=compare_scan.modules,
     )

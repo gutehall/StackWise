@@ -743,3 +743,136 @@ def test_analyze_can_still_write_findings(tmp_path: Path, monkeypatch):
         assert db.get_findings(scan.id)
     finally:
         db.close()
+
+
+def _scan_at(seconds: int, args: list[str] | None = None) -> None:
+    with patch("stackwise.cli.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(seconds=seconds)
+        runner.invoke(app, args or _SCAN_ARGS)
+
+
+def _scan_files(tmp_path: Path) -> list[Path]:
+    return sorted(_account_dir(tmp_path).glob("*.db"))
+
+
+@mock_aws
+def test_diff_baseline_ignores_older_file_that_was_read_and_touched(tmp_path: Path, monkeypatch):
+    """`diff --base old.db` must not make old.db the next plain diff's baseline,
+    even if something else gives that file the newest mtime."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    for seconds in range(3):
+        _scan_at(seconds)
+    oldest, middle, newest = _scan_files(tmp_path)
+
+    assert runner.invoke(app, ["diff", "--base", str(oldest)]).exit_code == 0
+    os.utime(oldest, (newest.stat().st_mtime + 100, newest.stat().st_mtime + 100))
+
+    result = runner.invoke(app, ["diff"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Base:    {middle.name}" in result.output
+
+
+@mock_aws
+def test_diff_baseline_skips_scan_with_scan_errors(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    with patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("boom")):
+        _scan_at(1)
+    _scan_at(2)
+    good, failed, latest = _scan_files(tmp_path)
+
+    result = runner.invoke(app, ["diff"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Base:    {good.name}" in result.output
+    assert f"Compare: {latest.name}" in result.output
+    assert failed.name not in result.output
+
+
+@mock_aws
+def test_diff_baseline_skips_scan_that_crashed_before_publishing(tmp_path: Path, monkeypatch):
+    """A crash leaves a partial file with no scan_errors row, usually the newest."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    with patch.object(EC2Scanner, "scan", side_effect=RuntimeError("crash")):
+        _scan_at(1)
+    _scan_at(2)
+    good, crashed, _latest = _scan_files(tmp_path)
+
+    result = runner.invoke(app, ["diff"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Base:    {good.name}" in result.output
+    assert crashed.name not in result.output
+
+
+@mock_aws
+def test_diff_with_only_failed_earlier_scans_fails_cleanly(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    with patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("boom")):
+        _scan_at(0)
+    _scan_at(1)
+
+    result = runner.invoke(app, ["diff"])
+
+    assert result.exit_code == 1
+    assert "No previous scan" in result.output
+
+
+@mock_aws
+@pytest.mark.parametrize(
+    ("narrower", "expected"),
+    [
+        (
+            ["scan", "--regions", "us-east-1", "--modules", "compute"],
+            ["Base: modules compute,network; regions us-east-1",
+             "Compare: modules compute; regions us-east-1"],
+        ),
+        (
+            ["scan", "--regions", "eu-west-1", "--modules", "compute,network"],
+            ["Base: modules compute,network; regions us-east-1",
+             "Compare: modules compute,network; regions us-east-1,eu-west-1"],
+        ),
+    ],
+    ids=["modules", "regions"],
+)
+def test_diff_warns_when_scopes_differ_before_the_lists(
+    tmp_path: Path, monkeypatch, narrower: list[str], expected: list[str]
+):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0, ["scan", "--regions", "us-east-1", "--modules", "compute,network"])
+    _scan_at(1, narrower)
+
+    result = runner.invoke(app, ["diff"])
+
+    assert result.exit_code == 0, result.output
+    assert "different scopes" in result.output
+    for line in expected:
+        assert line in result.output
+    assert result.output.index("different scopes") < result.output.index("Resources")
+
+
+@mock_aws
+def test_diff_scope_warning_does_not_corrupt_json(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0, ["scan", "--regions", "us-east-1", "--modules", "compute,network"])
+    _scan_at(1, ["scan", "--regions", "us-east-1", "--modules", "compute"])
+
+    result = runner.invoke(app, ["diff", "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    assert "different scopes" in result.stderr
+    assert "resources_added" in json.loads(result.stdout)
+
+
+@mock_aws
+def test_diff_same_scope_has_no_warning(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    _scan_at(1)
+
+    result = runner.invoke(app, ["diff"])
+
+    assert result.exit_code == 0, result.output
+    assert "different scopes" not in result.output
