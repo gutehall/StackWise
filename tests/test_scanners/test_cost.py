@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import boto3
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from stackwise.scanner.cost import CostScanner
@@ -214,6 +215,10 @@ def test_tagged_resources_top_level_failure_does_not_raise(scan_db: ScanDB):
         )
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("cost", "get_resources"),
+        ("cost", "get_lambda_function_recommendations"),
+    ]
 
 
 def test_cost_explorer_groups_costs_by_service(scan_db: ScanDB):
@@ -266,3 +271,64 @@ def test_cost_explorer_failure_returns_zero(scan_db: ScanDB):
         count = CostScanner()._scan_cost_explorer(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    errors = scan_db.get_scan_errors(scan.id)
+    assert [(e.scanner, e.operation) for e in errors] == [("cost", "get_cost_and_usage")]
+    assert "boom" in errors[0].message
+    assert "--skip-cost-explorer" in errors[0].message
+
+
+def test_compute_optimizer_ec2_failure_is_recorded(scan_db: ScanDB):
+    session = MagicMock()
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["cost"])
+
+    client = MagicMock()
+    client.get_ec2_instance_recommendations.side_effect = RuntimeError("boom")
+
+    with (
+        patch("stackwise.scanner.cost.regional_client", return_value=client),
+        patch("stackwise.scanner.cost.paginate", return_value=[]),
+    ):
+        CostScanner(skip_cost_explorer=True)._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("cost", "get_ec2_instance_recommendations"),
+    ]
+
+
+def _scan_with_compute_optimizer_error(scan_db: ScanDB, code: str) -> list[tuple[str, str]]:
+    """Run the cost scan with both Compute Optimizer calls raising a ClientError."""
+    session = MagicMock()
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["cost"])
+
+    def _error(operation: str) -> ClientError:
+        return ClientError({"Error": {"Code": code, "Message": "nope"}}, operation)
+
+    client = MagicMock()
+    client.get_ec2_instance_recommendations.side_effect = _error(
+        "GetEC2InstanceRecommendations"
+    )
+
+    def _paginate(_client, method, _key, **_kwargs):
+        if method == "get_lambda_function_recommendations":
+            raise _error("GetLambdaFunctionRecommendations")
+        return []
+
+    with (
+        patch("stackwise.scanner.cost.regional_client", return_value=client),
+        patch("stackwise.scanner.cost.paginate", side_effect=_paginate),
+    ):
+        CostScanner(skip_cost_explorer=True)._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    return [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)]
+
+
+def test_compute_optimizer_not_opted_in_is_not_a_scan_error(scan_db: ScanDB):
+    """An account that never opted in has nothing to list; the scan must still pass."""
+    assert _scan_with_compute_optimizer_error(scan_db, "OptInRequiredException") == []
+
+
+def test_compute_optimizer_other_client_error_is_recorded(scan_db: ScanDB):
+    assert _scan_with_compute_optimizer_error(scan_db, "AccessDeniedException") == [
+        ("cost", "get_ec2_instance_recommendations"),
+        ("cost", "get_lambda_function_recommendations"),
+    ]

@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from stackwise import __version__
 from stackwise.config import resolve_settings
 from stackwise.utils.logging import setup_logging
+
+if TYPE_CHECKING:
+    from stackwise.store.db import ScanDB
 
 app = typer.Typer(
     name="stackwise",
@@ -88,10 +95,12 @@ def scan(
     console.print(f"  Modules: {', '.join(settings.modules)}")
 
     # Open DB
-    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-    db_path = settings.scans_dir(account_id) / f"{ts}.db"
+    # Sorts in scan order, which `diff` relies on to find the previous scan. The
+    # suffix keeps two scans started at the same moment in separate files.
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%f")
+    db_path = settings.scans_dir(account_id) / f"{ts}-{uuid.uuid4().hex[:6]}.db"
     db = ScanDB(db_path)
-    scan_rec = db.create_scan(account_id, settings.regions, settings.modules)
+    scan_rec = db.create_scan(account_id, settings.regions, settings.modules, in_progress=True)
     console.print(f"  Scan ID: [green]{scan_rec.id}[/green]")
     console.print(f"  DB: {db_path}")
 
@@ -120,25 +129,52 @@ def scan(
 
     total_resources = 0
     max_workers = getattr(settings, "scan_max_workers", 1)
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        console=console,
-    ) as progress:
-        for scanner in scanners:
-            count = scanner.scan(
-                session, db, scan_rec.id, settings.regions, progress,
-                max_workers=max_workers,
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            console=console,
+        ) as progress:
+            for scanner in scanners:
+                count = scanner.scan(
+                    session, db, scan_rec.id, settings.regions, progress,
+                    max_workers=max_workers,
+                )
+                total_resources += count
+        scan_errors = db.get_scan_errors(scan_rec.id)
+        write_failures = sorted(db.write_failures)
+        if not scan_errors and not write_failures:
+            db.mark_scan_complete(scan_rec.id)
+    except sqlite3.Error as e:  # e.g. "database is locked"
+        console.print(f"\n[bold red]Scan failed:[/bold red] {escape(str(e))}", soft_wrap=True)
+        console.print(f"  DB: {escape(str(db_path))}", soft_wrap=True)
+        raise typer.Exit(1)
+    finally:
+        db.close()
+
+    if scan_errors or write_failures:
+        console.print(
+            f"\n[bold red]Scan failed:[/bold red] "
+            f"{len(scan_errors) + len(write_failures)} error(s)"
+        )
+        for failure in write_failures:
+            console.print(f"  [red]Database write failed: {escape(failure)}[/red]", soft_wrap=True)
+        # AWS error text can contain square brackets, which rich would parse as markup.
+        for err in scan_errors:
+            console.print(
+                f"  [red]{escape(err.scanner)} {escape(err.region)} "
+                f"{escape(err.operation)}: {escape(err.message)}[/red]",
+                soft_wrap=True,
             )
-            total_resources += count
+        console.print(f"  DB: {escape(str(db_path))}", soft_wrap=True)
+        raise typer.Exit(1)
 
     console.print(
         f"\n[bold green]Scan complete:[/bold green] "
         f"{total_resources} resources collected"
     )
-    db.close()
 
     # Store scan ID for subsequent commands
     _write_latest_scan(settings, account_id, scan_rec.id, db_path)
@@ -162,7 +198,6 @@ def analyze(
 ) -> None:
     """Run rule-based + AI analysis on the latest scan."""
     from stackwise.analyzer.engine import run_analysis
-    from stackwise.store.db import ScanDB
 
     settings = resolve_settings(
         profile=profile, model=model, engine=engine,
@@ -173,8 +208,8 @@ def analyze(
         console.print("[red]No scan found. Run 'stackwise scan' first.[/red]")
         raise typer.Exit(1)
 
+    db = _open_scan(db_path, scan_id, writable=True)
     console.print(f"[bold]Analyzing scan {scan_id}[/bold] from {db_path}")
-    db = ScanDB(db_path)
     run_analysis(settings, db, scan_id)
     db.close()
 
@@ -202,7 +237,6 @@ def report(
 ) -> None:
     """Generate reports from the latest analyzed scan."""
     from stackwise.report.generator import generate_report
-    from stackwise.store.db import ScanDB
 
     settings = resolve_settings(profile=profile, output_dir=output_dir)
     db_path, scan_id = _read_latest_scan(settings, account_id=account)
@@ -210,7 +244,7 @@ def report(
         console.print("[red]No scan found. Run 'stackwise scan' first.[/red]")
         raise typer.Exit(1)
 
-    db = ScanDB(db_path)
+    db = _open_scan(db_path, scan_id)
 
     types = ["engineering", "executive", "architecture"] if report_type == "all" else [report_type]
     any_failed = False
@@ -290,7 +324,7 @@ def diff(
     ),
 ) -> None:
     """Compare two scans for drift detection (resources and findings)."""
-    from stackwise.diff import diff_scans
+    from stackwise.diff import diff_scans, previous_completed_scan
 
     settings = resolve_settings(profile=profile)
 
@@ -301,9 +335,10 @@ def diff(
             raise typer.Exit(1)
     else:
         db_path, scan_id = _read_latest_scan(settings)
-        if not db_path or not db_path.exists():
+        if not db_path:
             console.print("[red]No latest scan. Run 'stackwise scan' first.[/red]")
             raise typer.Exit(1)
+        _open_scan(db_path, scan_id).close()
         compare_path = db_path
 
     if base:
@@ -313,21 +348,36 @@ def diff(
             raise typer.Exit(1)
     else:
         # Only consider DBs from the same account as compare
-        compare_account_dir = compare_path.parent
-        all_dbs: list[tuple[Path, float]] = []
-        for db_file in compare_account_dir.glob("*.db"):
-            if db_file.resolve() != compare_path.resolve():
-                all_dbs.append((db_file, db_file.stat().st_mtime))
-        if not all_dbs:
-            console.print("[red]No previous scan to compare. Use --base to specify.[/red]")
+        base_path = previous_completed_scan(compare_path)
+        if base_path is None:
+            console.print(
+                "[red]No previous scan to compare (failed or unfinished scans don't count). "
+                "Use --base to specify.[/red]"
+            )
             raise typer.Exit(1)
-        base_path = max(all_dbs, key=lambda x: x[1])[0]
 
     try:
         result = diff_scans(base_path, compare_path)
-    except ValueError as e:
+    except (ValueError, FileNotFoundError) as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
+
+    # On stderr, so it comes before the lists and can't corrupt --format json.
+    if result.scope_differs:
+        console.print(
+            "[yellow]Warning: these scans cover different scopes, so anything outside "
+            "the overlap shows as added or removed.[/yellow]",
+            soft_wrap=True,
+        )
+        for label, regions, modules in (
+            ("Base", result.base_regions, result.base_modules),
+            ("Compare", result.compare_regions, result.compare_modules),
+        ):
+            console.print(
+                f"  {label}: modules {escape(','.join(modules))}; "
+                f"regions {escape(','.join(regions))}",
+                soft_wrap=True,
+            )
 
     if output_format == "json":
         payload = {
@@ -469,6 +519,43 @@ def _write_latest_scan(settings, account_id: str, scan_id: str, db_path: Path) -
     last_account = _last_account_file(settings)
     last_account.parent.mkdir(parents=True, exist_ok=True)
     last_account.write_text(account_id)
+
+
+def _open_scan(db_path: Path, scan_id: str, *, writable: bool = False) -> ScanDB:
+    """Open the scan a pointer names, or exit 1 if the file or scan is gone.
+
+    Checks on a read-only connection first, so that a missing file isn't created
+    and a file without this scan isn't given a schema.
+    """
+    from stackwise.store.db import ScanDB
+
+    try:
+        db = ScanDB(db_path, mode="ro")
+    except (FileNotFoundError, sqlite3.OperationalError):
+        console.print(
+            f"[red]Scan database not found: {escape(str(db_path))}. "
+            "Run 'stackwise scan' again.[/red]",
+            soft_wrap=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        found = db.get_scan(scan_id) is not None
+    except sqlite3.DatabaseError:  # empty file, or not a scan database at all
+        found = False
+    if not found:
+        db.close()
+        console.print(
+            f"[red]Scan {escape(scan_id)} not found in {escape(str(db_path))}. "
+            "Run 'stackwise scan' again.[/red]",
+            soft_wrap=True,
+        )
+        raise typer.Exit(1)
+
+    if writable:
+        db.close()
+        return ScanDB(db_path, mode="rw")
+    return db
 
 
 def _read_latest_scan(

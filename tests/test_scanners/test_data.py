@@ -155,6 +155,9 @@ def test_s3_list_buckets_top_level_failure_returns_zero(scan_db: ScanDB):
         count = S3Scanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("s3", "list_buckets"),
+    ]
 
 
 def test_s3_get_bucket_location_failure_defaults_region(scan_db: ScanDB):
@@ -186,6 +189,7 @@ def test_s3_get_bucket_location_failure_defaults_region(scan_db: ScanDB):
     resources = scan_db.get_resources(scan.id, service="s3")
     bucket = next(r for r in resources if r.resource_id == "test-bucket")
     assert bucket.region == "us-east-1"
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 def test_s3_versioning_check_failure_is_flagged(scan_db: ScanDB):
@@ -214,6 +218,7 @@ def test_s3_versioning_check_failure_is_flagged(scan_db: ScanDB):
     resources = scan_db.get_resources(scan.id, service="s3")
     bucket = next(r for r in resources if r.resource_id == "locked-bucket")
     assert bucket.metadata["VersioningCheckFailed"] is True
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 @mock_aws
@@ -280,6 +285,9 @@ def test_rds_describe_db_instances_failure_does_not_abort_scan(scan_db: ScanDB):
         count = RDSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("rds", "describe_db_instances"),
+    ]
 
 
 def test_rds_describe_db_clusters_failure_does_not_raise(scan_db: ScanDB):
@@ -299,6 +307,9 @@ def test_rds_describe_db_clusters_failure_does_not_raise(scan_db: ScanDB):
         count = RDSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("rds", "describe_db_clusters"),
+    ]
 
 
 @mock_aws
@@ -378,6 +389,7 @@ def test_dynamodb_describe_table_failure_does_not_abort_scan(scan_db: ScanDB):
 
     assert count == 0
     assert scan_db.get_resources(scan.id, service="dynamodb") == []
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 def test_dynamodb_top_level_failure_does_not_raise(scan_db: ScanDB):
@@ -392,6 +404,9 @@ def test_dynamodb_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = DynamoDBScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("dynamodb", "list_tables"),
+    ]
 
 
 def test_efs_lifecycle_lookup_failure_still_stores_filesystem(scan_db: ScanDB):
@@ -432,6 +447,9 @@ def test_efs_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = EFSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("efs", "describe_file_systems"),
+    ]
 
 
 @mock_aws
@@ -475,3 +493,28 @@ def test_elasticache_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = ElastiCacheScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("elasticache", "describe_cache_clusters"),
+    ]
+
+
+def test_elasticache_replication_groups_failure_names_the_operation(scan_db: ScanDB):
+    """describe_replication_groups shares a try with describe_cache_clusters;
+    the recorded operation must name the call that actually failed."""
+    session = MagicMock()
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+
+    def _paginate(client, method, key, **kw):
+        if method == "describe_replication_groups":
+            raise RuntimeError("boom")
+        return []
+
+    with (
+        patch("stackwise.scanner.data.regional_client", return_value=MagicMock()),
+        patch("stackwise.scanner.data.paginate", side_effect=_paginate),
+    ):
+        ElastiCacheScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("elasticache", "describe_replication_groups"),
+    ]

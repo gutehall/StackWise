@@ -49,6 +49,7 @@ class SecurityScanner(BaseScanner):
     ) -> int:
         count = 0
         iam = regional_client(session, "iam", "us-east-1")
+        operation = "list_roles"
         try:
             roles = paginate(iam, "list_roles", "Roles")
             for role in roles:
@@ -88,6 +89,7 @@ class SecurityScanner(BaseScanner):
                 )
                 count += 1
 
+            operation = "list_users"
             users = paginate(iam, "list_users", "Users")
             for user in users:
                 user_name = user["UserName"]
@@ -128,8 +130,9 @@ class SecurityScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("IAM scan failed: %s", exc_info=True)
+            self._record_list_failure(db, scan_id, region, operation, e)
         return count
 
     def _scan_kms_regional(
@@ -179,8 +182,9 @@ class SecurityScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("KMS scan failed in %s: %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "list_keys", e)
         return count
 
     def _scan_secrets(
@@ -211,8 +215,9 @@ class SecurityScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("Secrets Manager scan failed in %s: %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "list_secrets", e)
         return count
 
     def _scan_guardduty(
@@ -250,18 +255,21 @@ class SecurityScanner(BaseScanner):
                 count += 1
                 count += self._scan_guardduty_findings(gd, db, scan_id, region, det_id)
 
-        except Exception:
+        except Exception as e:
             logger.debug("GuardDuty scan failed in %s: %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "list_detectors", e)
         return count
 
     def _scan_guardduty_findings(
         self, gd, db: ScanDB, scan_id: str, region: str, detector_id: str
     ) -> int:
         count = 0
+        operation = "list_findings"
         try:
             finding_ids = paginate(gd, "list_findings", "FindingIds", DetectorId=detector_id)
             for i in range(0, len(finding_ids), 50):  # get_findings takes at most 50 IDs
                 batch = finding_ids[i : i + 50]
+                operation = "get_findings"
                 resp = gd.get_findings(DetectorId=detector_id, FindingIds=batch)
                 for f in resp.get("Findings", []):
                     finding_id = f.get("Id", "")
@@ -281,11 +289,12 @@ class SecurityScanner(BaseScanner):
                         },
                     )
                     count += 1
-        except Exception:
+        except Exception as e:
             logger.debug(
                 "GuardDuty findings scan failed for detector %s in %s", detector_id, region,
                 exc_info=True,
             )
+            self._record_list_failure(db, scan_id, region, operation, e)
         return count
 
 

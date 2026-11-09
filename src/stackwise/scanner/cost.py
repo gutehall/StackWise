@@ -6,6 +6,7 @@ import logging
 from datetime import date, timedelta
 
 import boto3
+from botocore.exceptions import ClientError
 
 from stackwise.scanner.base import BaseScanner
 from stackwise.store.db import ScanDB
@@ -63,8 +64,9 @@ class CostScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("Tagged resources scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "get_resources", e)
 
         # ── Compute Optimizer EC2 recommendations ─────────────
         # No boto3 paginator exists for this operation — page manually via nextToken.
@@ -96,9 +98,12 @@ class CostScanner(BaseScanner):
                 next_token = ec2_recs.get("nextToken")
                 if not next_token:
                     break
-        except Exception:
+        except Exception as e:
             logger.debug(
                 "Compute Optimizer EC2 scan failed in %s", region, exc_info=True
+            )
+            self._record_compute_optimizer_failure(
+                db, scan_id, region, "get_ec2_instance_recommendations", e
             )
 
         # ── Compute Optimizer Lambda recommendations ──────────
@@ -126,12 +131,32 @@ class CostScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug(
                 "Compute Optimizer Lambda scan failed in %s", region, exc_info=True
             )
+            self._record_compute_optimizer_failure(
+                db, scan_id, region, "get_lambda_function_recommendations", e
+            )
 
         return count
+
+    def _record_compute_optimizer_failure(
+        self,
+        db: ScanDB,
+        scan_id: str,
+        region: str,
+        operation: str,
+        exc: Exception,
+    ) -> None:
+        # An account that never opted in to Compute Optimizer has nothing to list.
+        # That is "not configured", not a failed list, so it must not fail the scan.
+        if (
+            isinstance(exc, ClientError)
+            and exc.response.get("Error", {}).get("Code") == "OptInRequiredException"
+        ):
+            return
+        self._record_list_failure(db, scan_id, region, operation, exc)
 
     def _scan_cost_explorer(
         self,
@@ -182,8 +207,12 @@ class CostScanner(BaseScanner):
                 },
             )
             return 1
-        except Exception:
+        except Exception as e:
             logger.debug("Cost Explorer get_cost_and_usage failed in %s", region, exc_info=True)
+            db.insert_scan_error(
+                scan_id, self.name, region, "get_cost_and_usage",
+                f"{e} (use --skip-cost-explorer to skip this call)",
+            )
             return 0
 
 

@@ -56,7 +56,7 @@ provides `settings` (temp-dir `Settings`) and `scan_db` (temp `ScanDB`) fixtures
 Each stage is a separate CLI command/DB pass, not one long-lived process:
 
 1. **scan** (`cli.py` → `scanner/*.py`) — creates a new SQLite file at
-   `~/.stackwise/scans/{account_id}/{timestamp}.db` (or `$STACKWISE_DATA_DIR`), runs the
+   `~/.stackwise/scans/{account_id}/{timestamp}-{suffix}.db` (or `$STACKWISE_DATA_DIR`), runs the
    scanner modules requested by `--modules`, writes raw AWS resources into it. Also updates
    `.last_account.<profile>` and a per-account `.latest` pointer so later commands can find
    "the most recent scan" without re-specifying paths.

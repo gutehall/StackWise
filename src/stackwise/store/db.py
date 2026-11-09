@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +56,38 @@ CREATE TABLE IF NOT EXISTS recommendations (
     effort      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS scan_errors (
+    id          TEXT PRIMARY KEY,
+    scan_id     TEXT NOT NULL REFERENCES scans(id),
+    scanner     TEXT NOT NULL,
+    region      TEXT NOT NULL,
+    operation   TEXT NOT NULL,
+    message     TEXT NOT NULL
+);
+
+-- Written when a scan starts and removed when it succeeds, so a crashed scan keeps
+-- its row. Inverted on purpose: files older than this table have no row and count
+-- as complete.
+CREATE TABLE IF NOT EXISTS incomplete_scans (
+    scan_id     TEXT PRIMARY KEY REFERENCES scans(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_resources_scan ON resources(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_recommendations_scan ON recommendations(scan_id);
+CREATE INDEX IF NOT EXISTS idx_scan_errors_scan ON scan_errors(scan_id);
 """
+
+# How long a write waits for another connection to release the database. A longer
+# wait multiplies: each row of a scan would wait this long in turn.
+_BUSY_TIMEOUT_SECONDS = 10
+
+# A row in any of these means the file holds a scan that must not be a diff baseline.
+_INCOMPLETE_SCAN_CHECKS = {
+    "scan_errors": "SELECT 1 FROM scan_errors LIMIT 1",
+    "incomplete_scans": "SELECT 1 FROM incomplete_scans LIMIT 1",
+}
 
 # Enforces one row per (scan_id, service, resource_type, resource_id, region) so a
 # resource discovered by two scanner modules in the same scan (e.g. cost + discovery
@@ -122,15 +149,54 @@ class RecommendationRecord:
     effort: str | None = None
 
 
-class ScanDB:
-    """Thin wrapper around a per-scan SQLite database."""
+@dataclass
+class ScanErrorRecord:
+    id: str
+    scan_id: str
+    scanner: str
+    region: str
+    operation: str
+    message: str
 
-    def __init__(self, db_path: Path) -> None:
+
+class ScanDB:
+    """Thin wrapper around a per-scan SQLite database.
+
+    ``mode`` is ``"create"`` for a new scan, ``"rw"`` to write to an existing file,
+    or ``"ro"`` to read one without changing it, including its mtime. ``"rw"`` and
+    ``"ro"`` raise FileNotFoundError for a missing file instead of creating it.
+    ``"ro"`` skips the schema, so a table newer than the file can be absent.
+
+    ``"create"`` uses WAL while the scan writes and returns to a single file on
+    close. A read-only open of a WAL file would otherwise leave -shm and -wal
+    files beside it.
+    """
+
+    def __init__(self, db_path: Path, mode: Literal["create", "rw", "ro"] = "create") -> None:
         self.db_path = db_path
+        self._mode = mode
         self._lock = threading.Lock()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        # Scanners catch broad exceptions around per-resource work, which can swallow
+        # a failed write. This keeps it visible, so the scan can still fail.
+        self.write_failures: set[str] = set()
+        if mode == "create":
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(
+                str(db_path), timeout=_BUSY_TIMEOUT_SECONDS, check_same_thread=False
+            )
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        else:
+            if not db_path.exists():
+                raise FileNotFoundError(f"Scan database not found: {db_path}")
+            self.conn = sqlite3.connect(
+                f"{db_path.resolve().as_uri()}?mode={mode}",
+                uri=True,
+                timeout=_BUSY_TIMEOUT_SECONDS,
+                check_same_thread=False,
+            )
         self.conn.row_factory = sqlite3.Row
+        if mode == "ro":
+            return
         self.conn.executescript(_SCHEMA)
         try:
             self.conn.execute(_UNIQUE_RESOURCE_INDEX)
@@ -144,7 +210,15 @@ class ScanDB:
 
     # ── Scans ──────────────────────────────────────────────
 
-    def create_scan(self, account_id: str, regions: list[str], modules: list[str]) -> ScanRecord:
+    def create_scan(
+        self,
+        account_id: str,
+        regions: list[str],
+        modules: list[str],
+        in_progress: bool = False,
+    ) -> ScanRecord:
+        """Insert a scan. With *in_progress*, it counts as incomplete until
+        ``mark_scan_complete``, including if the process dies first."""
         scan = ScanRecord(
             id=_uid(),
             timestamp=datetime.now(UTC).isoformat(),
@@ -157,8 +231,30 @@ class ScanDB:
             (scan.id, scan.timestamp, scan.account_id,
              json.dumps(scan.regions), json.dumps(scan.modules)),
         )
+        if in_progress:
+            self.conn.execute("INSERT INTO incomplete_scans (scan_id) VALUES (?)", (scan.id,))
         self.conn.commit()
         return scan
+
+    def mark_scan_complete(self, scan_id: str) -> None:
+        self.conn.execute("DELETE FROM incomplete_scans WHERE scan_id = ?", (scan_id,))
+        self.conn.commit()
+
+    def is_complete(self) -> bool:
+        """False if a scan in this file failed or never finished.
+
+        Read-only connections skip the schema, so a table newer than the file can
+        be absent. That file predates the check and counts as complete.
+        """
+        tables = {
+            row["name"]
+            for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        return not any(
+            self.conn.execute(query).fetchone()
+            for table, query in _INCOMPLETE_SCAN_CHECKS.items()
+            if table in tables
+        )
 
     def get_scan(self, scan_id: str) -> ScanRecord | None:
         row = self.conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
@@ -197,9 +293,13 @@ class ScanDB:
         metadata: dict | None = None,
     ) -> ResourceRecord:
         with self._lock:
-            return self._insert_resource_unsafe(
-                scan_id, service, resource_type, resource_id, region, arn, metadata
-            )
+            try:
+                return self._insert_resource_unsafe(
+                    scan_id, service, resource_type, resource_id, region, arn, metadata
+                )
+            except sqlite3.Error as e:
+                self.write_failures.add(str(e))
+                raise
 
     def _insert_resource_unsafe(
         self,
@@ -353,6 +453,42 @@ class ScanDB:
             for r in rows
         ]
 
+    # ── Scan errors ────────────────────────────────────────
+
+    def insert_scan_error(
+        self,
+        scan_id: str,
+        scanner: str,
+        region: str,
+        operation: str,
+        message: str,
+    ) -> ScanErrorRecord:
+        rec = ScanErrorRecord(
+            id=_uid(), scan_id=scan_id, scanner=scanner, region=region,
+            operation=operation, message=message,
+        )
+        # Called from scanner worker threads sharing this connection.
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO scan_errors "
+                "(id, scan_id, scanner, region, operation, message) VALUES (?,?,?,?,?,?)",
+                (rec.id, rec.scan_id, rec.scanner, rec.region, rec.operation, rec.message),
+            )
+            self.conn.commit()
+        return rec
+
+    def get_scan_errors(self, scan_id: str) -> list[ScanErrorRecord]:
+        rows = self.conn.execute(
+            "SELECT * FROM scan_errors WHERE scan_id = ? ORDER BY rowid", (scan_id,)
+        ).fetchall()
+        return [
+            ScanErrorRecord(
+                id=r["id"], scan_id=r["scan_id"], scanner=r["scanner"], region=r["region"],
+                operation=r["operation"], message=r["message"],
+            )
+            for r in rows
+        ]
+
     # ── Utilities ──────────────────────────────────────────
 
     def summary(self, scan_id: str) -> dict:
@@ -376,4 +512,10 @@ class ScanDB:
         }
 
     def close(self) -> None:
+        if self._mode == "create":
+            try:
+                self.conn.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.Error:
+                # Another connection still has it open. A WAL file still reads fine.
+                logger.debug("Could not leave WAL mode on %s", self.db_path, exc_info=True)
         self.conn.close()

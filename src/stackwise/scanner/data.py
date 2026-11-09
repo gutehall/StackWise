@@ -54,8 +54,9 @@ class S3Scanner(BaseScanner):
         count = 0
         try:
             buckets = s3_client.list_buckets().get("Buckets", [])
-        except Exception:
+        except Exception as e:
             logger.exception("S3 list_buckets failed")
+            self._record_list_failure(db, scan_id, region, "list_buckets", e)
             return 0
 
         for bucket in buckets:
@@ -168,8 +169,9 @@ class RDSScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("RDS describe_db_instances failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_db_instances", e)
 
         # DB clusters (Aurora)
         try:
@@ -193,8 +195,9 @@ class RDSScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("RDS describe_db_clusters failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_db_clusters", e)
 
         return count
 
@@ -244,8 +247,9 @@ class DynamoDBScanner(BaseScanner):
                     count += 1
                 except Exception:
                     logger.debug("describe_table failed for %s", table_name)
-        except Exception:
+        except Exception as e:
             logger.debug("DynamoDB scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "list_tables", e)
         return count
 
 
@@ -295,8 +299,9 @@ class EFSScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("EFS scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_file_systems", e)
         return count
 
 
@@ -313,6 +318,7 @@ class ElastiCacheScanner(BaseScanner):
         region: str,
     ) -> int:
         count = 0
+        operation = "describe_cache_clusters"
         try:
             ec = regional_client(session, "elasticache", region)
             clusters = paginate(ec, "describe_cache_clusters", "CacheClusters")
@@ -334,6 +340,7 @@ class ElastiCacheScanner(BaseScanner):
                 )
                 count += 1
 
+            operation = "describe_replication_groups"
             repl_groups = paginate(
                 ec, "describe_replication_groups", "ReplicationGroups"
             )
@@ -353,8 +360,9 @@ class ElastiCacheScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("ElastiCache scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, operation, e)
         return count
 
 

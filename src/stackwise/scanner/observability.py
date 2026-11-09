@@ -49,8 +49,9 @@ class ObservabilityScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("CloudWatch alarms scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_alarms", e)
 
         # ── CloudWatch Logs ──────────────────────────────────
         try:
@@ -72,8 +73,9 @@ class ObservabilityScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("Log groups scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_log_groups", e)
 
         return count
 
