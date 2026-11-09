@@ -61,8 +61,9 @@ class NetworkScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("VPC scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_vpcs", e)
 
         # ── Security Groups ─────────────────────────────────
         try:
@@ -85,8 +86,9 @@ class NetworkScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("Security group scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_security_groups", e)
 
         # ── Load Balancers (ALB/NLB) ─────────────────────────
         try:
@@ -129,8 +131,9 @@ class NetworkScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("Load balancer scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_load_balancers", e)
 
         # ── NAT Gateways ────────────────────────────────────
         try:
@@ -154,8 +157,9 @@ class NetworkScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("NAT gateway scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_nat_gateways", e)
 
         # ── API Gateway REST APIs ───────────────────────────
         try:
@@ -197,8 +201,9 @@ class NetworkScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("API Gateway scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "get_rest_apis", e)
 
         return count
 

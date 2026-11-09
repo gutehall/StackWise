@@ -56,10 +56,20 @@ CREATE TABLE IF NOT EXISTS recommendations (
     effort      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS scan_errors (
+    id          TEXT PRIMARY KEY,
+    scan_id     TEXT NOT NULL REFERENCES scans(id),
+    scanner     TEXT NOT NULL,
+    region      TEXT NOT NULL,
+    operation   TEXT NOT NULL,
+    message     TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_resources_scan ON resources(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_recommendations_scan ON recommendations(scan_id);
+CREATE INDEX IF NOT EXISTS idx_scan_errors_scan ON scan_errors(scan_id);
 """
 
 # Enforces one row per (scan_id, service, resource_type, resource_id, region) so a
@@ -120,6 +130,16 @@ class RecommendationRecord:
     detail: str | None = None
     impact: str | None = None
     effort: str | None = None
+
+
+@dataclass
+class ScanErrorRecord:
+    id: str
+    scan_id: str
+    scanner: str
+    region: str
+    operation: str
+    message: str
 
 
 class ScanDB:
@@ -349,6 +369,42 @@ class ScanDB:
                 id=r["id"], scan_id=r["scan_id"], source=r["source"],
                 category=r["category"], title=r["title"], detail=r["detail"],
                 impact=r["impact"], effort=r["effort"],
+            )
+            for r in rows
+        ]
+
+    # ── Scan errors ────────────────────────────────────────
+
+    def insert_scan_error(
+        self,
+        scan_id: str,
+        scanner: str,
+        region: str,
+        operation: str,
+        message: str,
+    ) -> ScanErrorRecord:
+        rec = ScanErrorRecord(
+            id=_uid(), scan_id=scan_id, scanner=scanner, region=region,
+            operation=operation, message=message,
+        )
+        # Called from scanner worker threads sharing this connection.
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO scan_errors "
+                "(id, scan_id, scanner, region, operation, message) VALUES (?,?,?,?,?,?)",
+                (rec.id, rec.scan_id, rec.scanner, rec.region, rec.operation, rec.message),
+            )
+            self.conn.commit()
+        return rec
+
+    def get_scan_errors(self, scan_id: str) -> list[ScanErrorRecord]:
+        rows = self.conn.execute(
+            "SELECT * FROM scan_errors WHERE scan_id = ? ORDER BY rowid", (scan_id,)
+        ).fetchall()
+        return [
+            ScanErrorRecord(
+                id=r["id"], scan_id=r["scan_id"], scanner=r["scanner"], region=r["region"],
+                operation=r["operation"], message=r["message"],
             )
             for r in rows
         ]

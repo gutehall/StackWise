@@ -132,8 +132,9 @@ class EC2Scanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("launch_templates: not available in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_launch_templates", e)
 
         return count
 
@@ -199,10 +200,12 @@ class ECSScanner(BaseScanner):
         count = 0
         ecs = regional_client(session, "ecs", region)
 
+        operation = "list_clusters"
         try:
             cluster_arns = paginate(ecs, "list_clusters", "clusterArns")
             for cluster_arn in cluster_arns:
                 cluster_name = cluster_arn.split("/")[-1]
+                operation = "list_services"
                 svc_arns = paginate(
                     ecs,
                     "list_services",
@@ -238,6 +241,7 @@ class ECSScanner(BaseScanner):
                     except Exception:
                         logger.debug("describe_services failed for %s", svc_arn)
 
+            operation = "list_task_definitions"
             task_def_arns = paginate(ecs, "list_task_definitions", "taskDefinitionArns")
             for td_arn in task_def_arns:
                 try:
@@ -272,8 +276,9 @@ class ECSScanner(BaseScanner):
                     count += 1
                 except Exception:
                     logger.debug("describe_task_definition failed for %s", td_arn)
-        except Exception:
+        except Exception as e:
             logger.debug("ECS scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, operation, e)
 
         return count
 
@@ -352,8 +357,9 @@ class EKSScanner(BaseScanner):
                     logger.debug(
                         "describe_cluster failed for %s", cluster_name, exc_info=True
                     )
-        except Exception:
+        except Exception as e:
             logger.debug("EKS scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "list_clusters", e)
 
         return count
 

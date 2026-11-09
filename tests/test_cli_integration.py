@@ -6,18 +6,41 @@ individual functions can't see."""
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import boto3
+import pytest
+from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 from moto import mock_aws
 from typer.testing import CliRunner
 
 from stackwise import __version__
 from stackwise.cli import app
+from stackwise.scanner.compute import EC2Scanner
+from stackwise.store.db import ScanDB
 
 runner = CliRunner()
+
+_real_make_api_call = BaseClient._make_api_call
+
+
+@pytest.fixture
+def _compute_optimizer_empty():
+    """moto doesn't implement compute-optimizer (every call is a 404 "Not yet
+    implemented"), and a failed list call now fails the scan. Answer those calls
+    with an empty result so tests of the cost module can reach a clean exit."""
+
+    def _make_api_call(self, operation_name, api_params):
+        if self.meta.service_model.service_name == "compute-optimizer":
+            return {}
+        return _real_make_api_call(self, operation_name, api_params)
+
+    with patch.object(BaseClient, "_make_api_call", _make_api_call):
+        yield
 
 
 def _invoke_scans_with_distinct_timestamps(*arg_lists):
@@ -78,7 +101,7 @@ def test_scan_analyze_report_end_to_end(tmp_path: Path, monkeypatch):
 
 
 @mock_aws
-def test_scan_skip_cost_explorer_flag(tmp_path: Path, monkeypatch):
+def test_scan_skip_cost_explorer_flag(tmp_path: Path, monkeypatch, _compute_optimizer_empty):
     """--skip-cost-explorer through the real scan command must skip the
     billable ce.get_cost_and_usage call while still scanning the rest of
     the cost module (tagged resources, Compute Optimizer)."""
@@ -202,7 +225,9 @@ def test_scan_get_account_id_failure_exits_cleanly(tmp_path: Path, monkeypatch):
 
 
 @mock_aws
-def test_scan_wires_every_scanner_module(tmp_path: Path, monkeypatch):
+def test_scan_wires_every_scanner_module(
+    tmp_path: Path, monkeypatch, _compute_optimizer_empty
+):
     """--modules with every module name must actually import and run each
     scanner, not just the ones already covered by other integration tests."""
     monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
@@ -476,3 +501,149 @@ def test_list_scans_with_profile_filter_no_recorded_scan(tmp_path: Path, monkeyp
     result = runner.invoke(app, ["list-scans", "--profile", "never-used"])
     assert result.exit_code == 0
     assert "No recorded scan for profile" in result.output
+
+
+_SCAN_ARGS = ["scan", "--regions", "us-east-1", "--modules", "compute"]
+
+
+def _account_dir(tmp_path: Path) -> Path:
+    return tmp_path / "data" / "scans" / "123456789012"
+
+
+@mock_aws
+def test_scan_region_exception_exits_1_and_keeps_previous_latest(tmp_path: Path, monkeypatch):
+    """A region failure must exit 1, record a scan_errors row, and leave .latest
+    pointing at the last good scan so analyze/report can't pick up partial data."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+
+    good = _invoke_scans_with_distinct_timestamps(_SCAN_ARGS)[0]
+    assert good.exit_code == 0, good.output
+    latest = _account_dir(tmp_path) / ".latest"
+    latest_before = latest.read_text()
+    good_db = Path(latest_before.splitlines()[0])
+
+    # The brackets would be a MarkupError if the summary didn't escape AWS text.
+    with (
+        patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("denied [/red] [x]")),
+        patch("stackwise.cli.datetime") as mock_dt,
+    ):
+        mock_dt.now.return_value = datetime(2024, 1, 2, tzinfo=UTC)
+        result = runner.invoke(app, _SCAN_ARGS)
+
+    assert result.exit_code == 1, result.output
+    assert "Scan complete" not in result.output
+    assert "Scan failed" in result.output
+    assert "ec2 us-east-1 _scan_region: denied [/red] [x]" in result.output
+    assert latest.read_text() == latest_before
+
+    failed_db = next(p for p in _account_dir(tmp_path).glob("*.db") if p != good_db)
+    assert str(failed_db) in result.output.replace("\n", "")
+    db = ScanDB(failed_db)
+    try:
+        errors = db.get_scan_errors(db.latest_scan().id)
+    finally:
+        db.close()
+    assert [(e.scanner, e.region, e.operation) for e in errors] == [
+        ("ec2", "us-east-1", "_scan_region")
+    ]
+
+
+@mock_aws
+def test_scan_list_failure_exits_1(tmp_path: Path, monkeypatch):
+    """A list call a scanner swallows internally must fail the scan too, not
+    just an exception that reaches the region driver."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+
+    def _make_api_call(self, operation_name, api_params):
+        if operation_name == "ListBuckets":
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, operation_name)
+        return _real_make_api_call(self, operation_name, api_params)
+
+    with patch.object(BaseClient, "_make_api_call", _make_api_call):
+        result = runner.invoke(app, ["scan", "--regions", "us-east-1", "--modules", "data"])
+
+    assert result.exit_code == 1, result.output
+    assert "s3 us-east-1 list_buckets" in result.output
+    assert not (_account_dir(tmp_path) / ".latest").exists()
+
+
+@mock_aws
+def test_scan_with_only_enrichment_failures_exits_0(tmp_path: Path, monkeypatch):
+    """A per-resource lookup failing is not a scan failure: exit 0, .latest
+    written, no scan_errors rows."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="locked-bucket")
+
+    def _make_api_call(self, operation_name, api_params):
+        if operation_name in {"GetBucketLocation", "GetBucketVersioning"}:
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, operation_name)
+        return _real_make_api_call(self, operation_name, api_params)
+
+    with patch.object(BaseClient, "_make_api_call", _make_api_call):
+        result = runner.invoke(app, ["scan", "--regions", "us-east-1", "--modules", "data"])
+
+    assert result.exit_code == 0, result.output
+    assert "Scan complete" in result.output
+    db_path, scan_id = (_account_dir(tmp_path) / ".latest").read_text().splitlines()
+    db = ScanDB(Path(db_path))
+    try:
+        assert db.get_scan_errors(scan_id) == []
+        bucket = next(r for r in db.get_resources(scan_id) if r.resource_id == "locked-bucket")
+    finally:
+        db.close()
+    assert bucket.metadata["VersioningCheckFailed"] is True
+
+
+@mock_aws
+def test_scan_error_write_failure_still_fails_the_scan(tmp_path: Path, monkeypatch):
+    """If the scan_errors row itself can't be written, the scan must still fail
+    without moving .latest, and the db must still be closed."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+
+    with (
+        patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("boom")),
+        patch.object(
+            ScanDB, "insert_scan_error",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ),
+        patch.object(ScanDB, "close", autospec=True, side_effect=ScanDB.close) as close,
+    ):
+        result = runner.invoke(app, _SCAN_ARGS)
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, sqlite3.OperationalError)
+    assert "Scan complete" not in result.output
+    assert not (_account_dir(tmp_path) / ".latest").exists()
+    close.assert_called_once()
+
+
+@mock_aws
+def test_run_stops_after_failed_scan(tmp_path: Path, monkeypatch):
+    """`run` must not analyze or report after a failed scan. A previous good scan
+    exists, so without the stop they would silently run against stale data."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+
+    good = _invoke_scans_with_distinct_timestamps(_SCAN_ARGS)[0]
+    assert good.exit_code == 0, good.output
+
+    output_dir = tmp_path / "reports"
+    with (
+        patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("boom")),
+        patch("stackwise.cli.datetime") as mock_dt,
+        patch("stackwise.analyzer.engine.run_analysis") as run_analysis,
+        patch("stackwise.report.generator.generate_report") as generate_report,
+    ):
+        mock_dt.now.return_value = datetime(2024, 1, 2, tzinfo=UTC)
+        result = runner.invoke(
+            app,
+            [
+                "run", "--regions", "us-east-1", "--modules", "compute",
+                "--engine", "rules-only", "--format", "json",
+                "--output-dir", str(output_dir),
+            ],
+        )
+
+    assert result.exit_code == 1, result.output
+    run_analysis.assert_not_called()
+    generate_report.assert_not_called()
+    assert not list(output_dir.glob("*"))

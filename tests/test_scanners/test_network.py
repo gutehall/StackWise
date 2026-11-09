@@ -255,6 +255,7 @@ def test_flow_logs_lookup_failure_still_stores_vpc(scan_db: ScanDB):
     ]
     assert len(vpcs) == 1
     assert vpcs[0].metadata["FlowLogsEnabled"] is False
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 @mock_aws
@@ -373,3 +374,10 @@ def test_top_level_api_failures_degrade_gracefully(scan_db: ScanDB):
 
     assert count == 0
     assert scan_db.get_resources(scan.id) == []
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("network", "describe_vpcs"),
+        ("network", "describe_security_groups"),
+        ("network", "describe_load_balancers"),
+        ("network", "describe_nat_gateways"),
+        ("network", "get_rest_apis"),
+    ]

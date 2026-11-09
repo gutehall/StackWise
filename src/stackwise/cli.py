@@ -8,6 +8,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
@@ -120,25 +121,40 @@ def scan(
 
     total_resources = 0
     max_workers = getattr(settings, "scan_max_workers", 1)
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        console=console,
-    ) as progress:
-        for scanner in scanners:
-            count = scanner.scan(
-                session, db, scan_rec.id, settings.regions, progress,
-                max_workers=max_workers,
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            console=console,
+        ) as progress:
+            for scanner in scanners:
+                count = scanner.scan(
+                    session, db, scan_rec.id, settings.regions, progress,
+                    max_workers=max_workers,
+                )
+                total_resources += count
+        scan_errors = db.get_scan_errors(scan_rec.id)
+    finally:
+        db.close()
+
+    if scan_errors:
+        console.print(f"\n[bold red]Scan failed:[/bold red] {len(scan_errors)} error(s)")
+        # AWS error text can contain square brackets, which rich would parse as markup.
+        for err in scan_errors:
+            console.print(
+                f"  [red]{escape(err.scanner)} {escape(err.region)} "
+                f"{escape(err.operation)}: {escape(err.message)}[/red]",
+                soft_wrap=True,
             )
-            total_resources += count
+        console.print(f"  DB: {escape(str(db_path))}", soft_wrap=True)
+        raise typer.Exit(1)
 
     console.print(
         f"\n[bold green]Scan complete:[/bold green] "
         f"{total_resources} resources collected"
     )
-    db.close()
 
     # Store scan ID for subsequent commands
     _write_latest_scan(settings, account_id, scan_rec.id, db_path)

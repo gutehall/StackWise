@@ -62,8 +62,9 @@ class DiscoveryScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("Config recorder scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "describe_configuration_recorders", e)
 
         # ── Tagged resources (same as cost, but discovery rules use it too) ─
         # Cost scanner also runs get_resources, since discovery DSC-002 and cost
@@ -96,8 +97,9 @@ class DiscoveryScanner(BaseScanner):
                     },
                 )
                 count += 1
-        except Exception:
+        except Exception as e:
             logger.debug("Tagged resources scan failed in %s", region, exc_info=True)
+            self._record_list_failure(db, scan_id, region, "get_resources", e)
 
         return count
 

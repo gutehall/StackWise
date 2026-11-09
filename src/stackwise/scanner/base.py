@@ -51,8 +51,11 @@ class BaseScanner(ABC):
                 count = self._scan_region(session, db, scan_id, region)
                 logger.info("%s: %s → %d resources", self.name, region, count)
                 return count
-            except Exception:
+            except Exception as exc:
                 logger.exception("%s: failed in %s", self.name, region)
+                # If this write fails too (e.g. "database is locked") it propagates
+                # out of scan() on purpose: the failure must not vanish.
+                self._record_list_failure(db, scan_id, region, "_scan_region", exc)
                 return 0
 
         if max_workers <= 1:
@@ -70,6 +73,21 @@ class BaseScanner(ABC):
                         progress.advance(task)
 
         return total
+
+    def _record_list_failure(
+        self,
+        db: ScanDB,
+        scan_id: str,
+        region: str,
+        operation: str,
+        exc: Exception,
+    ) -> None:
+        """Record that a whole-service list call failed, which fails the scan.
+
+        Per-resource enrichment failures don't belong here. A failing DB write
+        propagates so the failure can't vanish.
+        """
+        db.insert_scan_error(scan_id, self.name, region, operation, str(exc) or repr(exc))
 
     @abstractmethod
     def _scan_region(

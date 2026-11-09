@@ -3,6 +3,7 @@
 import logging
 import sqlite3
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from stackwise.store.db import ScanDB
 
@@ -194,3 +195,58 @@ def test_opening_db_with_preexisting_duplicate_resources_warns_not_raises(
     assert "duplicate rows" in caplog.text
     assert len(db.get_resources("scan1")) == 2  # both rows still readable
     db.close()
+
+
+def test_insert_and_get_scan_errors(scan_db: ScanDB):
+    """Rows are scoped to their scan and come back in insertion order."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+    other = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+
+    first = scan_db.insert_scan_error(scan.id, "s3", "us-east-1", "list_buckets", "denied")
+    second = scan_db.insert_scan_error(scan.id, "rds", "eu-west-1", "describe_db_clusters", "slow")
+    scan_db.insert_scan_error(other.id, "efs", "us-east-1", "describe_file_systems", "boom")
+
+    assert scan_db.get_scan_errors(scan.id) == [first, second]
+    assert (first.scanner, first.region, first.operation, first.message) == (
+        "s3", "us-east-1", "list_buckets", "denied",
+    )
+
+
+def test_get_scan_errors_empty_for_clean_scan(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+    assert scan_db.get_scan_errors(scan.id) == []
+
+
+def test_insert_scan_error_takes_the_shared_lock(scan_db: ScanDB):
+    """Worker threads share one connection, so the write must hold _lock."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+    scan_db._lock = MagicMock()
+
+    scan_db.insert_scan_error(scan.id, "s3", "us-east-1", "list_buckets", "denied")
+
+    scan_db._lock.__enter__.assert_called_once()
+
+
+def test_opening_legacy_db_without_scan_errors_table_works(tmp_path: Path):
+    """A scan file written before scan_errors existed must still open, keep its
+    data, and read back as having no errors."""
+    db_path = tmp_path / "legacy.db"
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript(
+        """
+        CREATE TABLE scans (
+            id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, account_id TEXT NOT NULL,
+            regions TEXT NOT NULL, modules TEXT NOT NULL
+        );
+        INSERT INTO scans VALUES ('scan1', '2024-01-01', '123456789012', '[]', '[]');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    db = ScanDB(db_path)
+    try:
+        assert db.get_scan("scan1") is not None
+        assert db.get_scan_errors("scan1") == []
+    finally:
+        db.close()

@@ -51,6 +51,7 @@ def test_iam_user_mfa_check_failure_is_flagged_not_swallowed(scan_db: ScanDB):
     assert len(users) == 1
     assert users[0].metadata["MFACheckFailed"] is True
     assert users[0].metadata["MFADevices"] == []
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 def test_kms_key_metadata_preserved_when_rotation_check_fails(scan_db: ScanDB):
@@ -201,6 +202,7 @@ def test_iam_role_enrichment_failure_is_flagged_not_swallowed(scan_db: ScanDB):
     assert len(roles) == 1
     assert roles[0].metadata["InlinePoliciesCheckFailed"] is True
     assert roles[0].metadata["Arn"] == "arn:aws:iam::1:role/my-role"
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 def test_iam_user_inline_policy_failure_is_flagged_not_swallowed(scan_db: ScanDB):
@@ -247,6 +249,9 @@ def test_iam_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = SecurityScanner()._scan_iam(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("security", "list_roles"),
+    ]
 
 
 def test_kms_describe_key_failure_defaults_metadata(scan_db: ScanDB):
@@ -275,6 +280,7 @@ def test_kms_describe_key_failure_defaults_metadata(scan_db: ScanDB):
     assert keys[0].metadata["Arn"] is None
     assert keys[0].metadata["KeyManager"] is None
     assert keys[0].metadata["KeyRotationCheckFailed"] is False
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 def test_kms_top_level_failure_does_not_raise(scan_db: ScanDB):
@@ -289,6 +295,9 @@ def test_kms_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = SecurityScanner()._scan_kms_regional(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("security", "list_keys"),
+    ]
 
 
 @mock_aws
@@ -322,6 +331,9 @@ def test_secrets_manager_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = SecurityScanner()._scan_secrets(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("security", "list_secrets"),
+    ]
 
 
 def test_guardduty_get_detector_failure_skips_detector(scan_db: ScanDB):
@@ -360,6 +372,9 @@ def test_guardduty_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = SecurityScanner()._scan_guardduty(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("security", "list_detectors"),
+    ]
 
 
 def test_guardduty_findings_scan_failure_does_not_raise(scan_db: ScanDB):
@@ -376,6 +391,7 @@ def test_guardduty_findings_scan_failure_does_not_raise(scan_db: ScanDB):
         )
 
     assert count == 0
+    assert [e.operation for e in scan_db.get_scan_errors("scan-1")] == ["list_findings"]
 
 
 @mock_aws
@@ -411,3 +427,37 @@ def test_scan_region_skips_iam_and_guardduty_outside_us_east_1(scan_db: ScanDB):
     assert [r for r in resources if r.service == "iam"] == []
     assert [r for r in resources if r.service == "guardduty"] == []
     assert [r for r in resources if r.service == "kms"] != []
+
+
+def test_iam_list_users_failure_names_the_operation(scan_db: ScanDB):
+    """list_users shares a try with list_roles; the recorded operation must
+    name the call that actually failed."""
+    session = MagicMock()
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["security"])
+
+    def _paginate(client, method, key, **kw):
+        if method == "list_users":
+            raise RuntimeError("boom")
+        return []
+
+    with (
+        patch("stackwise.scanner.security.regional_client", return_value=MagicMock()),
+        patch("stackwise.scanner.security.paginate", side_effect=_paginate),
+    ):
+        SecurityScanner()._scan_iam(session, scan_db, scan.id, "us-east-1")
+
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("security", "list_users"),
+    ]
+
+
+def test_guardduty_get_findings_failure_names_the_operation(scan_db: ScanDB):
+    """get_findings shares a try with list_findings; the recorded operation
+    must name the call that actually failed."""
+    gd = MagicMock()
+    gd.get_findings.side_effect = RuntimeError("boom")
+
+    with patch("stackwise.scanner.security.paginate", return_value=["f-1"]):
+        SecurityScanner()._scan_guardduty_findings(gd, scan_db, "scan-1", "us-east-1", "det-1")
+
+    assert [e.operation for e in scan_db.get_scan_errors("scan-1")] == ["get_findings"]

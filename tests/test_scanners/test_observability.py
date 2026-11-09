@@ -97,3 +97,7 @@ def test_top_level_api_failures_degrade_gracefully(scan_db: ScanDB):
 
     assert count == 0
     assert scan_db.get_resources(scan.id) == []
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("observability", "describe_alarms"),
+        ("observability", "describe_log_groups"),
+    ]

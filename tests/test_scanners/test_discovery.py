@@ -116,6 +116,7 @@ def test_recorder_status_lookup_failure_still_stores_recorder(scan_db: ScanDB):
     ]
     assert len(recorders) == 1
     assert recorders[0].metadata["recording"] is False
+    assert scan_db.get_scan_errors(scan.id) == []
 
 
 def test_config_recorder_top_level_failure_does_not_raise(scan_db: ScanDB):
@@ -134,6 +135,9 @@ def test_config_recorder_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = DiscoveryScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("discovery", "describe_configuration_recorders"),
+    ]
 
 
 def test_tagged_resource_with_malformed_arn_falls_back(scan_db: ScanDB):
@@ -180,3 +184,6 @@ def test_tagged_resources_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = DiscoveryScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("discovery", "get_resources"),
+    ]

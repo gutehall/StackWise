@@ -216,6 +216,9 @@ def test_launch_templates_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = EC2Scanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("ec2", "describe_launch_templates"),
+    ]
 
 
 @mock_aws
@@ -322,6 +325,9 @@ def test_ecs_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = ECSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("ecs", "list_clusters"),
+    ]
 
 
 @mock_aws
@@ -436,3 +442,48 @@ def test_eks_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = EKSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("eks", "list_clusters"),
+    ]
+
+
+def test_ecs_list_services_failure_names_the_operation(scan_db: ScanDB):
+    """list_services shares a try with list_clusters; the recorded operation
+    must name the call that actually failed."""
+    session = MagicMock()
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+
+    def _paginate(client, method, key, **kw):
+        if method == "list_clusters":
+            return ["arn:aws:ecs:us-east-1:123456789012:cluster/c1"]
+        raise RuntimeError("boom")
+
+    with (
+        patch("stackwise.scanner.compute.regional_client", return_value=MagicMock()),
+        patch("stackwise.scanner.compute.paginate", side_effect=_paginate),
+    ):
+        ECSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("ecs", "list_services"),
+    ]
+
+
+def test_ecs_list_task_definitions_failure_names_the_operation(scan_db: ScanDB):
+    session = MagicMock()
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+
+    def _paginate(client, method, key, **kw):
+        if method == "list_task_definitions":
+            raise RuntimeError("boom")
+        return []
+
+    with (
+        patch("stackwise.scanner.compute.regional_client", return_value=MagicMock()),
+        patch("stackwise.scanner.compute.paginate", side_effect=_paginate),
+    ):
+        ECSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("ecs", "list_task_definitions"),
+    ]
