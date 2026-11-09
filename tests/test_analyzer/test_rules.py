@@ -679,11 +679,11 @@ def test_discovery_rules_separate_failed_checks_from_misconfiguration(
     [
         # A failed check must not look like a disabled detector.
         ({"DetectorCheckFailed": True}, "SEC-009", False),
-        ({"DetectorCheckFailed": True}, "SEC-011", True),
+        ({"DetectorCheckFailed": True}, "SEC-014", True),
         # A disabled detector, or none at all, still fires.
         ({"DetectorCheckFailed": False, "Status": "DISABLED"}, "SEC-009", True),
         ({"DetectorCheckFailed": False, "Status": "NOT_FOUND"}, "SEC-009", True),
-        ({"DetectorCheckFailed": False, "Status": "DISABLED"}, "SEC-011", False),
+        ({"DetectorCheckFailed": False, "Status": "DISABLED"}, "SEC-014", False),
         # An enabled detector doesn't fire.
         ({"DetectorCheckFailed": False, "Status": "ENABLED"}, "SEC-009", False),
         # Older scans have no flag, and behave as before.
@@ -789,3 +789,10 @@ def test_ecs_and_eks_rules_separate_failed_checks_from_misconfiguration(
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_rule_ids_are_unique():
+    """Suppression and diff key on the rule id, so a reused id ties two rules together."""
+    ids = [r.id for r in load_rules()]
+
+    assert sorted(i for i in set(ids) if ids.count(i) > 1) == []

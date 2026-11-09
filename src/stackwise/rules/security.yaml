@@ -140,7 +140,7 @@
     Review and remediate high-severity GuardDuty findings.
 
 # Checks that could not run
-- id: SEC-011
+- id: SEC-014
   title: "GuardDuty detector status could not be verified"
   severity: INFO
   resource_type: detector
