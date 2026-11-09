@@ -958,3 +958,25 @@ def test_reading_a_finished_scan_leaves_no_sidecar_files(tmp_path: Path, monkeyp
     assert runner.invoke(app, ["report", "--output-dir", str(tmp_path / "out")]).exit_code == 0
 
     assert [p for p in _account_dir(tmp_path).iterdir() if ".db-" in p.name] == []
+
+
+@pytest.mark.parametrize("output_format", ["html", "md", "json"])
+def test_reports_render_a_bucket_whose_region_is_unknown(
+    tmp_path: Path, monkeypatch, output_format: str
+):
+    db_path = tmp_path / "scan.db"
+    db = ScanDB(db_path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["data"])
+    db.insert_resource(
+        scan.id, "s3", "bucket", "b", "unknown", metadata={"LocationCheckFailed": True}
+    )
+    db.close()
+    _point_latest_at(db_path, scan.id, monkeypatch, tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "all", "--format", output_format,
+         "--output-dir", str(tmp_path / "out")],
+    )
+
+    assert result.exit_code == 0, result.output

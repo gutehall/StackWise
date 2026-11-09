@@ -24,6 +24,15 @@ _S3_NOT_CONFIGURED_CODES = {
 }
 
 
+# Stored as the region when get_bucket_location fails, rather than guessing one.
+# diff ignores a bucket's region, so a later real region isn't reported as drift.
+_S3_UNKNOWN_REGION = "unknown"
+
+# Legacy eu-west-1 buckets report this instead of a region name. A bucket in us-east-1
+# reports no constraint at all.
+_S3_LEGACY_LOCATIONS = {"EU": "eu-west-1"}
+
+
 def _s3_check_failed(bucket_name: str, method: str, error: Exception) -> bool:
     """True if *error* means the check genuinely couldn't be verified."""
     if isinstance(error, ClientError):
@@ -52,8 +61,18 @@ class S3Scanner(BaseScanner):
 
         s3_client = regional_client(session, "s3", "us-east-1")
         count = 0
+        buckets: list[dict] = []
         try:
-            buckets = s3_client.list_buckets().get("Buckets", [])
+            # Paged by hand: the list_buckets paginator is newer than the oldest boto3
+            # this package allows, and a missing paginator would fail the scan.
+            kwargs: dict = {}
+            while True:
+                resp = s3_client.list_buckets(**kwargs)
+                buckets.extend(resp.get("Buckets", []))
+                token = resp.get("ContinuationToken")
+                if not token:
+                    break
+                kwargs["ContinuationToken"] = token
         except Exception as e:
             logger.exception("S3 list_buckets failed")
             self._record_list_failure(db, scan_id, region, "list_buckets", e)
@@ -68,9 +87,13 @@ class S3Scanner(BaseScanner):
 
             try:
                 loc = s3_client.get_bucket_location(Bucket=bucket_name)
-                bucket_region = loc.get("LocationConstraint") or "us-east-1"
-            except Exception:
-                bucket_region = "us-east-1"
+                constraint = loc.get("LocationConstraint") or "us-east-1"
+                bucket_region = _S3_LEGACY_LOCATIONS.get(constraint, constraint)
+                metadata["LocationCheckFailed"] = False
+            except Exception as e:
+                logger.warning("get_bucket_location failed for bucket %s: %s", bucket_name, e)
+                bucket_region = _S3_UNKNOWN_REGION
+                metadata["LocationCheckFailed"] = True
 
             try:
                 ver = s3_client.get_bucket_versioning(Bucket=bucket_name)

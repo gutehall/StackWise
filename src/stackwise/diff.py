@@ -10,7 +10,15 @@ from stackwise.store.db import ScanDB
 
 
 def _resource_key(r) -> tuple[str, str, str, str]:
-    """Unique key for a resource: (service, resource_type, resource_id, region)."""
+    """Unique key for a resource: (service, resource_type, resource_id, region).
+
+    S3 bucket names are globally unique and a bucket can't change region, so a bucket's
+    stored region is left out. It can differ between scans without the bucket changing:
+    a failed location lookup stores "unknown", and older scans stored a guessed
+    "us-east-1" or a raw "EU".
+    """
+    if r.service == "s3" and r.resource_type == "bucket":
+        return (r.service, r.resource_type, r.resource_id, "")
     return (r.service, r.resource_type, r.resource_id, r.region)
 
 
