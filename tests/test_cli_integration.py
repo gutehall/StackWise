@@ -980,3 +980,21 @@ def test_reports_render_a_bucket_whose_region_is_unknown(
     )
 
     assert result.exit_code == 0, result.output
+
+
+@mock_aws
+def test_region_with_no_config_recorder_gets_one_finding(tmp_path: Path, monkeypatch):
+    """moto starts with no recorder, so this goes through the real scan and rules."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    args = ["scan", "--regions", "us-east-1", "--modules", "discovery"]
+    assert runner.invoke(app, args).exit_code == 0
+
+    result = runner.invoke(app, ["analyze", "--engine", "rules-only"])
+    assert result.exit_code == 0, result.output
+
+    db = ScanDB(_scan_files(tmp_path)[0], mode="ro")
+    try:
+        findings = db.get_findings(db.latest_scan().id)
+    finally:
+        db.close()
+    assert len([f for f in findings if f.rule_id == "DSC-001"]) == 1

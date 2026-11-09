@@ -643,3 +643,32 @@ def test_dat013_handles_a_table_with_no_billing_summary(
 
     assert "DAT-013" not in caplog.text
     assert any(f.rule_id == "DAT-013" for f in scan_db.get_findings(scan.id)) is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        # A failed status check must not look like a stopped recorder.
+        ({"RecordingCheckFailed": True}, "DSC-001", False),
+        ({"RecordingCheckFailed": True}, "DSC-003", True),
+        # A recorder really not recording, or none at all, still fires.
+        ({"RecordingCheckFailed": False, "recording": False}, "DSC-001", True),
+        ({"RecordingCheckFailed": False, "recording": False, "RecorderAbsent": True},
+         "DSC-001", True),
+        ({"RecordingCheckFailed": False, "recording": False}, "DSC-003", False),
+        # A healthy recorder doesn't fire.
+        ({"RecordingCheckFailed": False, "recording": True}, "DSC-001", False),
+        # Older scans have no flag, and behave as before.
+        ({"recording": False}, "DSC-001", True),
+        ({"recording": True}, "DSC-001", False),
+    ],
+)
+def test_discovery_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["discovery"])
+    scan_db.insert_resource(scan.id, "config", "recorder", "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires

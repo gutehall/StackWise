@@ -90,8 +90,8 @@ def test_recorder_with_malformed_role_arn_does_not_abort_region(scan_db: ScanDB)
 
 def test_recorder_status_lookup_failure_still_stores_recorder(scan_db: ScanDB):
     """A describe_configuration_recorder_status failure is narrower than the
-    outer Config try/except — the recorder must still be stored, defaulting
-    to recording=False rather than being dropped."""
+    outer Config try/except — the recorder must still be stored, flagged, with
+    recording left unset rather than looking like it's stopped."""
     session = MagicMock()
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["discovery"])
 
@@ -115,8 +115,51 @@ def test_recorder_status_lookup_failure_still_stores_recorder(scan_db: ScanDB):
         if r.resource_type == "recorder"
     ]
     assert len(recorders) == 1
+    assert recorders[0].metadata["RecordingCheckFailed"] is True
+    assert "recording" not in recorders[0].metadata
+    assert scan_db.get_scan_errors(scan.id) == []
+
+
+def test_empty_recorder_list_stores_one_absent_recorder(scan_db: ScanDB):
+    """Config was never enabled here, which must not look the same as healthy."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["discovery"])
+    config = MagicMock()
+    config.describe_configuration_recorders.return_value = {"ConfigurationRecorders": []}
+    config.describe_configuration_recorder_status.return_value = {
+        "ConfigurationRecordersStatus": []
+    }
+
+    with (
+        patch("stackwise.scanner.discovery.regional_client", return_value=config),
+        patch("stackwise.scanner.discovery.paginate", return_value=[]),
+    ):
+        count = DiscoveryScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    assert count == 1
+    recorders = scan_db.get_resources(scan.id, service="config")
+    assert [r.resource_id for r in recorders] == ["no-recorder"]
+    assert recorders[0].arn is None
+    assert recorders[0].metadata["RecorderAbsent"] is True
     assert recorders[0].metadata["recording"] is False
     assert scan_db.get_scan_errors(scan.id) == []
+
+
+def test_empty_recorder_list_is_still_absent_when_the_status_call_fails(scan_db: ScanDB):
+    """No recorder exists, so a failed status lookup has nothing left to check."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["discovery"])
+    config = MagicMock()
+    config.describe_configuration_recorders.return_value = {"ConfigurationRecorders": []}
+    config.describe_configuration_recorder_status.side_effect = RuntimeError("denied")
+
+    with (
+        patch("stackwise.scanner.discovery.regional_client", return_value=config),
+        patch("stackwise.scanner.discovery.paginate", return_value=[]),
+    ):
+        DiscoveryScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    recorder = scan_db.get_resources(scan.id, service="config")[0]
+    assert recorder.metadata["RecorderAbsent"] is True
+    assert recorder.metadata["RecordingCheckFailed"] is False
 
 
 def test_config_recorder_top_level_failure_does_not_raise(scan_db: ScanDB):
@@ -135,6 +178,7 @@ def test_config_recorder_top_level_failure_does_not_raise(scan_db: ScanDB):
         count = DiscoveryScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
     assert count == 0
+    assert scan_db.get_resources(scan.id, service="config") == []
     assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
         ("discovery", "describe_configuration_recorders"),
     ]
@@ -183,7 +227,7 @@ def test_tagged_resources_top_level_failure_does_not_raise(scan_db: ScanDB):
     ):
         count = DiscoveryScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
-    assert count == 0
+    assert count == 1  # only the row for the empty recorder list
     assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
         ("discovery", "get_resources"),
     ]
