@@ -79,6 +79,10 @@ CREATE INDEX IF NOT EXISTS idx_recommendations_scan ON recommendations(scan_id);
 CREATE INDEX IF NOT EXISTS idx_scan_errors_scan ON scan_errors(scan_id);
 """
 
+# How long a write waits for another connection to release the database. A longer
+# wait multiplies: each row of a scan would wait this long in turn.
+_BUSY_TIMEOUT_SECONDS = 10
+
 # A row in any of these means the file holds a scan that must not be a diff baseline.
 _INCOMPLETE_SCAN_CHECKS = {
     "scan_errors": "SELECT 1 FROM scan_errors LIMIT 1",
@@ -162,19 +166,33 @@ class ScanDB:
     or ``"ro"`` to read one without changing it, including its mtime. ``"rw"`` and
     ``"ro"`` raise FileNotFoundError for a missing file instead of creating it.
     ``"ro"`` skips the schema, so a table newer than the file can be absent.
+
+    ``"create"`` uses WAL while the scan writes and returns to a single file on
+    close. A read-only open of a WAL file would otherwise leave -shm and -wal
+    files beside it.
     """
 
     def __init__(self, db_path: Path, mode: Literal["create", "rw", "ro"] = "create") -> None:
         self.db_path = db_path
+        self._mode = mode
         self._lock = threading.Lock()
+        # Scanners catch broad exceptions around per-resource work, which can swallow
+        # a failed write. This keeps it visible, so the scan can still fail.
+        self.write_failures: set[str] = set()
         if mode == "create":
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            self.conn = sqlite3.connect(
+                str(db_path), timeout=_BUSY_TIMEOUT_SECONDS, check_same_thread=False
+            )
+            self.conn.execute("PRAGMA journal_mode=WAL")
         else:
             if not db_path.exists():
                 raise FileNotFoundError(f"Scan database not found: {db_path}")
             self.conn = sqlite3.connect(
-                f"{db_path.resolve().as_uri()}?mode={mode}", uri=True, check_same_thread=False
+                f"{db_path.resolve().as_uri()}?mode={mode}",
+                uri=True,
+                timeout=_BUSY_TIMEOUT_SECONDS,
+                check_same_thread=False,
             )
         self.conn.row_factory = sqlite3.Row
         if mode == "ro":
@@ -275,9 +293,13 @@ class ScanDB:
         metadata: dict | None = None,
     ) -> ResourceRecord:
         with self._lock:
-            return self._insert_resource_unsafe(
-                scan_id, service, resource_type, resource_id, region, arn, metadata
-            )
+            try:
+                return self._insert_resource_unsafe(
+                    scan_id, service, resource_type, resource_id, region, arn, metadata
+                )
+            except sqlite3.Error as e:
+                self.write_failures.add(str(e))
+                raise
 
     def _insert_resource_unsafe(
         self,
@@ -490,4 +512,10 @@ class ScanDB:
         }
 
     def close(self) -> None:
+        if self._mode == "create":
+            try:
+                self.conn.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.Error:
+                # Another connection still has it open. A WAL file still reads fine.
+                logger.debug("Could not leave WAL mode on %s", self.db_path, exc_info=True)
         self.conn.close()

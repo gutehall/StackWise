@@ -202,3 +202,16 @@ def test_diff_result_scope_ignores_order():
 
     assert DiffResult("a", "b", base_modules=["compute"]).scope_differs is True
     assert DiffResult("a", "b", compare_regions=["us-east-1"]).scope_differs is True
+
+
+def test_filename_order_holds_across_the_old_and_new_naming(tmp_path: Path):
+    """Scans from before the microsecond and suffix names must sort correctly
+    against new ones, including within the same second."""
+    old = _make_scan(tmp_path / "20240101T000000.db")
+    same_second = _make_scan(tmp_path / "20240101T000000.000001-aaaaaa.db")
+    later = _make_scan(tmp_path / "20240101T000000.500000-000000.db")
+    next_old = _make_scan(tmp_path / "20240101T000001.db")
+
+    assert previous_completed_scan(same_second) == old
+    assert previous_completed_scan(later) == same_second
+    assert previous_completed_scan(next_old) == later

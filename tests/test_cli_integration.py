@@ -46,10 +46,7 @@ def _compute_optimizer_empty():
 
 def _invoke_scans_with_distinct_timestamps(*arg_lists):
     """Invoke the CLI once per arg_list, forcing each scan() call to get a
-    distinct timestamp. scan() derives its db filename from
-    datetime.now(UTC) at 1-second resolution, so two scans issued back to
-    back in a test can land in the same wall-clock second and silently
-    overwrite each other's db file."""
+    later timestamp, so the order of the db filenames is deterministic."""
     base = datetime(2024, 1, 1, tzinfo=UTC)
     results = []
     for i, args in enumerate(arg_lists):
@@ -612,7 +609,7 @@ def test_scan_error_write_failure_still_fails_the_scan(tmp_path: Path, monkeypat
         result = runner.invoke(app, _SCAN_ARGS)
 
     assert result.exit_code == 1
-    assert isinstance(result.exception, sqlite3.OperationalError)
+    assert "database is locked" in result.output
     assert "Scan complete" not in result.output
     assert not (_account_dir(tmp_path) / ".latest").exists()
     close.assert_called_once()
@@ -876,3 +873,88 @@ def test_diff_same_scope_has_no_warning(tmp_path: Path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "different scopes" not in result.output
+
+
+@mock_aws
+def test_two_scans_in_the_same_instant_get_their_own_files(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+
+    _scan_at(0)
+    _scan_at(0)
+
+    files = _scan_files(tmp_path)
+    assert len(files) == 2
+    for path in files:
+        db = ScanDB(path, mode="ro")
+        try:
+            assert db.conn.execute("SELECT count(*) FROM scans").fetchone()[0] == 1
+        finally:
+            db.close()
+    assert sorted(p.name for p in _account_dir(tmp_path).iterdir() if ".db-" in p.name) == []
+
+
+def _scanner_blocked_by_another_connection(*, swallow: bool):
+    """A _scan_region whose writes hit "database is locked", held by a second
+    connection the way an overlapping process would. Returns it and the holders."""
+    holders: list[sqlite3.Connection] = []
+
+    def _scan_region(self, session, db, scan_id, region):
+        holder = sqlite3.connect(db.db_path, check_same_thread=False)
+        holder.execute("BEGIN IMMEDIATE")
+        holders.append(holder)
+        try:
+            db.insert_resource(scan_id, "ec2", "instance", "i-1", region, metadata={})
+        except sqlite3.OperationalError:
+            # What the scanners' per-resource `except Exception` blocks do.
+            if not swallow:
+                raise
+        return 0
+
+    return _scan_region, holders
+
+
+@mock_aws
+@pytest.mark.parametrize("swallow", [True, False], ids=["swallowed", "raised"])
+def test_locked_database_fails_the_scan_and_is_not_published(
+    tmp_path: Path, monkeypatch, swallow: bool
+):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    latest = _account_dir(tmp_path) / ".latest"
+    before = latest.read_text()
+
+    _scan_region, holders = _scanner_blocked_by_another_connection(swallow=swallow)
+    with (
+        patch("stackwise.store.db._BUSY_TIMEOUT_SECONDS", 0.01),
+        patch.object(EC2Scanner, "_scan_region", _scan_region),
+    ):
+        with patch("stackwise.cli.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 1, 2, tzinfo=UTC)
+            result = runner.invoke(app, _SCAN_ARGS)
+    for holder in holders:
+        holder.close()
+
+    assert result.exit_code == 1
+    assert "database is locked" in result.output
+    assert "Scan complete" not in result.output
+    assert latest.read_text() == before
+
+    # It also can't become the baseline of a later diff.
+    good, locked = _scan_files(tmp_path)
+    _scan_at(86_400 * 2)
+    diff = runner.invoke(app, ["diff"])
+    assert diff.exit_code == 0, diff.output
+    assert f"Base:    {good.name}" in diff.output
+    assert locked.name not in diff.output
+
+
+@mock_aws
+def test_reading_a_finished_scan_leaves_no_sidecar_files(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    _scan_at(1)
+
+    assert runner.invoke(app, ["diff"]).exit_code == 0
+    assert runner.invoke(app, ["report", "--output-dir", str(tmp_path / "out")]).exit_code == 0
+
+    assert [p for p in _account_dir(tmp_path).iterdir() if ".db-" in p.name] == []

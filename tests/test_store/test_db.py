@@ -351,3 +351,55 @@ def test_old_file_opened_writable_still_counts_as_complete(tmp_path: Path):
         assert db.is_complete() is True
     finally:
         db.close()
+
+
+def test_scan_connection_uses_wal_and_returns_to_one_file_on_close(tmp_path: Path):
+    path = tmp_path / "scan.db"
+    db = ScanDB(path)
+    assert db.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+    db.close()
+
+    assert [p.name for p in tmp_path.iterdir()] == ["scan.db"]
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    conn.close()
+
+
+def test_busy_timeout_is_set_on_the_connection(tmp_path: Path):
+    db = ScanDB(tmp_path / "scan.db")
+    try:
+        assert db.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 10_000
+    finally:
+        db.close()
+
+
+def test_failed_resource_write_is_kept_after_being_swallowed(tmp_path: Path):
+    db = ScanDB(tmp_path / "scan.db")
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    holder = sqlite3.connect(db.db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    db.conn.execute("PRAGMA busy_timeout = 1")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            db.insert_resource(scan.id, "ec2", "instance", "i-1", "us-east-1", metadata={})
+        assert db.write_failures == {"database is locked"}
+        # Close can't leave WAL while another connection holds it. That must not raise.
+        db.close()
+    finally:
+        holder.close()
+
+
+def test_scan_left_in_wal_by_a_crash_still_opens_read_only(tmp_path: Path):
+    path = tmp_path / "crashed.db"
+    db = ScanDB(path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    # No close: the -wal file stays behind, as it would after the process dies.
+    db.conn.commit()
+
+    ro = ScanDB(path, mode="ro")
+    try:
+        assert ro.get_scan(scan.id) is not None
+    finally:
+        ro.close()
+        db.conn.close()

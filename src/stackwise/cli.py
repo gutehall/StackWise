@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -94,8 +95,10 @@ def scan(
     console.print(f"  Modules: {', '.join(settings.modules)}")
 
     # Open DB
-    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-    db_path = settings.scans_dir(account_id) / f"{ts}.db"
+    # Sorts in scan order, which `diff` relies on to find the previous scan. The
+    # suffix keeps two scans started at the same moment in separate files.
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%f")
+    db_path = settings.scans_dir(account_id) / f"{ts}-{uuid.uuid4().hex[:6]}.db"
     db = ScanDB(db_path)
     scan_rec = db.create_scan(account_id, settings.regions, settings.modules, in_progress=True)
     console.print(f"  Scan ID: [green]{scan_rec.id}[/green]")
@@ -141,13 +144,23 @@ def scan(
                 )
                 total_resources += count
         scan_errors = db.get_scan_errors(scan_rec.id)
-        if not scan_errors:
+        write_failures = sorted(db.write_failures)
+        if not scan_errors and not write_failures:
             db.mark_scan_complete(scan_rec.id)
+    except sqlite3.Error as e:  # e.g. "database is locked"
+        console.print(f"\n[bold red]Scan failed:[/bold red] {escape(str(e))}", soft_wrap=True)
+        console.print(f"  DB: {escape(str(db_path))}", soft_wrap=True)
+        raise typer.Exit(1)
     finally:
         db.close()
 
-    if scan_errors:
-        console.print(f"\n[bold red]Scan failed:[/bold red] {len(scan_errors)} error(s)")
+    if scan_errors or write_failures:
+        console.print(
+            f"\n[bold red]Scan failed:[/bold red] "
+            f"{len(scan_errors) + len(write_failures)} error(s)"
+        )
+        for failure in write_failures:
+            console.print(f"  [red]Database write failed: {escape(failure)}[/red]", soft_wrap=True)
         # AWS error text can contain square brackets, which rich would parse as markup.
         for err in scan_errors:
             console.print(
