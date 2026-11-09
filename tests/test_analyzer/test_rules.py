@@ -559,3 +559,87 @@ def test_network_check_that_could_not_run_is_reported(
     matches = [f for f in scan_db.get_findings(scan.id) if f.rule_id == rule_id]
     assert [f.resource_id for f in matches] == [failing.id]
     assert matches[0].severity == "INFO"
+
+
+_TABLE = ("dynamodb", "table")
+_EFS = ("efs", "file_system")
+_TABLE_OK = {
+    "DescribeTableCheckFailed": False,
+    "PointInTimeRecoveryCheckFailed": False,
+    "SSEDescription": {"Status": "ENABLED"},
+    "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"},
+    "PointInTimeRecoveryDescription": {"PointInTimeRecoveryStatus": "ENABLED"},
+}
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like the insecure setting.
+        (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-011", False),
+        (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-012", False),
+        (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-013", False),
+        (_EFS, {"LifecycleCheckFailed": True}, "DAT-015", False),
+        # A PITR error skips only DAT-011: the other settings were read.
+        (_TABLE, {"PointInTimeRecoveryCheckFailed": True, "DescribeTableCheckFailed": False,
+                  "SSEDescription": {"Status": "ENABLED"}}, "DAT-011", False),
+        (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True,
+                  "SSEDescription": None}, "DAT-012", True),
+        (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True,
+                  "BillingModeSummary": {"BillingMode": "PROVISIONED"}}, "DAT-013", True),
+        # The real misconfiguration still fires.
+        (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryDescription":
+                  {"PointInTimeRecoveryStatus": "DISABLED"}}, "DAT-011", True),
+        (_TABLE, {**_TABLE_OK, "SSEDescription": None}, "DAT-012", True),
+        (_EFS, {"LifecycleCheckFailed": False, "LifecyclePolicies": []}, "DAT-015", True),
+        # A correct setting doesn't fire.
+        (_TABLE, _TABLE_OK, "DAT-011", False),
+        (_TABLE, _TABLE_OK, "DAT-012", False),
+        (_EFS, {"LifecycleCheckFailed": False,
+                "LifecyclePolicies": [{"TransitionToIA": "AFTER_30_DAYS"}]}, "DAT-015", False),
+        # Older scans have no flag, and behave as before.
+        (_EFS, {"LifecyclePolicies": []}, "DAT-015", True),
+        (_TABLE, {"SSEDescription": None}, "DAT-012", True),
+        # A check that could not run stays visible.
+        (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-020", True),
+        (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True}, "DAT-020", True),
+        (_TABLE, _TABLE_OK, "DAT-020", False),
+        (_EFS, {"LifecycleCheckFailed": True}, "DAT-021", True),
+        (_EFS, {"LifecycleCheckFailed": False, "LifecyclePolicies": []}, "DAT-021", False),
+    ],
+)
+def test_data_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, kind, metadata, rule_id, fires
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "res-1", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    found = any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id))
+    assert found is fires
+
+
+@pytest.mark.parametrize(
+    ("summary", "fires"),
+    [
+        (None, False),
+        ({"BillingMode": "PROVISIONED"}, True),
+        ({"BillingMode": "PAY_PER_REQUEST"}, False),
+    ],
+    ids=["no-summary", "provisioned", "on-demand"],
+)
+def test_dat013_handles_a_table_with_no_billing_summary(
+    scan_db: ScanDB, caplog, summary: dict | None, fires: bool
+):
+    """AWS can omit BillingModeSummary, so the scanner stores None. The rule must
+    evaluate cleanly on that row, not raise and get skipped."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(
+        scan.id, "dynamodb", "table", "t1", "us-east-1", metadata={"BillingModeSummary": summary}
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert "DAT-013" not in caplog.text
+    assert any(f.rule_id == "DAT-013" for f in scan_db.get_findings(scan.id)) is fires

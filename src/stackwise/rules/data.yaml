@@ -122,7 +122,7 @@
   resource_type: table
   service: dynamodb
   condition: |
-    resource.get('PointInTimeRecoveryDescription', {}).get('PointInTimeRecoveryStatus') != 'ENABLED'
+    not resource.get('DescribeTableCheckFailed') and not resource.get('PointInTimeRecoveryCheckFailed') and resource.get('PointInTimeRecoveryDescription', {}).get('PointInTimeRecoveryStatus') != 'ENABLED'
   remediation: >
     Enable point-in-time recovery for backup and restore capability.
 
@@ -132,7 +132,7 @@
   resource_type: table
   service: dynamodb
   condition: |
-    not resource.get('SSEDescription') or resource.get('SSEDescription', {}).get('Status') != 'ENABLED'
+    not resource.get('DescribeTableCheckFailed') and (not resource.get('SSEDescription') or resource.get('SSEDescription', {}).get('Status') != 'ENABLED')
   remediation: >
     Enable encryption at rest for DynamoDB tables.
 
@@ -145,7 +145,7 @@
   # which isn't in the documented least-privilege IAM policy), so this can only
   # flag PROVISIONED tables for manual review, not actually detect low utilization.
   condition: |
-    resource.get('BillingModeSummary', {}).get('BillingMode') == 'PROVISIONED'
+    not resource.get('DescribeTableCheckFailed') and (resource.get('BillingModeSummary') or {}).get('BillingMode') == 'PROVISIONED'
   remediation: >
     Check CloudWatch ConsumedReadCapacityUnits/ConsumedWriteCapacityUnits against
     provisioned throughput; consider on-demand mode if utilization is consistently low.
@@ -167,7 +167,7 @@
   resource_type: file_system
   service: efs
   condition: |
-    not resource.get('LifecyclePolicies') or len(resource.get('LifecyclePolicies', [])) == 0
+    not resource.get('LifecycleCheckFailed') and (not resource.get('LifecyclePolicies') or len(resource.get('LifecyclePolicies', [])) == 0)
   remediation: >
     Consider lifecycle policies to transition infrequently accessed files to Infrequent Access.
 
@@ -201,3 +201,27 @@
     resource.get('AtRestEncryptionEnabled') is not True
   remediation: >
     Enable encryption at rest for ElastiCache replication groups.
+
+# Checks that could not run
+- id: DAT-020
+  title: "DynamoDB table configuration could not be verified"
+  severity: INFO
+  resource_type: table
+  service: dynamodb
+  condition: |
+    resource.get('DescribeTableCheckFailed') or resource.get('PointInTimeRecoveryCheckFailed')
+  remediation: >
+    A describe_table or describe_continuous_backups check failed (permissions or API
+    error), so DAT-011, DAT-012 or DAT-013 was skipped for this table. Verify manually.
+
+- id: DAT-021
+  title: "EFS lifecycle configuration could not be verified"
+  severity: INFO
+  resource_type: file_system
+  service: efs
+  condition: |
+    resource.get('LifecycleCheckFailed')
+  remediation: >
+    The lifecycle check failed (permissions or API error), so DAT-015 was skipped for
+    this file system. Verify manually, and check for
+    elasticfilesystem:DescribeLifecycleConfiguration.

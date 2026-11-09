@@ -367,28 +367,68 @@ def test_dynamodb_table_without_pitr_reports_disabled(scan_db: ScanDB):
     )
 
 
-def test_dynamodb_describe_table_failure_does_not_abort_scan(scan_db: ScanDB):
-    """A describe_table failure for one table must not stop the scan of
-    others (or raise out of _scan_region)."""
+def test_dynamodb_describe_table_failure_stores_flagged_row(scan_db: ScanDB):
+    """A describe_table failure must keep the table visible, flagged, and must not
+    stop the scan of the others."""
     session = MagicMock()
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
 
+    def _describe_table(**kwargs):
+        if kwargs["TableName"] == "broken-table":
+            raise RuntimeError("boom")
+        return {"Table": {"TableStatus": "ACTIVE", "SSEDescription": {"Status": "ENABLED"}}}
+
     ddb = MagicMock()
-    ddb.describe_table.side_effect = RuntimeError("boom")
+    ddb.describe_table.side_effect = _describe_table
+    ddb.describe_continuous_backups.return_value = {}
 
     with (
         patch("stackwise.scanner.data.regional_client", return_value=ddb),
         patch(
             "stackwise.scanner.data.paginate",
             side_effect=lambda client, method, key, **kw: (
-                ["broken-table"] if method == "list_tables" else []
+                ["broken-table", "good-table"] if method == "list_tables" else []
             ),
         ),
     ):
         count = DynamoDBScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
-    assert count == 0
-    assert scan_db.get_resources(scan.id, service="dynamodb") == []
+    assert count == 2
+    rows = {r.resource_id: r.metadata for r in scan_db.get_resources(scan.id, service="dynamodb")}
+    assert rows["broken-table"] == {
+        "TableName": "broken-table",
+        "DescribeTableCheckFailed": True,
+        "PointInTimeRecoveryCheckFailed": False,
+    }
+    assert rows["good-table"]["DescribeTableCheckFailed"] is False
+    assert scan_db.get_scan_errors(scan.id) == []
+
+
+def test_dynamodb_continuous_backups_failure_keeps_the_table(scan_db: ScanDB):
+    """AccessDenied on DescribeContinuousBackups must only lose the PITR check, not
+    the settings describe_table already returned."""
+    session = MagicMock()
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+
+    ddb = MagicMock()
+    ddb.describe_table.return_value = {
+        "Table": {"TableArn": "arn:table", "SSEDescription": {"Status": "ENABLED"}}
+    }
+    ddb.describe_continuous_backups.side_effect = RuntimeError("denied")
+
+    with (
+        patch("stackwise.scanner.data.regional_client", return_value=ddb),
+        patch("stackwise.scanner.data.paginate", return_value=["t1"]),
+    ):
+        count = DynamoDBScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    assert count == 1
+    table = scan_db.get_resources(scan.id, service="dynamodb")[0]
+    assert table.arn == "arn:table"
+    assert table.metadata["SSEDescription"] == {"Status": "ENABLED"}
+    assert table.metadata["PointInTimeRecoveryCheckFailed"] is True
+    assert table.metadata["DescribeTableCheckFailed"] is False
+    assert "PointInTimeRecoveryDescription" not in table.metadata
     assert scan_db.get_scan_errors(scan.id) == []
 
 
@@ -410,8 +450,8 @@ def test_dynamodb_top_level_failure_does_not_raise(scan_db: ScanDB):
 
 
 def test_efs_lifecycle_lookup_failure_still_stores_filesystem(scan_db: ScanDB):
-    """A describe_lifecycle_configuration failure must not drop the file
-    system — it should still be stored with an empty LifecyclePolicies list."""
+    """A describe_lifecycle_configuration failure must not drop the file system,
+    and must be flagged rather than look like no policies exist."""
     session = MagicMock()
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
 
@@ -431,7 +471,8 @@ def test_efs_lifecycle_lookup_failure_still_stores_filesystem(scan_db: ScanDB):
 
     resources = scan_db.get_resources(scan.id, service="efs")
     fs = next(r for r in resources if r.resource_id == "fs-1")
-    assert fs.metadata["LifecyclePolicies"] == []
+    assert fs.metadata["LifecycleCheckFailed"] is True
+    assert "LifecyclePolicies" not in fs.metadata
 
 
 def test_efs_top_level_failure_does_not_raise(scan_db: ScanDB):
