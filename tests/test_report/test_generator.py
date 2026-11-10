@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from stackwise.report.generator import generate_report
+from stackwise.report.generator import ReportFormatUnavailableError, generate_report
 from stackwise.store.db import ScanDB
 
 
@@ -136,35 +136,66 @@ def test_generate_report_unsupported_output_format_raises(scan_db: ScanDB, setti
         generate_report(settings, scan_db, scan.id, "engineering", "bogus-format")
 
 
-def test_generate_report_pdf_produces_valid_output(scan_db: ScanDB, settings):
-    """WeasyPrint needs system libs (pango/cairo/gobject) that aren't
-    guaranteed present on every CI runner (only the shipped Docker image
-    installs them) — so either a real PDF comes out, or the documented
-    OSError fallback to HTML kicks in. Both are correct; only a crash isn't."""
+def _scan_with_one_instance(scan_db: ScanDB) -> str:
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
     scan_db.insert_resource(scan.id, "ec2", "instance", "i-1", "us-east-1", metadata={})
+    return scan.id
 
-    path = generate_report(settings, scan_db, scan.id, "engineering", "pdf")
-    assert path.exists()
-    assert path.suffix in (".pdf", ".html")
-    if path.suffix == ".pdf":
+
+def _weasyprint_works() -> bool:
+    try:
+        from weasyprint import HTML
+
+        HTML(string="<p>x</p>").write_pdf()
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def test_generate_report_pdf_is_a_real_pdf_or_a_clear_failure(scan_db: ScanDB, settings):
+    """WeasyPrint needs Pango and Cairo, which not every CI runner has. With them,
+    the file must be a real PDF. Without them, it must fail, not hand back HTML."""
+    scan_id = _scan_with_one_instance(scan_db)
+
+    if _weasyprint_works():
+        path = generate_report(settings, scan_db, scan_id, "engineering", "pdf")
+        assert path.suffix == ".pdf"
         assert path.read_bytes()[:4] == b"%PDF"
+    else:
+        with pytest.raises(ReportFormatUnavailableError):
+            generate_report(settings, scan_db, scan_id, "engineering", "pdf")
+        assert list(settings.output_dir.glob("*")) == []
 
 
-def test_generate_report_pdf_falls_back_to_html_when_weasyprint_missing(
-    scan_db: ScanDB, settings
-):
-    """If weasyprint can't be imported (not installed, or missing system
-    libs raising OSError), the PDF request must fall back to writing HTML
-    instead of crashing."""
-    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
-    scan_db.insert_resource(scan.id, "ec2", "instance", "i-1", "us-east-1", metadata={})
+def test_missing_weasyprint_fails_instead_of_writing_html(scan_db: ScanDB, settings):
+    scan_id = _scan_with_one_instance(scan_db)
 
-    with patch.dict(sys.modules, {"weasyprint": None}):
-        path = generate_report(settings, scan_db, scan.id, "engineering", "pdf")
+    with (
+        patch.dict(sys.modules, {"weasyprint": None}),
+        pytest.raises(ReportFormatUnavailableError, match="--format html"),
+    ):
+        generate_report(settings, scan_db, scan_id, "engineering", "pdf")
 
-    assert path.suffix == ".html"
-    assert path.exists()
+    assert list(settings.output_dir.glob("*")) == []
+
+
+@pytest.mark.parametrize("error", [OSError("cairo crashed"), ValueError("bad css")])
+def test_a_failed_pdf_write_removes_the_partial_file(scan_db: ScanDB, settings, error):
+    scan_id = _scan_with_one_instance(scan_db)
+
+    def _write_half_then_fail(path):
+        Path(path).write_bytes(b"%PDF-1.7 partial")
+        raise error
+
+    fake = MagicMock()
+    fake.HTML.return_value.write_pdf.side_effect = _write_half_then_fail
+    with (
+        patch.dict(sys.modules, {"weasyprint": fake}),
+        pytest.raises((ReportFormatUnavailableError, ValueError)),
+    ):
+        generate_report(settings, scan_db, scan_id, "engineering", "pdf")
+
+    assert list(settings.output_dir.glob("*.pdf")) == []
 
 
 def test_markdown_executive_report_includes_severity_breakdown(scan_db: ScanDB, settings):

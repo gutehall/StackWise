@@ -19,6 +19,10 @@ from stackwise.store.db import ScanDB
 
 logger = logging.getLogger(__name__)
 
+
+class ReportFormatUnavailableError(RuntimeError):
+    """The requested report format could not be written on this machine."""
+
 _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -145,22 +149,23 @@ def generate_report(
         return out_path
 
     if output_format == "pdf":
+        out_path = settings.output_dir / f"{base_name}.pdf"
         try:
             from weasyprint import HTML as WeasyHTML  # noqa: N811
 
-            out_path = settings.output_dir / f"{base_name}.pdf"
             base_url = Path(__file__).parent.as_uri() + "/"
             WeasyHTML(string=html_content, base_url=base_url).write_pdf(str(out_path))
-            logger.info("PDF report written to %s", out_path)
-            return out_path
-        except (ImportError, OSError):
-            logger.error(
-                "WeasyPrint is not installed or system deps are missing. "
-                "Falling back to HTML output."
-            )
-            out_path = settings.output_dir / f"{base_name}.html"
-            out_path.write_text(html_content, encoding="utf-8")
-            return out_path
+        except BaseException as e:
+            # A failed write can leave a partial file; it must not look like the report.
+            out_path.unlink(missing_ok=True)
+            if isinstance(e, (ImportError, OSError)):
+                raise ReportFormatUnavailableError(
+                    "PDF output needs WeasyPrint and its system libraries (Pango, Cairo). "
+                    f"Install them, or use --format html. ({type(e).__name__}: {e})"
+                ) from e
+            raise
+        logger.info("PDF report written to %s", out_path)
+        return out_path
 
     if output_format == "md":
         out_path = settings.output_dir / f"{base_name}.md"

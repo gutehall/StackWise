@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -1175,3 +1176,19 @@ def test_reports_render_the_custom_rules_notice(tmp_path: Path, monkeypatch, out
     )
 
     assert result.exit_code == 0, result.output
+
+
+def test_report_pdf_without_weasyprint_exits_1_and_writes_no_html(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "scan.db"
+    db = ScanDB(db_path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    db.close()
+    _point_latest_at(db_path, scan.id, monkeypatch, tmp_path)
+    out = tmp_path / "out"
+
+    with patch.dict(sys.modules, {"weasyprint": None}):
+        result = runner.invoke(app, ["report", "--format", "pdf", "--output-dir", str(out)])
+
+    assert result.exit_code == 1
+    assert "WeasyPrint" in result.output
+    assert list(out.glob("*.html")) == [] and list(out.glob("*.pdf")) == []
