@@ -1091,3 +1091,42 @@ def test_default_api_key_source_is_not_a_finding(scan_db: ScanDB):
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert scan_db.get_findings(scan.id) == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        (("iam", "user"), {"MFADevices": [], "ConsoleAccess": False}, "SEC-002", False),
+        (("iam", "user"), {"MFADevices": [], "ConsoleAccess": True}, "SEC-002", True),
+        (("iam", "user"), {"MFADevices": [{"x": 1}], "ConsoleAccess": True}, "SEC-002", False),
+        (("iam", "user"), {"MFADevices": [], "ConsoleAccessCheckFailed": True}, "SEC-002", False),
+        (("iam", "user"), {"MFADevices": [], "ConsoleAccessCheckFailed": True}, "SEC-012", True),
+        # Older scans have no console flag, and behave as before.
+        (("iam", "user"), {"MFADevices": []}, "SEC-002", True),
+        (("iam", "role"), {"Path": "/aws-service-role/x.amazonaws.com/"}, "SEC-004", False),
+        (("iam", "role"), {"Path": "/"}, "SEC-004", True),
+        (("iam", "role"), {"Path": "/", "PermissionsBoundary": "arn:b"}, "SEC-004", False),
+        (("secretsmanager", "secret"), {"RotationEnabled": True}, "SEC-008", True),
+        (("secretsmanager", "secret"),
+         {"RotationEnabled": True, "RotationRules": {"AutomaticallyAfterDays": 30}},
+         "SEC-008", False),
+    ],
+)
+def test_iam_and_secret_rules_match_their_title(scan_db: ScanDB, kind, metadata, rule_id, fires):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["security"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_secret_with_rotation_disabled_gets_one_finding(scan_db: ScanDB):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["security"])
+    scan_db.insert_resource(
+        scan.id, "secretsmanager", "secret", "s", "us-east-1", metadata={"RotationEnabled": False}
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert [f.rule_id for f in scan_db.get_findings(scan.id)] == ["SEC-007"]

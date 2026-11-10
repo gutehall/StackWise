@@ -13,12 +13,12 @@
     Prefer managed policies over inline policies for easier audit and reuse.
 
 - id: SEC-002
-  title: "IAM user has no MFA"
+  title: "IAM user with console access has no MFA"
   severity: HIGH
   resource_type: user
   service: iam
   condition: |
-    not resource.get('MFACheckFailed') and (not resource.get('MFADevices') or len((resource.get('MFADevices') or [])) == 0)
+    not resource.get('MFACheckFailed') and not resource.get('ConsoleAccessCheckFailed') and resource.get('ConsoleAccess') is not False and len(resource.get('MFADevices') or []) == 0
   remediation: >
     Enable MFA for all IAM users with console access.
 
@@ -38,7 +38,7 @@
   resource_type: role
   service: iam
   condition: |
-    not resource.get('PermissionsBoundary')
+    not resource.get('PermissionsBoundary') and not (resource.get('Path') or '').startswith('/aws-service-role/')
   remediation: >
     Use permissions boundaries to limit maximum permissions for roles.
 
@@ -59,9 +59,9 @@
   resource_type: user
   service: iam
   condition: |
-    resource.get('MFACheckFailed') or resource.get('InlinePoliciesCheckFailed')
+    resource.get('MFACheckFailed') or resource.get('InlinePoliciesCheckFailed') or resource.get('ConsoleAccessCheckFailed')
   remediation: >
-    An MFA or inline-policy check failed (permissions or API error) for this user —
+    An MFA, console-access or inline-policy check failed (permissions or API error) for this user —
     verify manually rather than trusting SEC-002/SEC-003 for this user.
 
 # KMS
@@ -109,14 +109,14 @@
     Enable automatic rotation for database and service credentials.
 
 - id: SEC-008
-  title: "Secrets Manager secret has no rotation configured"
+  title: "Secrets Manager secret has rotation enabled but no schedule"
   severity: LOW
   resource_type: secret
   service: secretsmanager
   condition: |
-    not resource.get('RotationRules') and not resource.get('RotationEnabled')
+    resource.get('RotationEnabled') is True and not resource.get('RotationRules')
   remediation: >
-    Configure rotation rules for credentials that support rotation.
+    Set a rotation schedule (RotationRules) so the enabled rotation actually runs.
 
 # GuardDuty
 - id: SEC-009
