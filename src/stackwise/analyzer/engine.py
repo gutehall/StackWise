@@ -288,6 +288,14 @@ def _run_llm_analysis(
             # Exactly the resources that fit in the prompt: recommendations are
             # validated against these.
             kept = fit_resources([r.metadata for r in chunk])
+            if not kept:
+                # A single resource larger than the prompt budget: there's nothing to ask
+                # the model about.
+                logger.warning(
+                    "Skipping %s chunk %d: %s is too large for the prompt",
+                    category, idx + 1, ", ".join(r.resource_id for r in chunk),
+                )
+                continue
             tasks.append(_ChunkTask(
                 category, idx, len(chunks), chunk[: len(kept)], len(chunk) - len(kept)
             ))

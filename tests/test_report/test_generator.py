@@ -191,7 +191,8 @@ def test_a_failed_pdf_write_removes_the_partial_file(scan_db: ScanDB, settings, 
     fake.HTML.return_value.write_pdf.side_effect = _write_half_then_fail
     with (
         patch.dict(sys.modules, {"weasyprint": fake}),
-        pytest.raises((ReportFormatUnavailableError, ValueError)),
+        # A write error is raised as itself: a full disk isn't a missing library.
+        pytest.raises(type(error)),
     ):
         generate_report(settings, scan_db, scan_id, "engineering", "pdf")
 
@@ -368,3 +369,18 @@ def test_a_crash_during_the_write_keeps_the_previous_report(
 def test_a_missing_scan_raises_before_rendering(scan_db: ScanDB, settings):
     with pytest.raises(ValueError, match="not found"):
         generate_report(settings, scan_db, "no-such-scan", "engineering", "json")
+
+
+def test_missing_cairo_on_import_is_reported_as_unavailable(scan_db: ScanDB, settings):
+    """Missing system libraries surface as OSError when weasyprint is imported."""
+    scan_id = _scan_with_one_instance(scan_db)
+
+    class _Broken:
+        def __getattr__(self, name):
+            raise OSError("cannot load library 'libpango'")
+
+    with (
+        patch.dict(sys.modules, {"weasyprint": _Broken()}),
+        pytest.raises(ReportFormatUnavailableError, match="Pango"),
+    ):
+        generate_report(settings, scan_db, scan_id, "engineering", "pdf")

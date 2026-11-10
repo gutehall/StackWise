@@ -25,7 +25,7 @@
     Set the bucket's default encryption rule to SSE-S3 (AES256) or SSE-KMS.
 
 - id: DAT-003
-  title: "S3 bucket has public access block disabled"
+  title: "S3 bucket public access block is not fully enabled"
   severity: HIGH
   resource_type: bucket
   service: s3
@@ -136,9 +136,10 @@
   resource_type: table
   service: dynamodb
   # No SSEDescription means the AWS-owned key, which is still encryption at rest. Only a
-  # reported status other than ENABLED is a problem.
+  # reported status other than ENABLED, or a transition towards it (ENABLING, UPDATING
+  # during a key change), is a problem.
   condition: |
-    not resource.get('DescribeTableCheckFailed') and (resource.get('SSEDescription') or {}).get('Status') not in (None, 'ENABLED')
+    not resource.get('DescribeTableCheckFailed') and (resource.get('SSEDescription') or {}).get('Status') not in (None, 'ENABLED', 'ENABLING', 'UPDATING')
   remediation: >
     Enable encryption at rest for DynamoDB tables.
 
@@ -183,9 +184,10 @@
   severity: MEDIUM
   resource_type: cache_cluster
   service: elasticache
-  # Memcached has no replication groups, so only Redis and Valkey can be missing one.
+  # Memcached has no replication groups. Older scans have no Engine stored, and those
+  # were Redis-only checks before, so a missing Engine still counts.
   condition: |
-    resource.get('Engine') in ('redis', 'valkey') and not resource.get('ReplicationGroupId')
+    resource.get('Engine') != 'memcached' and not resource.get('ReplicationGroupId')
   remediation: >
     Use replication groups for high availability and failover.
 
@@ -194,9 +196,10 @@
   severity: HIGH
   resource_type: cache_cluster
   service: elasticache
-  # Memcached doesn't report AtRestEncryptionEnabled at all.
+  # Memcached doesn't report AtRestEncryptionEnabled at all. A missing Engine (older
+  # scans) still counts.
   condition: |
-    resource.get('Engine') in ('redis', 'valkey') and resource.get('AtRestEncryptionEnabled') is not True
+    resource.get('Engine') != 'memcached' and resource.get('AtRestEncryptionEnabled') is not True
   remediation: >
     Enable encryption at rest for ElastiCache.
 

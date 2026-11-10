@@ -1319,3 +1319,25 @@ def test_tag_finding_does_not_claim_a_full_inventory():
     rule = next(r for r in load_rules() if r.id == "DSC-002")
     assert "Tagging API returned" in rule.title
     assert not any(r.id == "CST-001" for r in load_rules())
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # Older scans have no Engine; those clusters were Redis-only checks before.
+        (("elasticache", "cache_cluster"), {}, "DAT-016", True),
+        (("elasticache", "cache_cluster"), {"AtRestEncryptionEnabled": False}, "DAT-017", True),
+        (("elasticache", "cache_cluster"), {"Engine": "memcached"}, "DAT-016", False),
+        # A key change in progress is still encryption at rest.
+        (("dynamodb", "table"), {"SSEDescription": {"Status": "UPDATING"}}, "DAT-012", False),
+        (("dynamodb", "table"), {"SSEDescription": {"Status": "ENABLING"}}, "DAT-012", False),
+        (("dynamodb", "table"), {"SSEDescription": {"Status": "DISABLING"}}, "DAT-012", True),
+    ],
+)
+def test_review_fixes(scan_db: ScanDB, kind, metadata, rule_id, fires):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires

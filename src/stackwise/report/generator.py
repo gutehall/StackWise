@@ -190,19 +190,21 @@ def generate_report(
         out_path = settings.output_dir / f"{base_name}.pdf"
         tmp_path = _temp_path_for(out_path)
         try:
+            # Missing Pango/Cairo libraries surface as OSError on import.
             from weasyprint import HTML as WeasyHTML  # noqa: N811
-
+        except (ImportError, OSError) as e:
+            raise ReportFormatUnavailableError(
+                "PDF output needs WeasyPrint and its system libraries (Pango, Cairo). "
+                f"Install them, or use --format html. ({type(e).__name__}: {e})"
+            ) from e
+        try:
             base_url = Path(__file__).parent.as_uri() + "/"
             WeasyHTML(string=html_content, base_url=base_url).write_pdf(str(tmp_path))
             os.replace(tmp_path, out_path)
-        except BaseException as e:
-            # A failed write leaves the previous report as it was, not a partial file.
+        except BaseException:
+            # A failed write leaves the previous report as it was, not a partial file. A
+            # write error such as a full disk is raised as itself, not as a missing library.
             tmp_path.unlink(missing_ok=True)
-            if isinstance(e, (ImportError, OSError)):
-                raise ReportFormatUnavailableError(
-                    "PDF output needs WeasyPrint and its system libraries (Pango, Cairo). "
-                    f"Install them, or use --format html. ({type(e).__name__}: {e})"
-                ) from e
             raise
         logger.info("PDF report written to %s", out_path)
         return out_path

@@ -699,3 +699,19 @@ def test_the_validation_set_is_exactly_the_resources_in_the_prompt(
     assert f"{len(ids) - len(shown_ids)} resources" in prompt
     stored = sorted(r.title for r in scan_db.get_recommendations(scan.id))
     assert stored == sorted(f"Stop {rid}" for rid in shown_ids)
+
+
+def test_a_resource_too_large_for_the_prompt_is_not_sent_alone(scan_db: ScanDB, tmp_path: Path):
+    """An empty chunk would ask the model about nothing and count as analyzed."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(
+        scan.id, "ec2", "instance", "i-huge", "us-east-1", metadata={"blob": "x" * 30_000}
+    )
+    client = _llm_client(["Anything"])
+    settings = Settings(engine=Engine.OLLAMA, data_dir=tmp_path / "s")
+
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        result = run_analysis(settings, scan_db, scan.id)
+
+    client.generate.assert_not_called()
+    assert result["llm_recommendations"] == 0

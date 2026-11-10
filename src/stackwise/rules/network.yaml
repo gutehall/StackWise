@@ -56,7 +56,7 @@
     Restrict RDP access to specific IP ranges or use a bastion host.
 
 - id: NET-005
-  title: "Security group allows unrestricted ingress (0.0.0.0/0)"
+  title: "Security group allows unrestricted ingress (0.0.0.0/0 or ::/0)"
   severity: MEDIUM
   resource_type: security_group
   service: ec2
