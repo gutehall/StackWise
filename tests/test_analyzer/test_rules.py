@@ -586,13 +586,13 @@ _TABLE_OK = {
         (_TABLE, {"PointInTimeRecoveryCheckFailed": True, "DescribeTableCheckFailed": False,
                   "SSEDescription": {"Status": "ENABLED"}}, "DAT-011", False),
         (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True,
-                  "SSEDescription": None}, "DAT-012", True),
+                  "SSEDescription": {"Status": "DISABLED"}}, "DAT-012", True),
         (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True,
                   "BillingModeSummary": {"BillingMode": "PROVISIONED"}}, "DAT-013", True),
         # The real misconfiguration still fires.
         (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryDescription":
                   {"PointInTimeRecoveryStatus": "DISABLED"}}, "DAT-011", True),
-        (_TABLE, {**_TABLE_OK, "SSEDescription": None}, "DAT-012", True),
+        (_TABLE, {**_TABLE_OK, "SSEDescription": {"Status": "DISABLED"}}, "DAT-012", True),
         (_EFS, {"LifecycleCheckFailed": False, "LifecyclePolicies": []}, "DAT-015", True),
         # A correct setting doesn't fire.
         (_TABLE, _TABLE_OK, "DAT-011", False),
@@ -601,7 +601,7 @@ _TABLE_OK = {
                 "LifecyclePolicies": [{"TransitionToIA": "AFTER_30_DAYS"}]}, "DAT-015", False),
         # Older scans have no flag, and behave as before.
         (_EFS, {"LifecyclePolicies": []}, "DAT-015", True),
-        (_TABLE, {"SSEDescription": None}, "DAT-012", True),
+        (_TABLE, {"SSEDescription": {"Status": "DISABLED"}}, "DAT-012", True),
         # A check that could not run stays visible.
         (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-020", True),
         (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True}, "DAT-020", True),
@@ -911,3 +911,58 @@ def test_cmp008_fires_when_metadata_options_is_null(scan_db: ScanDB, metadata, f
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert any(f.rule_id == "CMP-008" for f in scan_db.get_findings(scan.id)) is fires
+
+
+def _sse_rules(*algorithms: str) -> dict:
+    return {"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": a}} for a in algorithms
+    ]}
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # No explicit configuration still means SSE-S3 on new objects.
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": {}}, "DAT-002", False),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False}, "DAT-002", False),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": _sse_rules("AES256")},
+         "DAT-002", False),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": _sse_rules("aws:kms")},
+         "DAT-002", False),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": _sse_rules("aws:kms:dsse")},
+         "DAT-002", False),
+        # An explicit rule that sets no supported algorithm still fires.
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": _sse_rules("none")},
+         "DAT-002", True),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": {"Rules": [{}]}},
+         "DAT-002", True),
+        # No SSEDescription means the AWS-owned key, which is encryption at rest.
+        (_TABLE, {"SSEDescription": None}, "DAT-012", False),
+        (_TABLE, {}, "DAT-012", False),
+        (_TABLE, {"SSEDescription": {}}, "DAT-012", False),
+        (_TABLE, {"SSEDescription": {"Status": "ENABLED"}}, "DAT-012", False),
+        (_TABLE, {"SSEDescription": {"Status": "DISABLED"}}, "DAT-012", True),
+        (_TABLE, {"SSEDescription": {"Status": "DISABLING"}}, "DAT-012", True),
+    ],
+)
+def test_default_encryption_is_not_reported_as_unencrypted(
+    scan_db: ScanDB, kind: tuple[str, str], metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_obs005_describes_a_missing_customer_managed_key():
+    rule = next(r for r in load_rules() if r.id == "OBS-005")
+    assert rule.title == "Log group has no customer-managed KMS key"
+    assert rule.severity == "LOW"
