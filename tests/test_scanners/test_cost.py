@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import boto3
@@ -108,7 +109,7 @@ def test_compute_optimizer_ec2_recommendations_paginate(scan_db: ScanDB):
     with patch("stackwise.scanner.cost.regional_client", return_value=mock_client), patch(
         "stackwise.scanner.cost.paginate", return_value=[]
     ):
-        CostScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+        CostScanner(skip_cost_explorer=True)._scan_region(session, scan_db, scan.id, "us-east-1")
 
     recs = [
         r
@@ -130,7 +131,6 @@ def test_compute_optimizer_lambda_recommendations_are_scanned(scan_db: ScanDB):
             return [
                 {
                     "functionArn": "arn:aws:lambda:us-east-1:1:function:my-fn",
-                    "recommendationSourceType": "LambdaFunction",
                     "finding": "NotOptimized",
                     "recommendationOptions": [{"memorySize": 512}],
                 }
@@ -323,8 +323,13 @@ def _scan_with_compute_optimizer_error(scan_db: ScanDB, code: str) -> list[tuple
 
 
 def test_compute_optimizer_not_opted_in_is_not_a_scan_error(scan_db: ScanDB):
-    """An account that never opted in has nothing to list; the scan must still pass."""
+    """An account that never opted in has nothing to list; the scan must still pass,
+    and must say so rather than look like an account with nothing to recommend."""
     assert _scan_with_compute_optimizer_error(scan_db, "OptInRequiredException") == []
+    rows = scan_db.get_resources(scan_db.latest_scan().id, service="compute-optimizer")
+    assert [(r.resource_type, r.metadata) for r in rows] == [
+        ("status", {"OptInRequired": True, "RecommendationErrors": []})
+    ]
 
 
 def test_compute_optimizer_other_client_error_is_recorded(scan_db: ScanDB):
@@ -332,3 +337,93 @@ def test_compute_optimizer_other_client_error_is_recorded(scan_db: ScanDB):
         ("cost", "get_ec2_instance_recommendations"),
         ("cost", "get_lambda_function_recommendations"),
     ]
+
+
+def _scan_optimizer(scan_db: ScanDB, ec2_pages: list[dict]) -> list:
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["cost"])
+    client = MagicMock()
+    client.get_ec2_instance_recommendations.side_effect = ec2_pages
+    with (
+        patch("stackwise.scanner.cost.regional_client", return_value=client),
+        patch("stackwise.scanner.cost.paginate", return_value=[]),
+    ):
+        CostScanner(skip_cost_explorer=True)._scan_region(
+            MagicMock(), scan_db, scan.id, "us-east-1"
+        )
+    return scan_db.get_resources(scan.id, service="compute-optimizer")
+
+
+def test_compute_optimizer_with_no_recommendations_stores_nothing(scan_db: ScanDB):
+    assert _scan_optimizer(scan_db, [{"instanceRecommendations": [], "errors": []}]) == []
+
+
+def test_compute_optimizer_errors_are_kept_on_a_status_row(scan_db: ScanDB):
+    """The live response can carry errors next to its recommendations."""
+    error = {"identifier": "i-2", "code": "InternalError", "message": "try later"}
+    rows = _scan_optimizer(
+        scan_db,
+        [
+            {"instanceRecommendations": [], "errors": [error], "nextToken": "t"},
+            {"instanceRecommendations": [{"instanceArn": "a/i-1", "finding": "Overprovisioned"}]},
+        ],
+    )
+
+    by_type = {r.resource_type: r for r in rows}
+    assert by_type["status"].metadata == {"OptInRequired": False, "RecommendationErrors": [error]}
+    assert by_type["ec2_recommendation"].metadata["finding"] == "Overprovisioned"
+    assert "RecommendationSourceType" not in by_type["ec2_recommendation"].metadata
+
+
+def test_cost_explorer_follows_next_page_token(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["cost"])
+
+    def _group(service: str, amount: str) -> dict:
+        return {"Keys": [service], "Metrics": {"UnblendedCost": {"Amount": amount}}}
+
+    ce = MagicMock()
+    ce.get_cost_and_usage.side_effect = [
+        {"ResultsByTime": [{"Groups": [_group("EC2", "1")]}], "NextPageToken": "p2"},
+        {"ResultsByTime": [{"Groups": [_group("S3", "2"), _group("EC2", "3")]}]},
+    ]
+
+    with patch("stackwise.scanner.cost.regional_client", return_value=ce):
+        CostScanner()._scan_cost_explorer(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    assert ce.get_cost_and_usage.call_args_list[1].kwargs["NextPageToken"] == "p2"
+    summary = scan_db.get_resources(scan.id, service="ce")[0]
+    groups = {
+        g["Keys"][0]: g["Metrics"]["UnblendedCost"]["Amount"] for g in summary.metadata["Groups"]
+    }
+    assert groups == {"EC2": "4.0", "S3": "2.0"}
+
+
+def test_cost_summary_id_is_stable_across_days(scan_db: ScanDB):
+    """The window moves daily. If it were in the id, every diff would show the summary
+    removed and added."""
+    ce = MagicMock()
+    ce.get_cost_and_usage.return_value = {"ResultsByTime": []}
+    ids = []
+    for day in ("2026-11-09", "2026-11-10"):
+        scan = scan_db.create_scan("123456789012", ["us-east-1"], ["cost"])
+        with (
+            patch("stackwise.scanner.cost.regional_client", return_value=ce),
+            patch("stackwise.scanner.cost.date") as mock_date,
+        ):
+            mock_date.today.return_value = date.fromisoformat(day)
+            CostScanner()._scan_cost_explorer(MagicMock(), scan_db, scan.id, "us-east-1")
+        summary = scan_db.get_resources(scan.id, service="ce")[0]
+        ids.append(summary.resource_id)
+        assert summary.metadata["TimePeriod"]["End"] == day
+
+    assert ids == ["cost-summary", "cost-summary"]
+
+
+def test_cost_explorer_stops_on_a_repeated_page_token(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["cost"])
+    ce = MagicMock()
+    ce.get_cost_and_usage.return_value = {"ResultsByTime": [], "NextPageToken": "same"}
+
+    with patch("stackwise.scanner.cost.regional_client", return_value=ce):
+        CostScanner()._scan_cost_explorer(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    assert ce.get_cost_and_usage.call_count == 2

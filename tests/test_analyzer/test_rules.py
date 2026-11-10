@@ -830,3 +830,36 @@ def test_every_policy_copy_grants_lambda_concurrency_lookup():
     docs = Path(__file__).resolve().parents[2] / "docs"
     for name in ("iam-policy.json", "stackwise-role.yaml", "stackwise-ec2.yaml"):
         assert "lambda:GetFunctionConcurrency" in (docs / name).read_text(), name
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # Live finding values from the Compute Optimizer API model.
+        ("ec2_recommendation", {"finding": "Overprovisioned"}, "CST-002", True),
+        ("ec2_recommendation", {"finding": "Underprovisioned"}, "CST-002", True),
+        ("ec2_recommendation", {"finding": "NotOptimized"}, "CST-002", True),
+        ("ec2_recommendation", {"finding": "Optimized"}, "CST-002", False),
+        ("lambda_recommendation", {"finding": "NotOptimized"}, "CST-003", True),
+        ("lambda_recommendation", {"finding": "Optimized"}, "CST-003", False),
+        ("lambda_recommendation", {"finding": "Unavailable"}, "CST-003", False),
+        # The old rules keyed on a field the API never returns.
+        ("ec2_recommendation", {"RecommendationSourceType": "Ec2Instance", "finding": "Optimized"},
+         "CST-002", False),
+        ("status", {"OptInRequired": True, "RecommendationErrors": []}, "CST-004", True),
+        ("status", {"OptInRequired": False, "RecommendationErrors": [{"code": "x"}]},
+         "CST-004", False),
+        ("status", {"OptInRequired": False, "RecommendationErrors": [{"code": "x"}]},
+         "CST-005", True),
+        ("status", {"OptInRequired": True, "RecommendationErrors": []}, "CST-005", False),
+    ],
+)
+def test_compute_optimizer_rules_use_live_fields(
+    scan_db: ScanDB, kind: str, metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["cost"])
+    scan_db.insert_resource(scan.id, "compute-optimizer", kind, "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires

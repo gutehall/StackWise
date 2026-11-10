@@ -17,7 +17,7 @@
   resource_type: ec2_recommendation
   service: compute-optimizer
   condition: |
-    resource.get('RecommendationSourceType') == 'Ec2Instance'
+    resource.get('finding') in ('Overprovisioned', 'Underprovisioned', 'NotOptimized')
   remediation: >
     Review Compute Optimizer recommendations for EC2 rightsizing.
 
@@ -27,6 +27,28 @@
   resource_type: lambda_recommendation
   service: compute-optimizer
   condition: |
-    resource.get('RecommendationSourceType') == 'LambdaFunction'
+    resource.get('finding') == 'NotOptimized'
   remediation: >
     Review Compute Optimizer recommendations for Lambda memory optimization.
+
+- id: CST-004
+  title: "Compute Optimizer is not enabled"
+  severity: INFO
+  resource_type: status
+  service: compute-optimizer
+  condition: |
+    resource.get('OptInRequired') is True
+  remediation: >
+    Opt in to AWS Compute Optimizer to get EC2 and Lambda rightsizing recommendations.
+    Until then, CST-002 and CST-003 can't report anything.
+
+- id: CST-005
+  title: "Some Compute Optimizer recommendations could not be retrieved"
+  severity: INFO
+  resource_type: status
+  service: compute-optimizer
+  condition: |
+    bool(resource.get('RecommendationErrors'))
+  remediation: >
+    Compute Optimizer returned errors alongside its recommendations, so CST-002 may
+    be missing instances. See RecommendationErrors on this resource.
