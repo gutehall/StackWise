@@ -384,3 +384,57 @@ def test_missing_cairo_on_import_is_reported_as_unavailable(scan_db: ScanDB, set
         pytest.raises(ReportFormatUnavailableError, match="Pango"),
     ):
         generate_report(settings, scan_db, scan_id, "engineering", "pdf")
+
+
+def _html_report(scan_db: ScanDB, settings, report_type: str, status, with_rec: bool) -> str:
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    if with_rec:
+        scan_db.insert_recommendation(
+            scan_id=scan.id, source="llm", category="data", title="Encrypt the tables"
+        )
+    if status:
+        scan_db.set_analysis_status(scan.id, *status)
+    return generate_report(settings, scan_db, scan.id, report_type, "html").read_text()
+
+
+@pytest.mark.parametrize("report_type", ["engineering", "executive"])
+@pytest.mark.parametrize("with_rec", [True, False], ids=["with-recs", "no-recs"])
+def test_html_shows_a_partial_llm_run(scan_db: ScanDB, settings, report_type, with_rec):
+    html = _html_report(
+        scan_db, settings, report_type, ("partial", ["compute", "security"]), with_rec
+    )
+
+    assert "compute, security" in html
+    phrase = {"engineering": "LLM analysis was partial", "executive": "AI analysis was incomplete"}
+    assert phrase[report_type] in html
+    # The run did happen, so blaming a missing Ollama would be wrong.
+    assert "Ollama may not have been available" not in html
+    assert ("Encrypt the tables" in html) is with_rec
+
+
+@pytest.mark.parametrize("report_type", ["engineering", "executive"])
+@pytest.mark.parametrize(
+    "status", [("complete", []), None], ids=["complete", "llm-never-ran"]
+)
+def test_html_has_no_partial_notice_otherwise(scan_db: ScanDB, settings, report_type, status):
+    html = _html_report(scan_db, settings, report_type, status, with_rec=False)
+
+    assert "⚠" not in html
+    assert "Ollama may not have been available" in html
+
+
+def test_html_partial_notice_escapes_category_names(scan_db: ScanDB, settings):
+    html = _html_report(
+        scan_db, settings, "engineering", ("partial", ["<script>x</script>"]), with_rec=False
+    )
+
+    assert "<script>x</script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+@pytest.mark.parametrize("report_type", ["engineering", "executive"])
+def test_html_partial_notice_without_named_categories(scan_db: ScanDB, settings, report_type):
+    html = _html_report(scan_db, settings, report_type, ("partial", []), with_rec=False)
+
+    assert "⚠" in html
+    assert "for: ." not in html and "recommendations: ." not in html
