@@ -197,6 +197,9 @@ def load_rules_checked(rules_dir: Path | None = None) -> RuleLoadResult:
         return result
 
     for path in sorted(base.glob("*.yaml")):
+        # Kept only once the whole file has parsed: a file reported as failed must not
+        # still contribute the rules above the broken entry.
+        file_rules: list[Rule] = []
         try:
             with open(path) as f:
                 entries = yaml.safe_load(f) or []
@@ -209,7 +212,7 @@ def load_rules_checked(rules_dir: Path | None = None) -> RuleLoadResult:
                     logger.exception("Rejecting rule %s from %s", rule_id, path)
                     result.rejected_rules.append(f"{rule_id} ({path.name})")
                     continue
-                result.rules.append(
+                file_rules.append(
                     Rule(
                         id=rule_id,
                         title=entry["title"],
@@ -225,6 +228,8 @@ def load_rules_checked(rules_dir: Path | None = None) -> RuleLoadResult:
         except Exception as e:
             logger.exception("Failed to load rules from %s", path)
             result.failed_files.append(f"{path.name} ({type(e).__name__})")
+            continue
+        result.rules.extend(file_rules)
 
     logger.info("Loaded %d rules from %s", len(result.rules), base)
     return result

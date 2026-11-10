@@ -55,8 +55,11 @@ RULES_LOAD_FINDING_ID = "RULES-LOAD"
 def run_analysis(settings: Settings, db: ScanDB, scan_id: str) -> dict:
     """Run full analysis pipeline: rules then optional LLM enrichment.
 
-    Replaces the scan's findings and LLM recommendations. Raises, with the previous
-    results kept, if anything fails before the new ones are committed.
+    Replaces the scan's findings. LLM recommendations are replaced only when the LLM
+    runs; a rules-only run, or one where Ollama is unavailable, keeps the previous ones,
+    which may refer to findings from the run that produced them. Raises, with the
+    previous results kept, if anything fails before the new ones are committed,
+    including an LLM error.
 
     Returns:
         Summary dict with counts.

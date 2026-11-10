@@ -453,3 +453,15 @@ def test_the_packaged_rules_load_cleanly():
     loaded = load_rules_checked()
     assert loaded.problems == []
     assert loaded.rules
+
+
+def test_a_file_that_fails_part_way_contributes_no_rules(tmp_path: Path):
+    """It is reported as failed, so none of its rules may run."""
+    rules_dir = _rules_dir(
+        tmp_path, {"mixed.yaml": _GOOD_RULE + "\n- id: TST-003\n  title: missing fields\n"}
+    )
+
+    loaded = load_rules_checked(rules_dir)
+
+    assert [r.id for r in loaded.rules] == []
+    assert loaded.failed_files == ["mixed.yaml (KeyError)"]
