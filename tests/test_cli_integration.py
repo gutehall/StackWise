@@ -1268,3 +1268,65 @@ def test_diff_format_is_checked_case_insensitively(tmp_path: Path, monkeypatch, 
         assert "Resources" not in result.output
     elif fmt == "JSON":
         assert "resources_added" in json.loads(result.stdout)
+
+
+@mock_aws
+@pytest.mark.parametrize("flag", ["--base", "--compare"])
+def test_diff_warns_when_given_a_failed_scan(tmp_path: Path, monkeypatch, flag: str):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    with patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("boom")):
+        _scan_at(1)
+    _scan_at(2)
+    good, failed, latest = _scan_files(tmp_path)
+    args = (["diff", "--base", str(failed)] if flag == "--base"
+            else ["diff", "--base", str(good), "--compare", str(failed)])
+
+    result = runner.invoke(app, [*args, "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    assert "failed or never finished" in result.stderr
+    assert failed.name in result.stderr
+    assert "resources_added" in json.loads(result.stdout)
+
+
+@mock_aws
+def test_diff_of_two_completed_scans_has_no_failed_scan_warning(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    _scan_at(1)
+    base, _ = _scan_files(tmp_path)
+
+    result = runner.invoke(app, ["diff", "--base", str(base)])
+
+    assert result.exit_code == 0, result.output
+    assert "failed or never finished" not in result.output
+
+
+def test_diff_of_scans_older_than_the_completeness_tables_has_no_warning(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    paths = []
+    for name in ("old.db", "new.db"):
+        path = tmp_path / name
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE scans (id TEXT PRIMARY KEY, timestamp TEXT, account_id TEXT,"
+            " regions TEXT, modules TEXT);"
+            "CREATE TABLE resources (id TEXT, scan_id TEXT, service TEXT, resource_type TEXT,"
+            " resource_id TEXT, region TEXT, arn TEXT, metadata_json TEXT);"
+            "CREATE TABLE findings (id TEXT, scan_id TEXT, resource_id TEXT, rule_id TEXT,"
+            " severity TEXT, title TEXT, detail TEXT, remediation TEXT);"
+        )
+        conn.execute(
+            "INSERT INTO scans VALUES (?, '2024-01-01T00:00:00', '1', '[]', '[]')", (name,)
+        )
+        conn.commit()
+        conn.close()
+        paths.append(path)
+
+    result = runner.invoke(app, ["diff", "--base", str(paths[0]), "--compare", str(paths[1])])
+
+    assert result.exit_code == 0, result.output
+    assert "failed or never finished" not in result.output

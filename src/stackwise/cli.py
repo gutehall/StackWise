@@ -338,7 +338,7 @@ def diff(
     ),
 ) -> None:
     """Compare two scans for drift detection (resources and findings)."""
-    from stackwise.diff import diff_scans, previous_completed_scan
+    from stackwise.diff import diff_scans, is_completed_scan, previous_completed_scan
 
     output_format = output_format.lower()
     if output_format not in ("text", "json"):
@@ -381,7 +381,16 @@ def diff(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
-    # On stderr, so it comes before the lists and can't corrupt --format json.
+    # On stderr, so it comes before the lists and can't corrupt --format json. The
+    # default baseline is always complete, but --base or --compare can name any file.
+    for label, path in (("Base", base_path), ("Compare", compare_path)):
+        if not is_completed_scan(path):
+            console.print(
+                f"[yellow]Warning: the {label.lower()} scan failed or never finished, so "
+                f"anything it missed shows as added or removed: {escape(str(path))}[/yellow]",
+                soft_wrap=True,
+            )
+
     if result.scope_differs:
         console.print(
             "[yellow]Warning: these scans cover different scopes, so anything outside "

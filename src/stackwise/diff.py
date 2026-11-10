@@ -53,7 +53,12 @@ class DiffResult:
         )
 
 
-def _is_completed_scan(db_path: Path) -> bool:
+def is_completed_scan(db_path: Path) -> bool:
+    """True if the file holds a scan that finished without scan errors.
+
+    False also for a file that can't be read as a scan. A file older than the
+    completeness tables counts as complete.
+    """
     try:
         db = ScanDB(db_path, mode="ro")
     except (FileNotFoundError, sqlite3.DatabaseError):
@@ -74,7 +79,7 @@ def previous_completed_scan(compare_db_path: Path) -> Path | None:
     """
     earlier = [p for p in compare_db_path.parent.glob("*.db") if p.stem < compare_db_path.stem]
     for path in sorted(earlier, key=lambda p: p.stem, reverse=True):
-        if _is_completed_scan(path):
+        if is_completed_scan(path):
             return path
     return None
 
