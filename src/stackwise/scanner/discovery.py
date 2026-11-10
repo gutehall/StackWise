@@ -7,6 +7,7 @@ import logging
 import boto3
 
 from stackwise.scanner.base import BaseScanner
+from stackwise.scanner.tagging import store_tagged_resources
 from stackwise.store.db import ScanDB
 from stackwise.utils.aws import paginate, regional_client
 
@@ -95,9 +96,8 @@ class DiscoveryScanner(BaseScanner):
         # ── Tagged resources (same as cost, but discovery rules use it too) ─
         # Cost scanner also runs get_resources, since discovery DSC-002 and cost
         # CST-001 both key off tagged_resource and a user may run either module
-        # alone. ScanDB.insert_resource dedups by (scan_id, service,
-        # resource_type, resource_id, region), so running both modules in the
-        # same scan stores each tagged resource once, not twice.
+        # alone. Both store by full ARN, and only a new row is counted, so running
+        # both modules in one scan stores and counts each tagged resource once.
         try:
             tag_client = regional_client(session, "resourcegroupstaggingapi", region)
             resources = paginate(
@@ -105,24 +105,7 @@ class DiscoveryScanner(BaseScanner):
                 "get_resources",
                 "ResourceTagMappingList",
             )
-            for res in resources:
-                arn = res.get("ResourceARN", "")
-                res_id = arn.split("/")[-1] if "/" in arn else arn.split(":")[-1]
-                if not res_id:
-                    res_id = arn
-                db.insert_resource(
-                    scan_id=scan_id,
-                    service="resourcegroupstaggingapi",
-                    resource_type="tagged_resource",
-                    resource_id=res_id,
-                    region=region,
-                    arn=arn,
-                    metadata={
-                        "ResourceARN": arn,
-                        "Tags": res.get("Tags", []),
-                    },
-                )
-                count += 1
+            count += store_tagged_resources(db, scan_id, region, resources)
         except Exception as e:
             logger.debug("Tagged resources scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, "get_resources", e)

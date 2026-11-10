@@ -83,7 +83,7 @@
   service: elbv2
   condition: |
     not resource.get('ListenersCheckFailed') and bool(resource.get('Listeners')) and not any(
-      l.get('Protocol') in ('HTTPS', 'TLS') for l in resource.get('Listeners', [])
+      l.get('Protocol') in ('HTTPS', 'TLS') for l in (resource.get('Listeners') or [])
     )
   remediation: >
     Use HTTPS listeners with ACM certificates for encrypted traffic.

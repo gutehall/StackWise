@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import boto3
+from botocore.exceptions import ClientError
 
 from stackwise.scanner.base import BaseScanner
 from stackwise.store.db import ScanDB
@@ -164,6 +165,23 @@ class LambdaScanner(BaseScanner):
         functions = paginate(client, "list_functions", "Functions")
         for fn in functions:
             fn_name = fn["FunctionName"]
+            # ListFunctions doesn't return reserved concurrency, so ask for it. A function
+            # with none set returns an empty response, not an error.
+            reserved = None
+            reserved_check_failed = False
+            try:
+                reserved = client.get_function_concurrency(FunctionName=fn_name).get(
+                    "ReservedConcurrentExecutions"
+                )
+            except ClientError as e:
+                # Not found means the function is gone since the list call, so there's
+                # nothing reserved. Anything else means the check didn't run.
+                if e.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+                    logger.debug("get_function_concurrency failed for %s", fn_name, exc_info=True)
+                    reserved_check_failed = True
+            except Exception:
+                logger.debug("get_function_concurrency failed for %s", fn_name, exc_info=True)
+                reserved_check_failed = True
             db.insert_resource(
                 scan_id=scan_id,
                 service="lambda",
@@ -184,7 +202,8 @@ class LambdaScanner(BaseScanner):
                     "EphemeralStorage": fn.get("EphemeralStorage"),
                     "VpcConfig": fn.get("VpcConfig"),
                     "DeadLetterConfig": fn.get("DeadLetterConfig"),
-                    "ReservedConcurrentExecutions": fn.get("ReservedConcurrentExecutions"),
+                    "ReservedConcurrentExecutions": reserved,
+                    "ReservedConcurrencyCheckFailed": reserved_check_failed,
                 },
             )
             count += 1

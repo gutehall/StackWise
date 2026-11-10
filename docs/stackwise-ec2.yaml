@@ -115,6 +115,7 @@ Resources:
                   - lambda:List*
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
+                  - lambda:GetFunctionConcurrency
                   - rds:Describe*
                   - dynamodb:Describe*
                   - dynamodb:List*

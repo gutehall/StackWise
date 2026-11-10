@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import glob
+import logging
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -796,3 +798,116 @@ def test_rule_ids_are_unique():
     ids = [r.id for r in load_rules()]
 
     assert sorted(i for i in set(ids) if ids.count(i) > 1) == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        ({"ReservedConcurrencyCheckFailed": False, "ReservedConcurrentExecutions": None},
+         "CMP-012", True),
+        ({"ReservedConcurrencyCheckFailed": False, "ReservedConcurrentExecutions": 5},
+         "CMP-012", False),
+        # 0 is a real setting: it stops the function from running.
+        ({"ReservedConcurrencyCheckFailed": False, "ReservedConcurrentExecutions": 0},
+         "CMP-012", False),
+        ({"ReservedConcurrencyCheckFailed": True, "ReservedConcurrentExecutions": None},
+         "CMP-012", False),
+        ({"ReservedConcurrencyCheckFailed": True, "ReservedConcurrentExecutions": None},
+         "CMP-025", True),
+        ({"ReservedConcurrencyCheckFailed": False, "ReservedConcurrentExecutions": None},
+         "CMP-025", False),
+    ],
+)
+def test_lambda_concurrency_rules(scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(scan.id, "lambda", "function", "f", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_every_policy_copy_grants_lambda_concurrency_lookup():
+    """The policy is copied into three docs files, so they can drift apart."""
+    docs = Path(__file__).resolve().parents[2] / "docs"
+    for name in ("iam-policy.json", "stackwise-role.yaml", "stackwise-ec2.yaml"):
+        assert "lambda:GetFunctionConcurrency" in (docs / name).read_text(), name
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # Live finding values from the Compute Optimizer API model.
+        ("ec2_recommendation", {"finding": "Overprovisioned"}, "CST-002", True),
+        ("ec2_recommendation", {"finding": "Underprovisioned"}, "CST-002", True),
+        ("ec2_recommendation", {"finding": "NotOptimized"}, "CST-002", True),
+        ("ec2_recommendation", {"finding": "Optimized"}, "CST-002", False),
+        ("lambda_recommendation", {"finding": "NotOptimized"}, "CST-003", True),
+        ("lambda_recommendation", {"finding": "Optimized"}, "CST-003", False),
+        ("lambda_recommendation", {"finding": "Unavailable"}, "CST-003", False),
+        # The old rules keyed on a field the API never returns.
+        ("ec2_recommendation", {"RecommendationSourceType": "Ec2Instance", "finding": "Optimized"},
+         "CST-002", False),
+        ("status", {"OptInRequired": True, "RecommendationErrors": []}, "CST-004", True),
+        ("status", {"OptInRequired": False, "RecommendationErrors": [{"code": "x"}]},
+         "CST-004", False),
+        ("status", {"OptInRequired": False, "RecommendationErrors": [{"code": "x"}]},
+         "CST-005", True),
+        ("status", {"OptInRequired": True, "RecommendationErrors": []}, "CST-005", False),
+    ],
+)
+def test_compute_optimizer_rules_use_live_fields(
+    scan_db: ScanDB, kind: str, metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["cost"])
+    scan_db.insert_resource(scan.id, "compute-optimizer", kind, "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def _null_field_cases():
+    """For each rule, every field it reads set to None together, then one at a time."""
+    for rule in load_rules():
+        keys = sorted(set(re.findall(r"resource\.get\('(\w+)'", rule.condition)))
+        yield rule, {k: None for k in keys}
+        for key in keys:
+            yield rule, {key: None}
+
+
+def test_no_rule_raises_on_a_present_but_null_field(scan_db: ScanDB, caplog):
+    """dict.get(key, default) returns None, not the default, when the key is present
+    with a None value. A rule that then calls .get on it raised, was logged, and
+    silently produced no finding."""
+    failures = []
+    for rule, metadata in _null_field_cases():
+        scan = scan_db.create_scan("123", ["us-east-1"], ["all"])
+        scan_db.insert_resource(
+            scan.id, rule.service or "any", rule.resource_type, "r", "us-east-1",
+            metadata=metadata,
+        )
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="stackwise.analyzer.rules"):
+            evaluate_rules([rule], scan_db, scan.id)
+        if "failed on resource" in caplog.text:
+            failures.append((rule.id, sorted(metadata)))
+
+    assert failures == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"MetadataOptions": None}, True),
+        ({"MetadataOptions": {"HttpTokens": "optional"}}, True),
+        ({"MetadataOptions": {"HttpTokens": "required"}}, False),
+    ],
+)
+def test_cmp008_fires_when_metadata_options_is_null(scan_db: ScanDB, metadata, fires):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(scan.id, "ec2", "instance", "i-1", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == "CMP-008" for f in scan_db.get_findings(scan.id)) is fires

@@ -292,11 +292,33 @@ class ScanDB:
         arn: str | None = None,
         metadata: dict | None = None,
     ) -> ResourceRecord:
+        return self._insert_resource(
+            scan_id, service, resource_type, resource_id, region, arn, metadata
+        )[0]
+
+    def insert_resource_if_new(
+        self,
+        scan_id: str,
+        service: str,
+        resource_type: str,
+        resource_id: str,
+        region: str,
+        arn: str | None = None,
+        metadata: dict | None = None,
+    ) -> bool:
+        """Insert a resource, and return True only if that created a row.
+
+        Lets a scanner count what it stored, not what it saw: two modules can observe
+        the same resource in one scan.
+        """
+        return self._insert_resource(
+            scan_id, service, resource_type, resource_id, region, arn, metadata
+        )[1]
+
+    def _insert_resource(self, *args) -> tuple[ResourceRecord, bool]:
         with self._lock:
             try:
-                return self._insert_resource_unsafe(
-                    scan_id, service, resource_type, resource_id, region, arn, metadata
-                )
+                return self._insert_resource_unsafe(*args)
             except sqlite3.Error as e:
                 self.write_failures.add(str(e))
                 raise
@@ -310,7 +332,7 @@ class ScanDB:
         region: str,
         arn: str | None = None,
         metadata: dict | None = None,
-    ) -> ResourceRecord:
+    ) -> tuple[ResourceRecord, bool]:
         rec = ResourceRecord(
             id=_uid(),
             scan_id=scan_id,
@@ -344,8 +366,8 @@ class ScanDB:
                     service=existing["service"], resource_type=existing["resource_type"],
                     resource_id=existing["resource_id"], region=existing["region"],
                     arn=existing["arn"], metadata=json.loads(existing["metadata_json"]),
-                )
-        return rec
+                ), False
+        return rec, cur.rowcount > 0
 
     def get_resources(self, scan_id: str, service: str | None = None) -> list[ResourceRecord]:
         query = "SELECT * FROM resources WHERE scan_id = ?"

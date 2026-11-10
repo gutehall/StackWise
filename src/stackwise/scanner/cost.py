@@ -9,6 +9,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from stackwise.scanner.base import BaseScanner
+from stackwise.scanner.tagging import store_tagged_resources
 from stackwise.store.db import ScanDB
 from stackwise.utils.aws import paginate, regional_client
 
@@ -46,27 +47,14 @@ class CostScanner(BaseScanner):
                 "get_resources",
                 "ResourceTagMappingList",
             )
-            for res in resources:
-                arn = res.get("ResourceARN", "")
-                res_id = arn.split("/")[-1] if "/" in arn else arn.split(":")[-1]
-                if not res_id:
-                    res_id = arn
-                db.insert_resource(
-                    scan_id=scan_id,
-                    service="resourcegroupstaggingapi",
-                    resource_type="tagged_resource",
-                    resource_id=res_id,
-                    region=region,
-                    arn=arn,
-                    metadata={
-                        "ResourceARN": arn,
-                        "Tags": res.get("Tags", []),
-                    },
-                )
-                count += 1
+            count += store_tagged_resources(db, scan_id, region, resources)
         except Exception as e:
             logger.debug("Tagged resources scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, "get_resources", e)
+
+        # Stored as one row per region when there's something to report, so "not opted in"
+        # or "some recommendations failed" can't look like "nothing to recommend".
+        optimizer_status: dict = {"OptInRequired": False, "RecommendationErrors": []}
 
         # ── Compute Optimizer EC2 recommendations ─────────────
         # No boto3 paginator exists for this operation — page manually via nextToken.
@@ -76,6 +64,7 @@ class CostScanner(BaseScanner):
             while True:
                 kwargs = {"nextToken": next_token} if next_token else {}
                 ec2_recs = opt.get_ec2_instance_recommendations(**kwargs)
+                optimizer_status["RecommendationErrors"].extend(ec2_recs.get("errors") or [])
                 for rec in ec2_recs.get("instanceRecommendations", []):
                     inst_arn = rec.get("instanceArn", "")
                     rec_id = inst_arn.split("/")[-1] if "/" in inst_arn else inst_arn
@@ -88,9 +77,8 @@ class CostScanner(BaseScanner):
                         arn=inst_arn,
                         metadata={
                             "instanceArn": inst_arn,
-                            "RecommendationSourceType": rec.get("recommendationSourceType")
-                            or rec.get("RecommendationSourceType"),
                             "finding": rec.get("finding"),
+                            "findingReasonCodes": rec.get("findingReasonCodes", []),
                             "recommendationOptions": rec.get("recommendationOptions", []),
                         },
                     )
@@ -102,9 +90,10 @@ class CostScanner(BaseScanner):
             logger.debug(
                 "Compute Optimizer EC2 scan failed in %s", region, exc_info=True
             )
-            self._record_compute_optimizer_failure(
+            if self._record_compute_optimizer_failure(
                 db, scan_id, region, "get_ec2_instance_recommendations", e
-            )
+            ):
+                optimizer_status["OptInRequired"] = True
 
         # ── Compute Optimizer Lambda recommendations ──────────
         try:
@@ -124,8 +113,6 @@ class CostScanner(BaseScanner):
                     arn=fn_arn,
                     metadata={
                         "functionArn": fn_arn,
-                        "RecommendationSourceType": rec.get("recommendationSourceType")
-                        or rec.get("RecommendationSourceType"),
                         "finding": rec.get("finding"),
                         "recommendationOptions": rec.get("recommendationOptions", []),
                     },
@@ -135,9 +122,21 @@ class CostScanner(BaseScanner):
             logger.debug(
                 "Compute Optimizer Lambda scan failed in %s", region, exc_info=True
             )
-            self._record_compute_optimizer_failure(
+            if self._record_compute_optimizer_failure(
                 db, scan_id, region, "get_lambda_function_recommendations", e
+            ):
+                optimizer_status["OptInRequired"] = True
+
+        if optimizer_status["OptInRequired"] or optimizer_status["RecommendationErrors"]:
+            db.insert_resource(
+                scan_id=scan_id,
+                service="compute-optimizer",
+                resource_type="status",
+                resource_id="compute-optimizer",
+                region=region,
+                metadata=optimizer_status,
             )
+            count += 1
 
         return count
 
@@ -148,15 +147,19 @@ class CostScanner(BaseScanner):
         region: str,
         operation: str,
         exc: Exception,
-    ) -> None:
-        # An account that never opted in to Compute Optimizer has nothing to list.
-        # That is "not configured", not a failed list, so it must not fail the scan.
+    ) -> bool:
+        """Record a failed call, and return True if it only means "not opted in".
+
+        An account that never opted in to Compute Optimizer has nothing to list. That
+        is "not configured", not a failed list, so it must not fail the scan.
+        """
         if (
             isinstance(exc, ClientError)
             and exc.response.get("Error", {}).get("Code") == "OptInRequiredException"
         ):
-            return
+            return True
         self._record_list_failure(db, scan_id, region, operation, exc)
+        return False
 
     def _scan_cost_explorer(
         self,
@@ -174,26 +177,38 @@ class CostScanner(BaseScanner):
             ce = regional_client(session, "ce", region)
             end_date = date.today()
             start_date = end_date - timedelta(days=30)
-            resp = ce.get_cost_and_usage(
-                TimePeriod={"Start": start_date.isoformat(), "End": end_date.isoformat()},
-                Granularity="MONTHLY",
-                Metrics=["UnblendedCost"],
-                GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
-            )
             cost_by_service: dict[str, float] = {}
-            for period in resp.get("ResultsByTime", []):
-                for g in period.get("Groups", []):
-                    svc = g.get("Keys", ["Other"])[0] if g.get("Keys") else "Other"
-                    amount = float(
-                        g.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0) or 0
-                    )
-                    cost_by_service[svc] = cost_by_service.get(svc, 0.0) + amount
+            # No boto3 paginator exists for this operation, and a large GroupBy result
+            # spans pages. Every page costs another $0.01 request.
+            kwargs: dict = {}
+            while True:
+                resp = ce.get_cost_and_usage(
+                    TimePeriod={"Start": start_date.isoformat(), "End": end_date.isoformat()},
+                    Granularity="MONTHLY",
+                    Metrics=["UnblendedCost"],
+                    GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+                    **kwargs,
+                )
+                for period in resp.get("ResultsByTime", []):
+                    for g in period.get("Groups", []):
+                        svc = g.get("Keys", ["Other"])[0] if g.get("Keys") else "Other"
+                        amount = float(
+                            g.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0) or 0
+                        )
+                        cost_by_service[svc] = cost_by_service.get(svc, 0.0) + amount
+                token = resp.get("NextPageToken")
+                # A repeated token would loop forever, and bill $0.01 each time.
+                if not token or token == kwargs.get("NextPageToken"):
+                    break
+                kwargs["NextPageToken"] = token
 
             db.insert_resource(
                 scan_id=scan_id,
                 service="ce",
                 resource_type="cost_summary",
-                resource_id=f"cost-summary-{start_date.isoformat()}-{end_date.isoformat()}",
+                # Stable across scans, or every daily diff shows it removed and added.
+                # The window is in metadata.
+                resource_id="cost-summary",
                 region=region,
                 metadata={
                     "TimePeriod": {"Start": start_date.isoformat(), "End": end_date.isoformat()},

@@ -184,35 +184,6 @@ def test_config_recorder_top_level_failure_does_not_raise(scan_db: ScanDB):
     ]
 
 
-def test_tagged_resource_with_malformed_arn_falls_back(scan_db: ScanDB):
-    """A malformed/empty ResourceARN (no '/' or ':') must not crash resource_id
-    derivation — it falls back to using the raw ARN string."""
-    session = MagicMock()
-    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["discovery"])
-
-    config = MagicMock()
-    config.describe_configuration_recorders.return_value = {"ConfigurationRecorders": []}
-
-    with (
-        patch("stackwise.scanner.discovery.regional_client", return_value=config),
-        patch(
-            "stackwise.scanner.discovery.paginate",
-            side_effect=lambda client, method, key, **kw: (
-                [{"ResourceARN": "", "Tags": []}] if method == "get_resources" else []
-            ),
-        ),
-    ):
-        DiscoveryScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
-
-    tagged = [
-        r
-        for r in scan_db.get_resources(scan.id, service="resourcegroupstaggingapi")
-        if r.resource_type == "tagged_resource"
-    ]
-    assert len(tagged) == 1
-    assert tagged[0].resource_id == ""
-
-
 def test_tagged_resources_top_level_failure_does_not_raise(scan_db: ScanDB):
     """get_resources failing entirely must not raise out of _scan_region."""
     session = MagicMock()

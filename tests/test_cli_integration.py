@@ -1057,3 +1057,30 @@ def test_failed_ecs_and_eks_describes_do_not_show_as_drift(tmp_path: Path, monke
         any(k.endswith("CheckFailed") and v for k, v in r.metadata.items())
         for r in rows if r.service in ("eks", "ecs")
     )
+
+
+@mock_aws
+def test_scan_count_matches_rows_with_overlapping_modules(
+    tmp_path: Path, monkeypatch, _compute_optimizer_empty
+):
+    """cost and discovery both list tagged resources. The total must count rows once."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    s3 = boto3.client("s3", region_name="us-east-1")
+    for name in ("api", "orders"):
+        s3.create_bucket(Bucket=name)
+        s3.put_bucket_tagging(Bucket=name, Tagging={"TagSet": [{"Key": "Env", "Value": "p"}]})
+
+    result = runner.invoke(
+        app,
+        ["scan", "--regions", "us-east-1", "--modules", "cost,discovery", "--skip-cost-explorer"],
+    )
+    assert result.exit_code == 0, result.output
+
+    db = ScanDB(_scan_files(tmp_path)[0], mode="ro")
+    try:
+        rows = db.get_resources(db.latest_scan().id)
+    finally:
+        db.close()
+    assert f"{len(rows)} resources collected" in result.output
+    tagged = [r for r in rows if r.resource_type == "tagged_resource"]
+    assert sorted(r.resource_id for r in tagged) == ["arn:aws:s3:::api", "arn:aws:s3:::orders"]
