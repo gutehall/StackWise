@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
@@ -20,6 +21,7 @@ from moto import mock_aws
 from typer.testing import CliRunner
 
 from stackwise import __version__
+from stackwise.analyzer.llm_client import LLMChunkError
 from stackwise.cli import app
 from stackwise.scanner.compute import EC2Scanner
 from stackwise.store.db import ScanDB
@@ -1137,6 +1139,42 @@ def test_analyze_that_rolls_back_exits_1_and_keeps_previous_findings(
     assert _finding_ids(db_path, scan_id) == before
 
 
+def test_analyze_with_a_partial_llm_run_exits_0_and_says_so(tmp_path: Path, monkeypatch):
+    db_path, scan_id = _scan_with_imds_findings(tmp_path, monkeypatch)
+    db = ScanDB(db_path)
+    db.insert_resource(scan_id, "s3", "bucket", "b", "us-east-1", metadata={"Name": "b"})
+    db.close()
+
+    def _generate(prompt: str) -> str:
+        if prompt.startswith("## compute"):
+            raise LLMChunkError("timed out")
+        return "data"
+
+    client = MagicMock()
+    client.is_available.return_value = True
+    client.ensure_model.return_value = True
+    client.build_category_prompt.side_effect = lambda category, *a, **k: f"## {category}"
+    client.generate.side_effect = _generate
+    client.parse_recommendations.return_value = [
+        {"category": "reliability", "title": "Replicate buckets", "detail": "x"}
+    ]
+
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        result = runner.invoke(app, ["analyze", "--engine", "ollama"])
+
+    assert result.exit_code == 0, result.output
+    assert "LLM analysis was partial: failed for compute" in result.output
+    assert "Stored 1 recommendations" in result.output
+    assert "LLM produced" not in result.output
+    assert "Analysis complete" in result.output
+    ro = ScanDB(db_path, mode="ro")
+    try:
+        assert ro.get_analysis_status(scan_id)["llm_status"] == "partial"
+        assert [r.title for r in ro.get_recommendations(scan_id)] == ["Replicate buckets"]
+    finally:
+        ro.close()
+
+
 def test_analyze_with_a_broken_packaged_rules_file_exits_1(tmp_path: Path, monkeypatch):
     db_path, scan_id = _scan_with_imds_findings(tmp_path, monkeypatch)
     monkeypatch.delenv("STACKWISE_RULES_DIR", raising=False)
@@ -1175,3 +1213,168 @@ def test_reports_render_the_custom_rules_notice(tmp_path: Path, monkeypatch, out
     )
 
     assert result.exit_code == 0, result.output
+
+
+def test_report_pdf_without_weasyprint_exits_1_and_writes_no_html(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "scan.db"
+    db = ScanDB(db_path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    db.close()
+    _point_latest_at(db_path, scan.id, monkeypatch, tmp_path)
+    out = tmp_path / "out"
+
+    with patch.dict(sys.modules, {"weasyprint": None}):
+        result = runner.invoke(app, ["report", "--format", "pdf", "--output-dir", str(out)])
+
+    assert result.exit_code == 1
+    assert "WeasyPrint" in result.output
+    assert list(out.glob("*.html")) == [] and list(out.glob("*.pdf")) == []
+
+
+@pytest.mark.parametrize("engine", ["mlx", "bogus"])
+def test_analyze_with_an_unusable_engine_exits_1_cleanly(tmp_path: Path, monkeypatch, engine):
+    _scan_with_imds_findings(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["analyze", "--engine", engine])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "Analysis complete" not in result.output
+
+
+def test_run_with_an_unknown_engine_fails_before_scanning(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+
+    with patch("stackwise.cli.scan") as scan_cmd:
+        result = runner.invoke(app, ["run", "--engine", "bogus"])
+
+    assert result.exit_code == 1
+    assert "Unknown engine: bogus" in result.output
+    scan_cmd.assert_not_called()
+
+
+@mock_aws
+@pytest.mark.parametrize(("fmt", "exit_code"), [("foo", 1), ("JSON", 0), ("Text", 0)])
+def test_diff_format_is_checked_case_insensitively(tmp_path: Path, monkeypatch, fmt, exit_code):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    _scan_at(1)
+
+    result = runner.invoke(app, ["diff", "--format", fmt])
+
+    assert result.exit_code == exit_code, result.output
+    if exit_code:
+        assert "Unknown diff format" in result.output
+        assert "Resources" not in result.output
+    elif fmt == "JSON":
+        assert "resources_added" in json.loads(result.stdout)
+
+
+@mock_aws
+@pytest.mark.parametrize("flag", ["--base", "--compare"])
+def test_diff_warns_when_given_a_failed_scan(tmp_path: Path, monkeypatch, flag: str):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    with patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("boom")):
+        _scan_at(1)
+    _scan_at(2)
+    good, failed, latest = _scan_files(tmp_path)
+    args = (["diff", "--base", str(failed)] if flag == "--base"
+            else ["diff", "--base", str(good), "--compare", str(failed)])
+
+    result = runner.invoke(app, [*args, "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    assert "failed or never finished" in result.stderr
+    assert failed.name in result.stderr
+    assert "resources_added" in json.loads(result.stdout)
+
+
+@mock_aws
+def test_diff_of_two_completed_scans_has_no_failed_scan_warning(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    _scan_at(1)
+    base, _ = _scan_files(tmp_path)
+
+    result = runner.invoke(app, ["diff", "--base", str(base)])
+
+    assert result.exit_code == 0, result.output
+    assert "failed or never finished" not in result.output
+
+
+def test_diff_of_scans_older_than_the_completeness_tables_has_no_warning(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    paths = []
+    for name in ("old.db", "new.db"):
+        path = tmp_path / name
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE scans (id TEXT PRIMARY KEY, timestamp TEXT, account_id TEXT,"
+            " regions TEXT, modules TEXT);"
+            "CREATE TABLE resources (id TEXT, scan_id TEXT, service TEXT, resource_type TEXT,"
+            " resource_id TEXT, region TEXT, arn TEXT, metadata_json TEXT);"
+            "CREATE TABLE findings (id TEXT, scan_id TEXT, resource_id TEXT, rule_id TEXT,"
+            " severity TEXT, title TEXT, detail TEXT, remediation TEXT);"
+        )
+        conn.execute(
+            "INSERT INTO scans VALUES (?, '2024-01-01T00:00:00', '1', '[]', '[]')", (name,)
+        )
+        conn.commit()
+        conn.close()
+        paths.append(path)
+
+    result = runner.invoke(app, ["diff", "--base", str(paths[0]), "--compare", str(paths[1])])
+
+    assert result.exit_code == 0, result.output
+    assert "failed or never finished" not in result.output
+
+
+@mock_aws
+def test_list_scans_shows_status_and_a_clean_timestamp(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    with patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("boom")):
+        _scan_at(1)
+    account_dir = _account_dir(tmp_path)
+    (account_dir / "20240101T000002.db").touch()  # empty file, old-style name
+    legacy = sqlite3.connect(account_dir / "20240101T000003.db")
+    legacy.execute("CREATE TABLE scans (id TEXT, timestamp TEXT, account_id TEXT,"
+                   " regions TEXT, modules TEXT)")
+    legacy.execute("INSERT INTO scans VALUES ('s', '2024-01-01', '1', '[]', '[]')")
+    legacy.commit()
+    legacy.close()
+    before = {p.name: p.stat().st_mtime for p in account_dir.iterdir()}
+
+    result = runner.invoke(app, ["list-scans"], env={"COLUMNS": "250"})
+
+    assert result.exit_code == 0, result.output
+    status = {
+        cells[2].strip(): cells[3].strip()
+        for cells in (line.split("│") for line in result.output.splitlines())
+        if len(cells) >= 6 and "2024-01-01" in cells[2]
+    }
+    assert status == {
+        "2024-01-01 00:00:00": "complete",
+        "2024-01-01 00:00:01": "incomplete",
+        "2024-01-01 00:00:02": "unreadable",
+        "2024-01-01 00:00:03": "complete",  # older than the completeness tables
+    }
+    assert ".000000-" not in result.output.split("Database")[0]
+    assert {p.name: p.stat().st_mtime for p in account_dir.iterdir()} == before
+
+
+@pytest.mark.parametrize(
+    ("stem", "shown"),
+    [
+        ("20240101T000000", "2024-01-01 00:00:00"),
+        ("20261109T125659.568774-079b12", "2026-11-09 12:56:59"),
+        ("my-own-name", "my-own-name"),
+    ],
+)
+def test_scan_time_drops_the_suffix(stem: str, shown: str):
+    from stackwise.cli import _scan_time
+
+    assert _scan_time(stem) == shown

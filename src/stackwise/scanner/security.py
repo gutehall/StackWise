@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import boto3
+from botocore.exceptions import ClientError
 
 from stackwise.scanner.base import BaseScanner
 from stackwise.store.db import ScanDB
@@ -83,6 +84,9 @@ class SecurityScanner(BaseScanner):
                     metadata={
                         "RoleName": role_name,
                         "Arn": r.get("Arn"),
+                        # Service-linked roles live under /aws-service-role/ and can't
+                        # take a permissions boundary.
+                        "Path": r.get("Path") or role.get("Path"),
                         "InlinePoliciesCount": inline_count,
                         "InlinePoliciesCheckFailed": policy_check_failed,
                         "PermissionsBoundary": (
@@ -118,6 +122,26 @@ class SecurityScanner(BaseScanner):
                     )
                     inline_count = 0
                     policy_check_failed = True
+                # A login profile is what gives a user console access. NoSuchEntity means
+                # there isn't one: an access-key-only user.
+                console_access: bool | None = None
+                console_check_failed = False
+                try:
+                    iam.get_login_profile(UserName=user_name)
+                    console_access = True
+                except ClientError as e:
+                    if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                        console_access = False
+                    else:
+                        logger.warning(
+                            "Failed to check console access for IAM user %s: %s", user_name, e
+                        )
+                        console_check_failed = True
+                except Exception as e:
+                    logger.warning(
+                        "Failed to check console access for IAM user %s: %s", user_name, e
+                    )
+                    console_check_failed = True
                 db.insert_resource(
                     scan_id=scan_id,
                     service="iam",
@@ -132,6 +156,8 @@ class SecurityScanner(BaseScanner):
                         "MFACheckFailed": mfa_check_failed,
                         "InlinePoliciesCount": inline_count,
                         "InlinePoliciesCheckFailed": policy_check_failed,
+                        "ConsoleAccess": console_access,
+                        "ConsoleAccessCheckFailed": console_check_failed,
                     },
                 )
                 count += 1

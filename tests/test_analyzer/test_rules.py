@@ -5,12 +5,15 @@ from __future__ import annotations
 import glob
 import logging
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
 
+from stackwise.analyzer import lifecycle as lifecycle_mod
+from stackwise.analyzer.lifecycle import lifecycle_context
 from stackwise.analyzer.rules import (
     Rule,
     RuleConditionError,
@@ -20,6 +23,16 @@ from stackwise.analyzer.rules import (
     load_rules,
 )
 from stackwise.store.db import ScanDB
+
+
+@pytest.fixture(autouse=True)
+def _pin_lifecycle_date(monkeypatch):
+    """Rules see lifecycle facts as of the day they run; pin that day so these tests
+    don't change verdict as AWS dates pass."""
+    monkeypatch.setattr(
+        "stackwise.analyzer.rules.lifecycle_context",
+        lambda: lifecycle_context(lifecycle_mod.AS_OF),
+    )
 
 
 def test_load_rules_includes_priority():
@@ -231,7 +244,7 @@ def test_dat001_does_not_fire_when_versioning_check_failed(scan_db: ScanDB):
 
 
 def test_eks_deprecated_version_rule_does_not_flag_current_versions(scan_db: ScanDB):
-    """CMP-017 must not flag every 1.2x version — only ones below the threshold."""
+    """CMP-017 must flag only versions past EKS standard support."""
     rules = load_rules()
     scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
     scan_db.insert_resource(
@@ -240,7 +253,7 @@ def test_eks_deprecated_version_rule_does_not_flag_current_versions(scan_db: Sca
     )
     scan_db.insert_resource(
         scan.id, "eks", "cluster", "current-cluster", "us-east-1",
-        metadata={"version": "1.30"},
+        metadata={"version": "1.34"},
     )
     evaluate_rules(rules, scan_db, scan.id)
     findings = [f for f in scan_db.get_findings(scan.id) if f.rule_id == "CMP-017"]
@@ -499,8 +512,8 @@ _API = ("apigateway", "rest_api")
                "Attributes": [{"Key": "access_logs.s3.enabled", "Value": "false"}]},
          "NET-006", True),
         (_LB, {"AttributesCheckFailed": False, "Attributes": []}, "NET-008", True),
-        (_LB, {"ListenersCheckFailed": False, "Listeners": [{"Protocol": "HTTP", "Port": 80}]},
-         "NET-007", True),
+        (_LB, {"ListenersCheckFailed": False, "Type": "application",
+               "Listeners": [{"Protocol": "HTTP", "Port": 80}]}, "NET-007", True),
         (_API, {"ThrottleCheckFailed": False, "Throttle": {}}, "NET-010", True),
         # A correct setting doesn't fire.
         (_VPC, {"FlowLogsCheckFailed": False, "FlowLogsEnabled": True, "FlowLogs": [{}]},
@@ -586,13 +599,13 @@ _TABLE_OK = {
         (_TABLE, {"PointInTimeRecoveryCheckFailed": True, "DescribeTableCheckFailed": False,
                   "SSEDescription": {"Status": "ENABLED"}}, "DAT-011", False),
         (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True,
-                  "SSEDescription": None}, "DAT-012", True),
+                  "SSEDescription": {"Status": "DISABLED"}}, "DAT-012", True),
         (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True,
                   "BillingModeSummary": {"BillingMode": "PROVISIONED"}}, "DAT-013", True),
         # The real misconfiguration still fires.
         (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryDescription":
                   {"PointInTimeRecoveryStatus": "DISABLED"}}, "DAT-011", True),
-        (_TABLE, {**_TABLE_OK, "SSEDescription": None}, "DAT-012", True),
+        (_TABLE, {**_TABLE_OK, "SSEDescription": {"Status": "DISABLED"}}, "DAT-012", True),
         (_EFS, {"LifecycleCheckFailed": False, "LifecyclePolicies": []}, "DAT-015", True),
         # A correct setting doesn't fire.
         (_TABLE, _TABLE_OK, "DAT-011", False),
@@ -601,7 +614,7 @@ _TABLE_OK = {
                 "LifecyclePolicies": [{"TransitionToIA": "AFTER_30_DAYS"}]}, "DAT-015", False),
         # Older scans have no flag, and behave as before.
         (_EFS, {"LifecyclePolicies": []}, "DAT-015", True),
-        (_TABLE, {"SSEDescription": None}, "DAT-012", True),
+        (_TABLE, {"SSEDescription": {"Status": "DISABLED"}}, "DAT-012", True),
         # A check that could not run stays visible.
         (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-020", True),
         (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True}, "DAT-020", True),
@@ -767,12 +780,13 @@ _EKS_NG = ("eks", "nodegroup")
                         "resourcesVpcConfig": {"endpointPublicAccess": True}}, "CMP-016", True),
         (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.21"}, "CMP-017", True),
         (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": None}, "CMP-018", True),
+        # A fixed-size node group is a choice, not a missing config.
         (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": {"minSize": 2, "maxSize": 2}},
-         "CMP-018", True),
+         "CMP-018", False),
         # A correct setting doesn't fire, and neither do the visibility rules.
         (_ECS_TD, {"TaskDefinitionCheckFailed": False, "cpu": 512, "memory": 2048},
          "CMP-015", False),
-        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.31"}, "CMP-017", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.34"}, "CMP-017", False),
         (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": {"minSize": 1, "maxSize": 3}},
          "CMP-018", False),
         (_ECS_SVC, {"ServiceCheckFailed": False}, "CMP-021", False),
@@ -827,11 +841,163 @@ def test_lambda_concurrency_rules(scan_db: ScanDB, metadata: dict, rule_id: str,
     assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
 
 
-def test_every_policy_copy_grants_lambda_concurrency_lookup():
+@pytest.mark.parametrize(
+    "action", ["lambda:GetFunctionConcurrency", "lambda:GetFunctionEventInvokeConfig"]
+)
+def test_every_policy_copy_grants_lambda_concurrency_lookup(action: str):
     """The policy is copied into three docs files, so they can drift apart."""
     docs = Path(__file__).resolve().parents[2] / "docs"
     for name in ("iam-policy.json", "stackwise-role.yaml", "stackwise-ec2.yaml"):
-        assert "lambda:GetFunctionConcurrency" in (docs / name).read_text(), name
+        assert action in (docs / name).read_text(), name
+
+
+def _fires(scan_db: ScanDB, service: str, kind: str, metadata: dict, rule_id: str) -> bool:
+    scan = scan_db.create_scan("123", ["us-east-1"], ["all"])
+    scan_db.insert_resource(scan.id, service, kind, "r", "us-east-1", metadata=metadata)
+    evaluate_rules(load_rules(), scan_db, scan.id)
+    return any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id))
+
+
+def test_lifecycle_table_is_fresh():
+    assert date.today() - lifecycle_mod.AS_OF <= timedelta(days=90), (
+        f"stackwise/analyzer/lifecycle.py is as of {lifecycle_mod.AS_OF}. Refresh "
+        f"LAMBDA_RUNTIME_DEPRECATION, EKS_END_OF_STANDARD_SUPPORT and AS_OF from "
+        f"{sorted(lifecycle_mod.SOURCES.values())}"
+    )
+
+
+def test_lifecycle_context_flips_scheduled_dates():
+    before = lifecycle_context(date(2027, 6, 29))
+    after = lifecycle_context(date(2027, 6, 30))
+
+    assert "java11" not in before["deprecated_lambda_runtimes"]
+    assert "java11" in after["deprecated_lambda_runtimes"]
+    assert lifecycle_context(date(2026, 11, 10))["eks_min_standard_version"] == [1, 34]
+    assert lifecycle_context(date(2026, 12, 2))["eks_min_standard_version"] == [1, 35]
+    # Past every listed date: only versions newer than the table count as supported.
+    assert lifecycle_context(date(2030, 1, 1))["eks_min_standard_version"] == [1, 38]
+
+
+def test_lifecycle_context_defaults_to_today():
+    assert lifecycle_context() == lifecycle_context(date.today())
+
+
+def test_lifecycle_is_plain_data_to_conditions():
+    with pytest.raises(RuleConditionError):
+        _compile_condition("lifecycle.__class__", "TEST-EVIL")
+
+
+@pytest.mark.parametrize(
+    ("runtime", "fires"),
+    [("python3.9", True), ("nodejs20.x", True), ("python3.10", True), ("java11", False),
+     ("python3.12", False), (None, False)],
+)
+def test_cmp004_uses_lifecycle_table(scan_db: ScanDB, runtime, fires: bool):
+    assert _fires(scan_db, "lambda", "function", {"Runtime": runtime}, "CMP-004") is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        ({"ClusterCheckFailed": False, "version": "1.33"}, "CMP-017", True),
+        ({"ClusterCheckFailed": False, "version": "1.34"}, "CMP-017", False),
+        ({"ClusterCheckFailed": False, "version": "1.40"}, "CMP-017", False),
+        # A missing version is unknown, not old.
+        ({"ClusterCheckFailed": False, "version": None}, "CMP-017", False),
+        ({"ClusterCheckFailed": False, "version": None}, "CMP-026", True),
+        ({"ClusterCheckFailed": False, "version": "1.33"}, "CMP-026", False),
+        ({"ClusterCheckFailed": True}, "CMP-026", False),
+    ],
+)
+def test_eks_version_rules(scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool):
+    assert _fires(scan_db, "eks", "cluster", metadata, rule_id) is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"cpu": 512, "memory": 1024}, False),
+        ({"cpu": 128, "memory": 1024}, True),
+        # No task-level size: the container sums stand in, and a null isn't "low".
+        ({"cpu": None, "memory": None, "ContainerCpu": 512, "ContainerMemory": 1024}, False),
+        ({"cpu": None, "memory": None, "ContainerCpu": 128, "ContainerMemory": 1024}, True),
+        ({"cpu": None, "memory": None, "ContainerCpu": None, "ContainerMemory": 1024}, False),
+        ({"cpu": None, "memory": None, "ContainerCpu": None, "ContainerMemory": 256}, True),
+        # Task level wins over the containers.
+        ({"cpu": 1024, "memory": 2048, "ContainerCpu": 128, "ContainerMemory": 128}, False),
+    ],
+)
+def test_cmp015_uses_container_sizes_when_task_has_none(
+    scan_db: ScanDB, metadata: dict, fires: bool
+):
+    metadata = {"TaskDefinitionCheckFailed": False, **metadata}
+    assert _fires(scan_db, "ecs", "task_definition", metadata, "CMP-015") is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"HasLoadBalancer": True, "HealthCheckType": "EC2"}, True),
+        ({"HasLoadBalancer": True, "HealthCheckType": "ELB"}, False),
+        # EC2 health checks are the right choice without a load balancer.
+        ({"HasLoadBalancer": False, "HealthCheckType": "EC2"}, False),
+        ({"HealthCheckType": "EC2"}, False),
+    ],
+)
+def test_cmp013_only_for_load_balanced_asgs(scan_db: ScanDB, metadata: dict, fires: bool):
+    assert _fires(scan_db, "ec2", "auto_scaling_group", metadata, "CMP-013") is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"launchType": "EC2"}, True),
+        ({"launchType": "FARGATE"}, False),
+        ({"launchType": None, "capacityProviderStrategy": ["my-ec2-provider"]}, True),
+        ({"launchType": None, "capacityProviderStrategy": ["FARGATE", "FARGATE_SPOT"]}, False),
+        ({"launchType": None, "capacityProviderStrategy": []}, False),
+        ({"ServiceCheckFailed": True, "capacityProviderStrategy": ["my-ec2-provider"]}, False),
+    ],
+)
+def test_cmp014_reads_capacity_providers(scan_db: ScanDB, metadata: dict, fires: bool):
+    assert _fires(scan_db, "ecs", "service", metadata, "CMP-014") is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        ({"DeadLetterConfig": None, "OnFailureDestination": None}, "CMP-011", True),
+        ({"DeadLetterConfig": {"TargetArn": "arn:sqs"}}, "CMP-011", False),
+        ({"DeadLetterConfig": None, "OnFailureDestination": "arn:sqs"}, "CMP-011", False),
+        ({"DestinationCheckFailed": True}, "CMP-011", False),
+        ({"DestinationCheckFailed": True}, "CMP-027", True),
+        ({"DestinationCheckFailed": False}, "CMP-027", False),
+    ],
+)
+def test_lambda_failure_destination_rules(
+    scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool
+):
+    assert _fires(scan_db, "lambda", "function", metadata, rule_id) is fires
+
+
+_ALL_BLOCKED = {
+    "BlockPublicAcls": True, "IgnorePublicAcls": True,
+    "BlockPublicPolicy": True, "RestrictPublicBuckets": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"PublicAccessBlock": {"BlockPublicAcls": True}}, True),
+        ({"PublicAccessBlock": {**_ALL_BLOCKED, "RestrictPublicBuckets": False}}, True),
+        ({"PublicAccessBlock": _ALL_BLOCKED}, False),
+        ({"PublicAccessBlock": None}, True),
+        ({"PublicAccessBlockCheckFailed": True, "PublicAccessBlock": None}, False),
+    ],
+)
+def test_dat003_requires_all_four_settings(scan_db: ScanDB, metadata: dict, fires: bool):
+    assert _fires(scan_db, "s3", "bucket", metadata, "DAT-003") is fires
 
 
 @pytest.mark.parametrize(
@@ -911,3 +1077,267 @@ def test_cmp008_fires_when_metadata_options_is_null(scan_db: ScanDB, metadata, f
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert any(f.rule_id == "CMP-008" for f in scan_db.get_findings(scan.id)) is fires
+
+
+def _sse_rules(*algorithms: str) -> dict:
+    return {"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": a}} for a in algorithms
+    ]}
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # No explicit configuration still means SSE-S3 on new objects.
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": {}}, "DAT-002", False),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False}, "DAT-002", False),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": _sse_rules("AES256")},
+         "DAT-002", False),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": _sse_rules("aws:kms")},
+         "DAT-002", False),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": _sse_rules("aws:kms:dsse")},
+         "DAT-002", False),
+        # An explicit rule that sets no supported algorithm still fires.
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": _sse_rules("none")},
+         "DAT-002", True),
+        (("s3", "bucket"), {"EncryptionCheckFailed": False,
+                            "ServerSideEncryptionConfiguration": {"Rules": [{}]}},
+         "DAT-002", True),
+        # No SSEDescription means the AWS-owned key, which is encryption at rest.
+        (_TABLE, {"SSEDescription": None}, "DAT-012", False),
+        (_TABLE, {}, "DAT-012", False),
+        (_TABLE, {"SSEDescription": {}}, "DAT-012", False),
+        (_TABLE, {"SSEDescription": {"Status": "ENABLED"}}, "DAT-012", False),
+        (_TABLE, {"SSEDescription": {"Status": "DISABLED"}}, "DAT-012", True),
+        (_TABLE, {"SSEDescription": {"Status": "DISABLING"}}, "DAT-012", True),
+    ],
+)
+def test_default_encryption_is_not_reported_as_unencrypted(
+    scan_db: ScanDB, kind: tuple[str, str], metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_obs005_describes_a_missing_customer_managed_key():
+    rule = next(r for r in load_rules() if r.id == "OBS-005")
+    assert rule.title == "Log group has no customer-managed KMS key"
+    assert rule.severity == "LOW"
+
+
+_RDS = ("rds", "db_instance")
+_CACHE = ("elasticache", "cache_cluster")
+_RG = ("elasticache", "replication_group")
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # An Aurora member or a read replica is not a single-AZ instance.
+        (_RDS, {"MultiAZ": False, "DBClusterIdentifier": "c1"}, "DAT-005", False),
+        (_RDS, {"MultiAZ": False, "ReadReplicaSourceDBInstanceIdentifier": "p"}, "DAT-005",
+         False),
+        (_RDS, {"MultiAZ": False}, "DAT-005", True),
+        (_RDS, {"MultiAZ": True}, "DAT-005", False),
+        # Memcached has no replication groups and no at-rest encryption field.
+        (_CACHE, {"Engine": "memcached"}, "DAT-016", False),
+        (_CACHE, {"Engine": "memcached"}, "DAT-017", False),
+        (_CACHE, {"Engine": "redis"}, "DAT-016", True),
+        (_CACHE, {"Engine": "valkey"}, "DAT-016", True),
+        (_CACHE, {"Engine": "redis", "ReplicationGroupId": "rg"}, "DAT-016", False),
+        (_CACHE, {"Engine": "redis", "AtRestEncryptionEnabled": False}, "DAT-017", True),
+        (_CACHE, {"Engine": "redis", "AtRestEncryptionEnabled": True}, "DAT-017", False),
+        # A one-node replication group can't fail over.
+        (_RG, {"MemberClusterCount": 1}, "DAT-022", True),
+        (_RG, {"MemberClusterCount": 2}, "DAT-022", False),
+        (_RG, {}, "DAT-022", False),
+    ],
+)
+def test_rules_match_the_resource_shape(scan_db: ScanDB, kind, metadata, rule_id, fires):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+_SG = ("ec2", "security_group")
+
+
+def _perm(protocol: str, from_port=None, to_port=None, v4=True, v6=False) -> dict:
+    perm: dict = {"IpProtocol": protocol}
+    if from_port is not None:
+        perm.update(FromPort=from_port, ToPort=to_port)
+    if v4:
+        perm["IpRanges"] = [{"CidrIp": "0.0.0.0/0"}]
+    if v6:
+        perm["Ipv6Ranges"] = [{"CidrIpv6": "::/0"}]
+    return perm
+
+
+@pytest.mark.parametrize(
+    ("perms", "expected"),
+    [
+        ([_perm("tcp", 22, 22)], {"NET-003"}),
+        ([_perm("tcp", 0, 65535)], {"NET-003", "NET-004"}),
+        ([_perm("-1")], {"NET-003", "NET-004"}),
+        ([_perm("tcp", 22, 22, v4=False, v6=True)], {"NET-003"}),
+        ([_perm("tcp", 3389, 3389)], {"NET-004"}),
+        ([_perm("tcp", 443, 443)], {"NET-005"}),
+        ([_perm("tcp", 443, 443, v4=False, v6=True)], {"NET-005"}),
+        ([_perm("tcp", 22, 22), _perm("tcp", 443, 443)], {"NET-003", "NET-005"}),
+        # UDP 22 isn't SSH, so it's the generic open-ingress finding.
+        ([_perm("udp", 22, 22)], {"NET-005"}),
+        ([{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+           "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}], set()),
+    ],
+    ids=["ssh", "all-ports", "all-protocols", "ssh-ipv6", "rdp", "https", "https-ipv6",
+         "ssh-and-https", "udp-22", "private"],
+)
+def test_internet_ingress_is_reported_once_at_the_right_severity(
+    scan_db: ScanDB, perms: list, expected: set
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    scan_db.insert_resource(
+        scan.id, *_SG, "sg-1", "us-east-1", metadata={"IpPermissions": perms}
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    fired = [f.rule_id for f in scan_db.get_findings(scan.id)
+             if f.rule_id in ("NET-003", "NET-004", "NET-005")]
+    assert sorted(fired) == sorted(expected)
+
+
+@pytest.mark.parametrize(
+    ("lb_type", "listeners", "fires"),
+    [
+        ("network", [{"Protocol": "TCP"}, {"Protocol": "UDP"}], False),
+        ("application", [{"Protocol": "HTTP"}, {"Protocol": "HTTPS"}], True),
+        ("application", [{"Protocol": "HTTPS"}], False),
+        ("application", [{"Protocol": "HTTP", "RedirectsToHttps": True},
+                         {"Protocol": "HTTPS"}], False),
+        ("application", [{"Protocol": "HTTP", "RedirectsToHttps": False}], True),
+    ],
+    ids=["nlb-tcp", "alb-http-and-https", "alb-https", "alb-redirect", "alb-http"],
+)
+def test_net007_flags_alb_http_that_is_not_a_redirect(
+    scan_db: ScanDB, lb_type: str, listeners: list, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    scan_db.insert_resource(
+        scan.id, "elbv2", "load_balancer", "lb", "us-east-1",
+        metadata={"Type": lb_type, "ListenersCheckFailed": False, "Listeners": listeners},
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == "NET-007" for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_default_api_key_source_is_not_a_finding(scan_db: ScanDB):
+    """HEADER is the default and only says where to read a key, not that none is needed."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    scan_db.insert_resource(
+        scan.id, "apigateway", "rest_api", "api", "us-east-1",
+        metadata={"ApiKeySource": "HEADER", "ThrottleCheckFailed": False,
+                  "Throttle": {"rateLimit": 10, "burstLimit": 5}},
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert scan_db.get_findings(scan.id) == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        (("iam", "user"), {"MFADevices": [], "ConsoleAccess": False}, "SEC-002", False),
+        (("iam", "user"), {"MFADevices": [], "ConsoleAccess": True}, "SEC-002", True),
+        (("iam", "user"), {"MFADevices": [{"x": 1}], "ConsoleAccess": True}, "SEC-002", False),
+        (("iam", "user"), {"MFADevices": [], "ConsoleAccessCheckFailed": True}, "SEC-002", False),
+        (("iam", "user"), {"MFADevices": [], "ConsoleAccessCheckFailed": True}, "SEC-012", True),
+        # Older scans have no console flag, and behave as before.
+        (("iam", "user"), {"MFADevices": []}, "SEC-002", True),
+        (("iam", "role"), {"Path": "/aws-service-role/x.amazonaws.com/"}, "SEC-004", False),
+        (("iam", "role"), {"Path": "/"}, "SEC-004", True),
+        (("iam", "role"), {"Path": "/", "PermissionsBoundary": "arn:b"}, "SEC-004", False),
+        (("secretsmanager", "secret"), {"RotationEnabled": True}, "SEC-008", True),
+        (("secretsmanager", "secret"),
+         {"RotationEnabled": True, "RotationRules": {"AutomaticallyAfterDays": 30}},
+         "SEC-008", False),
+    ],
+)
+def test_iam_and_secret_rules_match_their_title(scan_db: ScanDB, kind, metadata, rule_id, fires):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["security"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_secret_with_rotation_disabled_gets_one_finding(scan_db: ScanDB):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["security"])
+    scan_db.insert_resource(
+        scan.id, "secretsmanager", "secret", "s", "us-east-1", metadata={"RotationEnabled": False}
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert [f.rule_id for f in scan_db.get_findings(scan.id)] == ["SEC-007"]
+
+
+@pytest.mark.parametrize(
+    ("tags", "expected"),
+    [([], ["DSC-002"]), (None, ["DSC-002"]), ([{"Key": "Env", "Value": "p"}], [])],
+    ids=["empty", "null", "tagged"],
+)
+def test_empty_tag_set_gets_one_finding(scan_db: ScanDB, tags, expected):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["cost", "discovery"])
+    scan_db.insert_resource(
+        scan.id, "resourcegroupstaggingapi", "tagged_resource", "arn:aws:s3:::b", "us-east-1",
+        metadata={"ResourceARN": "arn:aws:s3:::b", "Tags": tags},
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert [f.rule_id for f in scan_db.get_findings(scan.id)] == expected
+
+
+def test_tag_finding_does_not_claim_a_full_inventory():
+    rule = next(r for r in load_rules() if r.id == "DSC-002")
+    assert "Tagging API returned" in rule.title
+    assert not any(r.id == "CST-001" for r in load_rules())
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # Older scans have no Engine; those clusters were Redis-only checks before.
+        (("elasticache", "cache_cluster"), {}, "DAT-016", True),
+        (("elasticache", "cache_cluster"), {"AtRestEncryptionEnabled": False}, "DAT-017", True),
+        (("elasticache", "cache_cluster"), {"Engine": "memcached"}, "DAT-016", False),
+        # A key change in progress is still encryption at rest.
+        (("dynamodb", "table"), {"SSEDescription": {"Status": "UPDATING"}}, "DAT-012", False),
+        (("dynamodb", "table"), {"SSEDescription": {"Status": "ENABLING"}}, "DAT-012", False),
+        (("dynamodb", "table"), {"SSEDescription": {"Status": "DISABLING"}}, "DAT-012", True),
+    ],
+)
+def test_review_fixes(scan_db: ScanDB, kind, metadata, rule_id, fires):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires

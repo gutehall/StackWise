@@ -538,3 +538,49 @@ def test_guardduty_get_findings_failure_names_the_operation(scan_db: ScanDB):
         SecurityScanner()._scan_guardduty_findings(gd, scan_db, "scan-1", "us-east-1", "det-1")
 
     assert [e.operation for e in scan_db.get_scan_errors("scan-1")] == ["get_findings"]
+
+
+@mock_aws
+def test_console_access_and_role_path_are_stored(scan_db: ScanDB):
+    session = boto3.Session(region_name="us-east-1")
+    iam = session.client("iam", region_name="us-east-1")
+    iam.create_user(UserName="console-user")
+    iam.create_login_profile(UserName="console-user", Password="Str0ng!Passw0rd#")
+    iam.create_user(UserName="keys-only")
+    iam.create_role(
+        RoleName="AWSServiceRoleForTest", Path="/aws-service-role/test.amazonaws.com/",
+        AssumeRolePolicyDocument=_ASSUME_ROLE_POLICY,
+    )
+
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["security"])
+    SecurityScanner()._scan_iam(session, scan_db, scan.id, "us-east-1")
+
+    rows = {r.resource_id: r.metadata for r in scan_db.get_resources(scan.id, service="iam")}
+    assert rows["console-user"]["ConsoleAccess"] is True
+    assert rows["keys-only"]["ConsoleAccess"] is False
+    assert rows["keys-only"]["ConsoleAccessCheckFailed"] is False
+    assert rows["AWSServiceRoleForTest"]["Path"] == "/aws-service-role/test.amazonaws.com/"
+
+
+@pytest.mark.parametrize(
+    "error", [_throttle_error("GetLoginProfile"), RuntimeError("reset")], ids=["client", "other"]
+)
+def test_console_access_check_failure_is_flagged(scan_db: ScanDB, error: Exception):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["security"])
+    iam = MagicMock()
+    iam.list_mfa_devices.return_value = {"MFADevices": []}
+    iam.list_user_policies.return_value = {"PolicyNames": []}
+    iam.get_login_profile.side_effect = error
+
+    def _paginate(client, method, key, **kw):
+        return [{"UserName": "u"}] if method == "list_users" else []
+
+    with (
+        patch("stackwise.scanner.security.regional_client", return_value=iam),
+        patch("stackwise.scanner.security.paginate", side_effect=_paginate),
+    ):
+        SecurityScanner()._scan_iam(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    user = scan_db.get_resources(scan.id, service="iam")[0].metadata
+    assert user["ConsoleAccessCheckFailed"] is True
+    assert user["ConsoleAccess"] is None

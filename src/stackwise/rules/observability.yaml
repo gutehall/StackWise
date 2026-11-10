@@ -47,11 +47,12 @@
     Set a retention period to control storage costs and comply with retention policies.
 
 - id: OBS-005
-  title: "Log group has no encryption"
+  title: "Log group has no customer-managed KMS key"
   severity: LOW
   resource_type: log_group
   service: logs
   condition: |
     not resource.get('kmsKeyId')
   remediation: >
-    Enable KMS encryption for sensitive log data.
+    Log groups are always encrypted with a service key. Associate a customer-managed KMS
+    key if you need to control key policy, rotation or access for sensitive log data.

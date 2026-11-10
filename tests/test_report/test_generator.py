@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from stackwise.report.generator import generate_report
+from stackwise.report.generator import ReportFormatUnavailableError, generate_report
 from stackwise.store.db import ScanDB
 
 
@@ -136,35 +136,67 @@ def test_generate_report_unsupported_output_format_raises(scan_db: ScanDB, setti
         generate_report(settings, scan_db, scan.id, "engineering", "bogus-format")
 
 
-def test_generate_report_pdf_produces_valid_output(scan_db: ScanDB, settings):
-    """WeasyPrint needs system libs (pango/cairo/gobject) that aren't
-    guaranteed present on every CI runner (only the shipped Docker image
-    installs them) — so either a real PDF comes out, or the documented
-    OSError fallback to HTML kicks in. Both are correct; only a crash isn't."""
+def _scan_with_one_instance(scan_db: ScanDB) -> str:
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
     scan_db.insert_resource(scan.id, "ec2", "instance", "i-1", "us-east-1", metadata={})
+    return scan.id
 
-    path = generate_report(settings, scan_db, scan.id, "engineering", "pdf")
-    assert path.exists()
-    assert path.suffix in (".pdf", ".html")
-    if path.suffix == ".pdf":
+
+def _weasyprint_works() -> bool:
+    try:
+        from weasyprint import HTML
+
+        HTML(string="<p>x</p>").write_pdf()
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def test_generate_report_pdf_is_a_real_pdf_or_a_clear_failure(scan_db: ScanDB, settings):
+    """WeasyPrint needs Pango and Cairo, which not every CI runner has. With them,
+    the file must be a real PDF. Without them, it must fail, not hand back HTML."""
+    scan_id = _scan_with_one_instance(scan_db)
+
+    if _weasyprint_works():
+        path = generate_report(settings, scan_db, scan_id, "engineering", "pdf")
+        assert path.suffix == ".pdf"
         assert path.read_bytes()[:4] == b"%PDF"
+    else:
+        with pytest.raises(ReportFormatUnavailableError):
+            generate_report(settings, scan_db, scan_id, "engineering", "pdf")
+        assert list(settings.output_dir.glob("*")) == []
 
 
-def test_generate_report_pdf_falls_back_to_html_when_weasyprint_missing(
-    scan_db: ScanDB, settings
-):
-    """If weasyprint can't be imported (not installed, or missing system
-    libs raising OSError), the PDF request must fall back to writing HTML
-    instead of crashing."""
-    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
-    scan_db.insert_resource(scan.id, "ec2", "instance", "i-1", "us-east-1", metadata={})
+def test_missing_weasyprint_fails_instead_of_writing_html(scan_db: ScanDB, settings):
+    scan_id = _scan_with_one_instance(scan_db)
 
-    with patch.dict(sys.modules, {"weasyprint": None}):
-        path = generate_report(settings, scan_db, scan.id, "engineering", "pdf")
+    with (
+        patch.dict(sys.modules, {"weasyprint": None}),
+        pytest.raises(ReportFormatUnavailableError, match="--format html"),
+    ):
+        generate_report(settings, scan_db, scan_id, "engineering", "pdf")
 
-    assert path.suffix == ".html"
-    assert path.exists()
+    assert list(settings.output_dir.glob("*")) == []
+
+
+@pytest.mark.parametrize("error", [OSError("cairo crashed"), ValueError("bad css")])
+def test_a_failed_pdf_write_removes_the_partial_file(scan_db: ScanDB, settings, error):
+    scan_id = _scan_with_one_instance(scan_db)
+
+    def _write_half_then_fail(path):
+        Path(path).write_bytes(b"%PDF-1.7 partial")
+        raise error
+
+    fake = MagicMock()
+    fake.HTML.return_value.write_pdf.side_effect = _write_half_then_fail
+    with (
+        patch.dict(sys.modules, {"weasyprint": fake}),
+        # A write error is raised as itself: a full disk isn't a missing library.
+        pytest.raises(type(error)),
+    ):
+        generate_report(settings, scan_db, scan_id, "engineering", "pdf")
+
+    assert list(settings.output_dir.glob("*.pdf")) == []
 
 
 def test_markdown_executive_report_includes_severity_breakdown(scan_db: ScanDB, settings):
@@ -204,3 +236,151 @@ def test_markdown_recommendations_section(scan_db: ScanDB, settings):
     assert "Recommendations (1)" in content
     assert "Right-size instances" in content
     assert "Impact: high | Effort: low" in content
+
+
+def test_markdown_shows_a_partial_llm_run(scan_db: ScanDB, settings):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    scan_db.insert_recommendation(
+        scan_id=scan.id, source="llm", category="cost", title="Right-size instances",
+    )
+    scan_db.set_analysis_status(scan.id, "partial", ["compute", "data"])
+
+    content = generate_report(settings, scan_db, scan.id, "engineering", "md").read_text()
+
+    assert "LLM analysis was partial; these categories failed: compute, data" in content
+
+
+def test_markdown_shows_a_partial_llm_run_with_no_recommendations(scan_db: ScanDB, settings):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    scan_db.set_analysis_status(scan.id, "partial", ["compute"])
+
+    content = generate_report(settings, scan_db, scan.id, "engineering", "md").read_text()
+
+    assert "Recommendations (0)" in content
+    assert "these categories failed: compute" in content
+
+
+def test_markdown_has_no_partial_line_for_a_complete_run(scan_db: ScanDB, settings):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    scan_db.insert_recommendation(
+        scan_id=scan.id, source="llm", category="cost", title="Right-size instances",
+    )
+    scan_db.set_analysis_status(scan.id, "complete", [])
+
+    content = generate_report(settings, scan_db, scan.id, "engineering", "md").read_text()
+
+    assert "partial" not in content
+
+
+def _scan_with_many_services_and_bad_costs(scan_db: ScanDB, n_services: int = 15) -> str:
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute", "cost"])
+    for i in range(n_services):
+        scan_db.insert_resource(scan.id, f"svc{i}", "thing", f"r{i}", "us-east-1", metadata={})
+    groups = [
+        {"Keys": [f"Service {i}"], "Metrics": {"UnblendedCost": {"Amount": str(i + 1)}}}
+        for i in range(n_services)
+    ]
+    groups += [
+        {"Keys": ["Null amount"], "Metrics": {"UnblendedCost": {"Amount": None}}},
+        {"Keys": ["Text amount"], "Metrics": {"UnblendedCost": {"Amount": "n/a"}}},
+        "not a dict",
+        {"Keys": ["No metrics"]},
+    ]
+    scan_db.insert_resource(
+        scan.id, "ce", "cost_summary", "cost-summary", "us-east-1", metadata={"Groups": groups}
+    )
+    return scan.id
+
+
+@pytest.mark.parametrize("output_format", ["json", "md", "html"])
+@pytest.mark.parametrize("report_type", ["engineering", "executive", "architecture"])
+def test_many_services_and_bad_cost_rows_do_not_abort_the_report(
+    scan_db: ScanDB, settings, output_format: str, report_type: str
+):
+    scan_id = _scan_with_many_services_and_bad_costs(scan_db)
+
+    path = generate_report(settings, scan_db, scan_id, report_type, output_format)
+
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_unreadable_cost_rows_are_skipped():
+    from stackwise.report.generator import _cost_by_service
+
+    meta = {"Groups": [
+        {"Keys": ["EC2"], "Metrics": {"UnblendedCost": {"Amount": "2.5"}}},
+        {"Keys": ["EC2"], "Metrics": {"UnblendedCost": {"Amount": "1"}}},
+        {"Keys": ["S3"], "Metrics": {"UnblendedCost": {"Amount": None}}},
+        {"Keys": [], "Metrics": {"UnblendedCost": {"Amount": "4"}}},
+        None,
+    ]}
+
+    assert _cost_by_service(meta) == {"EC2": 3.5, "Other": 4.0}
+    assert _cost_by_service({"Groups": "nope"}) == {}
+    assert _cost_by_service({}) == {}
+
+
+def test_json_and_markdown_draw_no_charts(scan_db: ScanDB, settings):
+    scan_id = _scan_with_many_services_and_bad_costs(scan_db)
+
+    with patch("stackwise.report.generator.severity_bar_chart") as chart:
+        generate_report(settings, scan_db, scan_id, "executive", "json")
+        generate_report(settings, scan_db, scan_id, "executive", "md")
+
+    chart.assert_not_called()
+
+
+def test_two_scans_on_the_same_day_get_separate_reports(scan_db: ScanDB, settings):
+    first = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    second = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    assert first.timestamp[:10] == second.timestamp[:10]
+
+    a = generate_report(settings, scan_db, first.id, "engineering", "json")
+    b = generate_report(settings, scan_db, second.id, "engineering", "json")
+
+    assert a != b
+    assert a.exists() and b.exists()
+
+
+@pytest.mark.parametrize("output_format", ["html", "md", "json"])
+def test_a_crash_during_the_write_keeps_the_previous_report(
+    scan_db: ScanDB, settings, output_format: str
+):
+    scan_id = _scan_with_one_instance(scan_db)
+    path = generate_report(settings, scan_db, scan_id, "engineering", output_format)
+    before = path.read_bytes()
+
+    real_write = Path.write_text
+
+    def _half_write_then_crash(self, text, *args, **kwargs):
+        real_write(self, text[: len(text) // 2], *args, **kwargs)
+        raise OSError("disk full")
+
+    with (
+        patch.object(Path, "write_text", _half_write_then_crash),
+        pytest.raises(OSError, match="disk full"),
+    ):
+        generate_report(settings, scan_db, scan_id, "engineering", output_format)
+
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in settings.output_dir.iterdir()) == [path.name]
+
+
+def test_a_missing_scan_raises_before_rendering(scan_db: ScanDB, settings):
+    with pytest.raises(ValueError, match="not found"):
+        generate_report(settings, scan_db, "no-such-scan", "engineering", "json")
+
+
+def test_missing_cairo_on_import_is_reported_as_unavailable(scan_db: ScanDB, settings):
+    """Missing system libraries surface as OSError when weasyprint is imported."""
+    scan_id = _scan_with_one_instance(scan_db)
+
+    class _Broken:
+        def __getattr__(self, name):
+            raise OSError("cannot load library 'libpango'")
+
+    with (
+        patch.dict(sys.modules, {"weasyprint": _Broken()}),
+        pytest.raises(ReportFormatUnavailableError, match="Pango"),
+    ):
+        generate_report(settings, scan_db, scan_id, "engineering", "pdf")

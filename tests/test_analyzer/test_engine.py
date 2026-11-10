@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from stackwise.analyzer.engine import _run_llm_analysis, run_analysis
+from stackwise.analyzer.engine import (
+    EngineUnavailableError,
+    _normalize_title,
+    _run_llm_analysis,
+    run_analysis,
+)
+from stackwise.analyzer.llm_client import LLMChunkError, OllamaClient
 from stackwise.analyzer.rules import RulesLoadError, load_rules_checked
 from stackwise.config import Engine, Settings
 from stackwise.store.db import ScanDB
@@ -43,7 +50,7 @@ def test_llm_analysis_deduplicates_recommendations(scan_db: ScanDB, tmp_path: Pa
                "impact": "high", "effort": "low"}
     client.parse_recommendations.side_effect = lambda x: [dup_rec, dup_rec]
 
-    count = _run_llm_analysis(client, scan_db, scan.id, settings)
+    count = _run_llm_analysis(client, scan_db, scan.id, settings).count
     recs = scan_db.get_recommendations(scan.id)
     # Should deduplicate to 1
     assert count == 1
@@ -75,7 +82,7 @@ def test_llm_analysis_chunks_large_categories(scan_db: ScanDB, tmp_path: Path):
                  "impact": "medium", "effort": "low"}
     client.parse_recommendations.side_effect = lambda x: [rightsize]
 
-    count = _run_llm_analysis(client, scan_db, scan.id, settings)
+    count = _run_llm_analysis(client, scan_db, scan.id, settings).count
     # Should have been called 3 times (chunks of 5, 5, 2)
     assert client.generate.call_count == 3
     # Should have 3 recommendations (one per chunk, no dedupe since same title)
@@ -99,7 +106,7 @@ def test_llm_analysis_skips_discovery_category(scan_db: ScanDB, tmp_path: Path):
     )
 
     client = MagicMock()
-    count = _run_llm_analysis(client, scan_db, scan.id, settings)
+    count = _run_llm_analysis(client, scan_db, scan.id, settings).count
 
     client.generate.assert_not_called()
     assert count == 0
@@ -172,7 +179,7 @@ def test_llm_analysis_skips_chunk_with_empty_response(scan_db: ScanDB, tmp_path:
     client = MagicMock()
     client.generate.return_value = ""
 
-    count = _run_llm_analysis(client, scan_db, scan.id, settings)
+    count = _run_llm_analysis(client, scan_db, scan.id, settings).count
 
     client.parse_recommendations.assert_not_called()
     assert count == 0
@@ -219,19 +226,48 @@ def test_run_analysis_model_not_found(scan_db: ScanDB, tmp_path: Path):
     assert result["llm_recommendations"] == 0
 
 
-def test_run_analysis_mlx_falls_back_to_ollama(scan_db: ScanDB, tmp_path: Path):
-    """MLX isn't implemented yet — selecting it must still go through the
-    Ollama client, with a message explaining the fallback."""
-    settings = Settings(engine=Engine.MLX, data_dir=tmp_path / "stackwise")
-    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+@pytest.mark.parametrize(
+    ("engine", "available", "has_model", "match"),
+    [
+        (Engine.MLX, True, True, "MLX engine is not implemented"),
+        (Engine.OLLAMA, False, True, "Ollama is not reachable"),
+        (Engine.OLLAMA, True, False, "is not in Ollama"),
+    ],
+    ids=["mlx", "ollama-down", "model-missing"],
+)
+def test_an_explicit_engine_that_cannot_run_fails_before_any_analysis(
+    scan_db: ScanDB, tmp_path: Path, engine, available, has_model, match
+):
+    settings = Settings(engine=engine, engine_explicit=True, data_dir=tmp_path / "stackwise")
+    scan_id = _scan_with_insecure_instances(scan_db)
+    run_analysis(Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "s"), scan_db, scan_id)
+    before = sorted(f.id for f in scan_db.get_findings(scan_id))
+    client = MagicMock()
+    client.is_available.return_value = available
+    client.ensure_model.return_value = has_model
 
-    mock_client = MagicMock()
-    mock_client.is_available.return_value = False
+    with (
+        patch("stackwise.analyzer.engine.OllamaClient", return_value=client),
+        pytest.raises(EngineUnavailableError, match=match),
+    ):
+        run_analysis(settings, scan_db, scan_id)
 
-    with patch("stackwise.analyzer.engine.OllamaClient", return_value=mock_client) as mock_cls:
-        run_analysis(settings, scan_db, scan.id)
+    assert sorted(f.id for f in scan_db.get_findings(scan_id)) == before
 
-    mock_cls.assert_called_once()
+
+def test_an_auto_selected_engine_that_is_down_falls_back_to_rules(
+    scan_db: ScanDB, tmp_path: Path
+):
+    settings = Settings(engine=Engine.OLLAMA, engine_explicit=False, data_dir=tmp_path / "s")
+    scan_id = _scan_with_insecure_instances(scan_db)
+    client = MagicMock()
+    client.is_available.return_value = False
+
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        result = run_analysis(settings, scan_db, scan_id)
+
+    assert result["llm_recommendations"] == 0
+    assert result["rule_findings"] > 0
 
 
 def test_run_analysis_full_success_path_runs_llm(scan_db: ScanDB, tmp_path: Path):
@@ -315,26 +351,30 @@ def test_a_failed_insert_keeps_the_previous_findings(scan_db: ScanDB, tmp_path: 
     assert sorted(f.id for f in scan_db.get_findings(scan_id)) == before
 
 
-def test_a_failed_llm_phase_keeps_the_previous_findings_and_recommendations(
+def test_a_failed_llm_phase_write_keeps_the_previous_findings_and_recommendations(
     scan_db: ScanDB, tmp_path: Path
 ):
-    """The new findings were already written in this transaction; they must go too."""
+    """A DB error while storing LLM results still rolls everything back, including
+    the new findings already written in this transaction."""
     settings = Settings(engine=Engine.OLLAMA, data_dir=tmp_path / "stackwise")
     scan_id = _scan_with_insecure_instances(scan_db)
     with patch("stackwise.analyzer.engine.OllamaClient", return_value=_llm_client(["Old"])):
         run_analysis(settings, scan_db, scan_id)
     before = sorted(f.id for f in scan_db.get_findings(scan_id))
 
-    broken = _llm_client([])
-    broken.generate.side_effect = RuntimeError("connection reset")
     with (
-        patch("stackwise.analyzer.engine.OllamaClient", return_value=broken),
-        pytest.raises(RuntimeError, match="connection reset"),
+        patch("stackwise.analyzer.engine.OllamaClient", return_value=_llm_client(["New"])),
+        patch.object(
+            scan_db, "insert_recommendation",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ),
+        pytest.raises(sqlite3.OperationalError, match="disk I/O error"),
     ):
         run_analysis(settings, scan_db, scan_id)
 
     assert sorted(f.id for f in scan_db.get_findings(scan_id)) == before
     assert [r.title for r in scan_db.get_recommendations(scan_id)] == ["Old"]
+    assert scan_db.get_analysis_status(scan_id)["llm_status"] == "complete"
 
 
 def test_llm_recommendations_are_replaced_only_when_the_llm_runs(
@@ -465,3 +505,213 @@ def test_a_file_that_fails_part_way_contributes_no_rules(tmp_path: Path):
 
     assert [r.id for r in loaded.rules] == []
     assert loaded.failed_files == ["mixed.yaml (KeyError)"]
+
+
+# ── Partial LLM runs, citation checks, dedup (DM3-360) ─────────
+
+
+def _ollama(tmp_path: Path, **kwargs) -> Settings:
+    return Settings(engine=Engine.OLLAMA, data_dir=tmp_path / "stackwise", **kwargs)
+
+
+def _rec(title: str, detail: str = "Why it matters.", category: str = "reliability") -> dict:
+    return {"category": category, "title": title, "detail": detail,
+            "impact": "high", "effort": "low"}
+
+
+def _real_prompt_client(responses: dict[str, object]) -> MagicMock:
+    """A client that builds real prompts and answers per category.
+
+    A value that is an exception is raised from generate; otherwise it's the list of
+    recommendations parse_recommendations returns for that category's prompt.
+    """
+    client = MagicMock()
+    client.is_available.return_value = True
+    client.ensure_model.return_value = True
+    client.build_category_prompt.side_effect = OllamaClient.build_category_prompt
+
+    def _generate(prompt: str) -> str:
+        category = prompt.split(" resources", 1)[0].removeprefix("## ")
+        answer = responses.get(category, [])
+        if isinstance(answer, Exception):
+            raise answer
+        return category
+
+    client.generate.side_effect = _generate
+    client.parse_recommendations.side_effect = lambda raw: responses.get(raw, [])
+    return client
+
+
+def _two_category_scan(scan_db: ScanDB) -> str:
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute", "data"])
+    scan_db.insert_resource(
+        scan.id, "ec2", "instance", "i-0123456789abcdef0", "us-east-1",
+        arn="arn:aws:ec2:us-east-1:123:instance/i-0123456789abcdef0",
+        metadata={
+            "InstanceId": "i-0123456789abcdef0",
+            "MetadataOptions": {"HttpTokens": "optional"},
+            "SecurityGroups": [{"GroupId": "sg-0aaaabbbbccccdddd"}],
+        },
+    )
+    scan_db.insert_resource(
+        scan.id, "s3", "bucket", "my-bucket", "us-east-1",
+        arn="arn:aws:s3:::my-bucket", metadata={"Name": "my-bucket"},
+    )
+    return scan.id
+
+
+def test_a_failed_chunk_keeps_the_other_categories_and_marks_the_run_partial(
+    scan_db: ScanDB, tmp_path: Path
+):
+    scan_id = _two_category_scan(scan_db)
+    client = _real_prompt_client({
+        "compute": LLMChunkError("timed out"),
+        "data": [_rec("Enable bucket replication")],
+    })
+
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        result = run_analysis(_ollama(tmp_path), scan_db, scan_id)
+
+    assert result["llm_recommendations"] == 1
+    assert [r.title for r in scan_db.get_recommendations(scan_id)] == [
+        "Enable bucket replication"
+    ]
+    status = scan_db.get_analysis_status(scan_id)
+    assert status["llm_status"] == "partial"
+    assert status["failed_categories"] == ["compute"]
+    # Rule findings were committed with the rest.
+    assert any(f.rule_id == "CMP-008" for f in scan_db.get_findings(scan_id))
+
+
+def test_a_run_with_no_failed_chunk_is_complete(scan_db: ScanDB, tmp_path: Path):
+    scan_id = _two_category_scan(scan_db)
+    client = _real_prompt_client({"data": [_rec("Enable bucket replication")]})
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        run_analysis(_ollama(tmp_path), scan_db, scan_id)
+
+    status = scan_db.get_analysis_status(scan_id)
+    assert status["llm_status"] == "complete"
+    assert status["failed_categories"] == []
+
+
+def test_a_rules_only_run_leaves_the_status_row_alone(scan_db: ScanDB, tmp_path: Path):
+    scan_id = _two_category_scan(scan_db)
+    client = _real_prompt_client({"compute": LLMChunkError("timed out")})
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        run_analysis(_ollama(tmp_path), scan_db, scan_id)
+    before = scan_db.get_analysis_status(scan_id)
+
+    run_analysis(
+        Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise"), scan_db, scan_id
+    )
+
+    assert scan_db.get_analysis_status(scan_id) == before
+
+
+def test_a_rules_only_run_writes_no_status(scan_db: ScanDB, tmp_path: Path):
+    scan_id = _two_category_scan(scan_db)
+    run_analysis(
+        Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise"), scan_db, scan_id
+    )
+    assert scan_db.get_analysis_status(scan_id) is None
+
+
+@pytest.mark.parametrize(
+    ("title", "detail", "stored"),
+    [
+        ("Restrict sg-0aaaabbbbccccdddd", "Open to the world.", True),
+        ("Harden instance", "arn:aws:ec2:us-east-1:123:instance/i-0123456789abcdef0.", True),
+        ("Use spot capacity", "Saves money.", True),
+        ("Stop i-0fffffffffffffff0", "It is idle.", False),
+        ("Harden instance", "See arn:aws:ec2:us-east-1:123:instance/i-0fffffffffffffff0", False),
+        # In the scan, but in another category's chunk.
+        ("Encrypt bucket", "arn:aws:s3:::my-bucket is unencrypted.", False),
+        # An AWS-managed policy isn't a resource in the scan, so naming it is fine.
+        ("Use a managed policy", "Attach arn:aws:iam::aws:policy/ReadOnlyAccess.", True),
+    ],
+    ids=["id-in-metadata", "arn-in-chunk", "no-ids", "unknown-id", "unknown-arn",
+         "other-chunk", "aws-managed-arn"],
+)
+def test_a_recommendation_citing_a_resource_outside_its_chunk_is_dropped(
+    scan_db: ScanDB, tmp_path: Path, title: str, detail: str, stored: bool
+):
+    scan_id = _two_category_scan(scan_db)
+    client = _real_prompt_client({"compute": [_rec(title, detail)]})
+
+    result = _run_llm_analysis(client, scan_db, scan_id, _ollama(tmp_path))
+
+    titles = [r.title for r in scan_db.get_recommendations(scan_id)]
+    assert (titles == [title]) is stored
+    assert result.count == int(stored)
+
+
+def test_llm_titles_matching_a_rule_finding_or_another_category_are_stored_once(
+    scan_db: ScanDB, tmp_path: Path
+):
+    scan_id = _two_category_scan(scan_db)
+    scan_db.insert_finding(
+        scan_id=scan_id, severity="MEDIUM", title="Instance allows IMDSv1", rule_id="CMP-008"
+    )
+    client = _real_prompt_client({
+        "compute": [_rec("instance  ALLOWS imdsv1!"), _rec("Add a backup plan.")],
+        "data": [_rec("add a backup plan", category="cost")],
+    })
+
+    result = _run_llm_analysis(client, scan_db, scan_id, _ollama(tmp_path))
+
+    assert [r.title for r in scan_db.get_recommendations(scan_id)] == ["Add a backup plan."]
+    assert result.count == 1
+
+
+def test_normalize_title():
+    assert _normalize_title("  Enable  MFA, now!  ") == "enable mfa now"
+
+
+def test_the_validation_set_is_exactly_the_resources_in_the_prompt(
+    scan_db: ScanDB, tmp_path: Path
+):
+    """Resources dropped to fit the prompt can't be cited either."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    ids = [f"i-{n:017x}" for n in range(40)]
+    for rid in ids:
+        scan_db.insert_resource(
+            scan.id, "ec2", "instance", rid, "us-east-1",
+            metadata={"InstanceId": rid, "padding": "x" * 1000},
+        )
+    prompts: list[str] = []
+    client = _real_prompt_client({})
+
+    def _generate(prompt: str) -> str:
+        prompts.append(prompt)
+        return "compute"
+
+    client.generate.side_effect = _generate
+    client.parse_recommendations.side_effect = lambda raw: [
+        _rec(f"Stop {rid}") for rid in ids
+    ]
+
+    _run_llm_analysis(client, scan_db, scan.id, _ollama(tmp_path, llm_chunk_size=50))
+
+    [prompt] = prompts
+    shown = json.loads(prompt.split("### Resources\n", 1)[1].split("\n", 1)[0])
+    shown_ids = [r["InstanceId"] for r in shown]
+    assert 0 < len(shown_ids) < len(ids)
+    assert f"{len(ids) - len(shown_ids)} resources" in prompt
+    stored = sorted(r.title for r in scan_db.get_recommendations(scan.id))
+    assert stored == sorted(f"Stop {rid}" for rid in shown_ids)
+
+
+def test_a_resource_too_large_for_the_prompt_is_not_sent_alone(scan_db: ScanDB, tmp_path: Path):
+    """An empty chunk would ask the model about nothing and count as analyzed."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(
+        scan.id, "ec2", "instance", "i-huge", "us-east-1", metadata={"blob": "x" * 30_000}
+    )
+    client = _llm_client(["Anything"])
+    settings = Settings(engine=Engine.OLLAMA, data_dir=tmp_path / "s")
+
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        result = run_analysis(settings, scan_db, scan.id)
+
+    client.generate.assert_not_called()
+    assert result["llm_recommendations"] == 0

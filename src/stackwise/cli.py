@@ -199,7 +199,7 @@ def analyze(
     """Run rule-based + AI analysis on the latest scan."""
     from stackwise.analyzer.engine import run_analysis
 
-    settings = resolve_settings(
+    settings = _settings_or_exit(
         profile=profile, model=model, engine=engine,
         suppressed_rules=suppress,
     )
@@ -247,7 +247,7 @@ def report(
     """Generate reports from the latest analyzed scan."""
     from stackwise.report.generator import generate_report
 
-    settings = resolve_settings(profile=profile, output_dir=output_dir)
+    settings = _settings_or_exit(profile=profile, output_dir=output_dir)
     db_path, scan_id = _read_latest_scan(settings, account_id=account)
     if not db_path:
         console.print("[red]No scan found. Run 'stackwise scan' first.[/red]")
@@ -294,6 +294,11 @@ def run(
     output_dir: str | None = typer.Option(None, "--output-dir", "-o"),
 ) -> None:
     """Scan → analyze → report in one command."""
+    # Check every flag before scanning, so a typo can't fail the run after a full scan.
+    _settings_or_exit(
+        profile=profile, regions=regions, modules=modules, model=model, engine=engine,
+        suppressed_rules=suppress, output_dir=output_dir,
+    )
     scan(
         profile=profile, regions=regions, modules=modules,
         skip_cost_explorer=skip_cost_explorer,
@@ -333,9 +338,14 @@ def diff(
     ),
 ) -> None:
     """Compare two scans for drift detection (resources and findings)."""
-    from stackwise.diff import diff_scans, previous_completed_scan
+    from stackwise.diff import diff_scans, is_completed_scan, previous_completed_scan
 
-    settings = resolve_settings(profile=profile)
+    output_format = output_format.lower()
+    if output_format not in ("text", "json"):
+        console.print(f"[red]Unknown diff format: {escape(output_format)}. Use text or json.[/red]")
+        raise typer.Exit(1)
+
+    settings = _settings_or_exit(profile=profile)
 
     if compare:
         compare_path = Path(compare)
@@ -371,7 +381,16 @@ def diff(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
-    # On stderr, so it comes before the lists and can't corrupt --format json.
+    # On stderr, so it comes before the lists and can't corrupt --format json. The
+    # default baseline is always complete, but --base or --compare can name any file.
+    for label, path in (("Base", base_path), ("Compare", compare_path)):
+        if not is_completed_scan(path):
+            console.print(
+                f"[yellow]Warning: the {label.lower()} scan failed or never finished, so "
+                f"anything it missed shows as added or removed: {escape(str(path))}[/yellow]",
+                soft_wrap=True,
+            )
+
     if result.scope_differs:
         console.print(
             "[yellow]Warning: these scans cover different scopes, so anything outside "
@@ -459,7 +478,7 @@ def list_scans(
     that profile (scans are stored by account ID, not profile — there's no
     other way to know which account a profile maps to without a live AWS call).
     """
-    settings = resolve_settings(profile=profile)
+    settings = _settings_or_exit(profile=profile)
     scans_base = settings.data_dir / "scans"
     if not scans_base.exists():
         console.print("No scans found.")
@@ -476,11 +495,15 @@ def list_scans(
                 f"showing all accounts.[/yellow]"
             )
 
+    from stackwise.diff import scan_status
+
     table = Table(title="Scan History")
     table.add_column("Account", style="cyan")
     table.add_column("Timestamp")
+    table.add_column("Status")
     table.add_column("Database")
     table.add_column("Size")
+    status_style = {"complete": "green", "incomplete": "red", "unreadable": "yellow"}
 
     for account_dir in sorted(scans_base.iterdir()):
         if not account_dir.is_dir():
@@ -489,9 +512,11 @@ def list_scans(
             continue
         for db_file in sorted(account_dir.glob("*.db"), reverse=True):
             size_kb = db_file.stat().st_size / 1024
+            status = scan_status(db_file)
             table.add_row(
                 account_dir.name,
-                db_file.stem,
+                _scan_time(db_file.stem),
+                f"[{status_style[status]}]{status}[/{status_style[status]}]",
                 str(db_file),
                 f"{size_kb:.1f} KB",
             )
@@ -528,6 +553,27 @@ def _write_latest_scan(settings, account_id: str, scan_id: str, db_path: Path) -
     last_account = _last_account_file(settings)
     last_account.parent.mkdir(parents=True, exist_ok=True)
     last_account.write_text(account_id)
+
+
+def _scan_time(stem: str) -> str:
+    """Show a scan filename's timestamp without its unique suffix.
+
+    Handles old names (20240101T000000) and new ones (20240101T000000.123456-ab12cd).
+    Anything else is shown as-is.
+    """
+    try:
+        return datetime.strptime(stem[:15], "%Y%m%dT%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return stem
+
+
+def _settings_or_exit(**kwargs):
+    """resolve_settings, but a bad flag value is an error message and exit 1."""
+    try:
+        return resolve_settings(**kwargs)
+    except ValueError as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
+        raise typer.Exit(1)
 
 
 def _open_scan(db_path: Path, scan_id: str, *, writable: bool = False) -> ScanDB:

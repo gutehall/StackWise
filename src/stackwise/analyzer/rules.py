@@ -10,6 +10,7 @@ from types import CodeType
 
 import yaml
 
+from stackwise.analyzer.lifecycle import lifecycle_context
 from stackwise.store.db import ScanDB
 
 logger = logging.getLogger(__name__)
@@ -102,7 +103,11 @@ def _compile_condition(condition: str, rule_id: str) -> CodeType:
     except SyntaxError as e:
         raise RuleConditionError(f"{rule_id}: syntax error in condition: {e}") from e
 
-    allowed_names = {"resource"} | set(_SAFE_BUILTINS) | _comprehension_bound_names(tree)
+    # `lifecycle` is the plain dict from lifecycle_context(); the attribute allowlist
+    # applies to it like any other value.
+    allowed_names = (
+        {"resource", "lifecycle"} | set(_SAFE_BUILTINS) | _comprehension_bound_names(tree)
+    )
 
     for node in ast.walk(tree):
         if not isinstance(node, _ALLOWED_NODE_TYPES):
@@ -257,6 +262,8 @@ def evaluate_rules(
     """
     suppressed = set(suppressed_rules or [])
     resources = db.get_resources(scan_id)
+    # Once per run, so every rule compares against the same day.
+    lifecycle = lifecycle_context()
     findings_count = 0
 
     for rule in rules:
@@ -271,11 +278,12 @@ def evaluate_rules(
         for res in matching:
             try:
                 # Evaluate the pre-validated, pre-compiled condition with
-                # `resource` in scope — see _compile_condition for what's allowed.
+                # `resource` and `lifecycle` in scope — see _compile_condition for
+                # what's allowed.
                 result = eval(
                     rule.compiled_condition,
                     {"__builtins__": _SAFE_BUILTINS},
-                    {"resource": res.metadata},
+                    {"resource": res.metadata, "lifecycle": lifecycle},
                 )
             except Exception:
                 logger.warning(

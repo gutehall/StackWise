@@ -53,17 +53,29 @@ class DiffResult:
         )
 
 
-def _is_completed_scan(db_path: Path) -> bool:
+def scan_status(db_path: Path) -> str:
+    """"complete", "incomplete" (failed or never finished) or "unreadable".
+
+    Opens read-only, so checking doesn't change the file. A file older than the
+    completeness tables counts as complete.
+    """
     try:
         db = ScanDB(db_path, mode="ro")
     except (FileNotFoundError, sqlite3.DatabaseError):
-        return False
+        return "unreadable"
     try:
-        return db.latest_scan() is not None and db.is_complete()
+        if db.latest_scan() is None:
+            return "unreadable"
+        return "complete" if db.is_complete() else "incomplete"
     except sqlite3.DatabaseError:  # empty file, or not a scan database at all
-        return False
+        return "unreadable"
     finally:
         db.close()
+
+
+def is_completed_scan(db_path: Path) -> bool:
+    """True if the file holds a scan that finished without scan errors."""
+    return scan_status(db_path) == "complete"
 
 
 def previous_completed_scan(compare_db_path: Path) -> Path | None:
@@ -74,7 +86,7 @@ def previous_completed_scan(compare_db_path: Path) -> Path | None:
     """
     earlier = [p for p in compare_db_path.parent.glob("*.db") if p.stem < compare_db_path.stem]
     for path in sorted(earlier, key=lambda p: p.stem, reverse=True):
-        if _is_completed_scan(path):
+        if is_completed_scan(path):
             return path
     return None
 

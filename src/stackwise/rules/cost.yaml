@@ -1,15 +1,8 @@
 # StackWise cost rules
 # Cost Explorer, Compute Optimizer, Tagging
 
-- id: CST-001
-  title: "Resource has no cost allocation tags"
-  severity: LOW
-  resource_type: tagged_resource
-  service: resourcegroupstaggingapi
-  condition: |
-    not resource.get('Tags') or len((resource.get('Tags') or [])) == 0
-  remediation: >
-    Add cost allocation tags (e.g. Environment, Project) for cost tracking.
+# CST-001 ("Resource has no cost allocation tags") was removed: it was the same check
+# on the same rows as DSC-002, so every empty tag set produced two findings.
 
 - id: CST-002
   title: "Compute Optimizer recommends rightsizing"

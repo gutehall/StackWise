@@ -1,6 +1,8 @@
 # StackWise compute rules
 # Each rule is evaluated against resources of the specified resource_type.
-# `condition` is a Python expression with `resource` (the metadata dict) in scope.
+# `condition` is a Python expression with `resource` (the metadata dict) in scope, and
+# `lifecycle` (stackwise.analyzer.lifecycle.lifecycle_context(): which Lambda runtimes and
+# EKS versions are past their AWS dates on the day the analysis runs).
 
 - id: CMP-001
   title: "EC2 instance has a public IP address"
@@ -43,7 +45,7 @@
   resource_type: function
   service: lambda
   condition: |
-    (resource.get('Runtime') or '') in ('python3.8', 'python3.7', 'nodejs14.x', 'nodejs16.x', 'java8', 'dotnetcore3.1', 'ruby2.7', 'go1.x')
+    (resource.get('Runtime') or '') in (lifecycle.get('deprecated_lambda_runtimes') or [])
   remediation: >
     Upgrade to a supported runtime to continue receiving security patches.
     See https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html
@@ -112,14 +114,15 @@
     Place Lambda in VPC if it needs to access private resources.
 
 - id: CMP-011
-  title: "Lambda function has no dead-letter queue"
+  title: "Lambda function has no dead-letter queue or on-failure destination"
   severity: LOW
   resource_type: function
   service: lambda
   condition: |
-    not resource.get('DeadLetterConfig') or not (resource.get('DeadLetterConfig') or {}).get('TargetArn')
+    not resource.get('DestinationCheckFailed') and not (resource.get('DeadLetterConfig') or {}).get('TargetArn') and not resource.get('OnFailureDestination')
   remediation: >
-    Configure a DLQ to capture failed invocations for debugging.
+    Configure a DLQ or an on-failure destination to capture failed asynchronous
+    invocations for debugging.
 
 - id: CMP-012
   title: "Lambda function has no reserved concurrency"
@@ -132,12 +135,12 @@
     Set reserved concurrency to prevent one function from consuming all account concurrency.
 
 - id: CMP-013
-  title: "Auto Scaling Group has no health check type"
+  title: "Auto Scaling Group behind a load balancer uses EC2 health checks"
   severity: LOW
   resource_type: auto_scaling_group
   service: ec2
   condition: |
-    not resource.get('HealthCheckType') or resource.get('HealthCheckType') == 'EC2'
+    resource.get('HasLoadBalancer') is True and resource.get('HealthCheckType') != 'ELB'
   remediation: >
     Use ELB health check for load balancer-backed ASGs.
 
@@ -147,7 +150,7 @@
   resource_type: service
   service: ecs
   condition: |
-    not resource.get('ServiceCheckFailed') and resource.get('launchType') == 'EC2'
+    not resource.get('ServiceCheckFailed') and (resource.get('launchType') == 'EC2' or (resource.get('launchType') is None and any(p not in ('FARGATE', 'FARGATE_SPOT') for p in (resource.get('capacityProviderStrategy') or []))))
   remediation: >
     Consider Fargate for simpler operations and no EC2 management.
 
@@ -157,7 +160,7 @@
   resource_type: task_definition
   service: ecs
   condition: |
-    not resource.get('TaskDefinitionCheckFailed') and ((resource.get('cpu') or 0) < 256 or (resource.get('memory') or 0) < 512)
+    not resource.get('TaskDefinitionCheckFailed') and any(v is not None and v < floor for v, floor in ((resource.get('cpu') if resource.get('cpu') is not None else resource.get('ContainerCpu'), 256), (resource.get('memory') if resource.get('memory') is not None else resource.get('ContainerMemory'), 512)))
   remediation: >
     Ensure task has adequate CPU and memory for the workload.
 
@@ -172,17 +175,16 @@
     Disable public endpoint and use private access for production clusters.
 
 - id: CMP-017
-  title: "EKS cluster uses deprecated Kubernetes version"
+  title: "EKS cluster Kubernetes version is past EKS standard support"
   severity: HIGH
   resource_type: cluster
   service: eks
-  # Compares (major, minor) against the oldest version still in EKS standard
-  # support. This threshold must be bumped periodically — see
-  # https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html
   condition: |
-    not resource.get('ClusterCheckFailed') and tuple(int(p) for p in (resource.get('version') or '0.0').split('.')[:2]) < (1, 28)
+    not resource.get('ClusterCheckFailed') and bool(resource.get('version')) and tuple(int(p) for p in (resource.get('version') or '').split('.')[:2]) < tuple(lifecycle.get('eks_min_standard_version') or [])
   remediation: >
-    Upgrade to a supported Kubernetes version. See EKS version support policy.
+    Upgrade to a Kubernetes version in EKS standard support. Past it the cluster is
+    in extended support (billed extra) or is upgraded automatically. See
+    https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html
 
 - id: CMP-018
   title: "EKS node group has no scaling config"
@@ -190,7 +192,7 @@
   resource_type: nodegroup
   service: eks
   condition: |
-    not resource.get('NodegroupCheckFailed') and (not resource.get('scalingConfig') or (resource.get('scalingConfig') or {}).get('minSize') == (resource.get('scalingConfig') or {}).get('maxSize'))
+    not resource.get('NodegroupCheckFailed') and not resource.get('scalingConfig')
   remediation: >
     Configure scaling to handle workload variations.
 
@@ -273,3 +275,26 @@
     The get_function_concurrency check failed (permissions or API error), so CMP-012
     was skipped for this function. Verify manually, and check for
     lambda:GetFunctionConcurrency.
+
+- id: CMP-026
+  title: "EKS cluster version was not reported"
+  severity: INFO
+  resource_type: cluster
+  service: eks
+  condition: |
+    not resource.get('ClusterCheckFailed') and not resource.get('version')
+  remediation: >
+    describe_cluster returned no Kubernetes version, so CMP-017 was skipped for this
+    cluster. Check the version manually against EKS standard support.
+
+- id: CMP-027
+  title: "Lambda failure destination could not be verified"
+  severity: INFO
+  resource_type: function
+  service: lambda
+  condition: |
+    resource.get('DestinationCheckFailed')
+  remediation: >
+    The get_function_event_invoke_config check failed (permissions or API error), so
+    CMP-011 was skipped for this function. Verify manually, and check for
+    lambda:GetFunctionEventInvokeConfig.

@@ -170,6 +170,7 @@ def test_asg_scanner_collects_auto_scaling_groups(scan_db: ScanDB):
     assert asgs[0].metadata["MinSize"] == 1
     assert asgs[0].metadata["MaxSize"] == 3
     assert asgs[0].metadata["HealthCheckType"] == "EC2"
+    assert asgs[0].metadata["HasLoadBalancer"] is False
 
 
 @mock_aws
@@ -250,6 +251,7 @@ def test_ecs_cluster_and_service_scanned(scan_db: ScanDB):
     assert len(services) == 1
     assert services[0].resource_id == "my-cluster/my-svc"
     assert services[0].metadata["launchType"] == "FARGATE"
+    assert services[0].metadata["capacityProviderStrategy"] == []
     assert services[0].metadata["desiredCount"] == 2
 
 
@@ -629,6 +631,7 @@ def test_lambda_concurrency_lookup_errors(scan_db: ScanDB, error: Exception, fai
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
     client = MagicMock()
     client.get_function_concurrency.side_effect = error
+    client.get_function_event_invoke_config.return_value = {}
 
     with (
         patch("stackwise.scanner.compute.regional_client", return_value=client),
@@ -641,3 +644,149 @@ def test_lambda_concurrency_lookup_errors(scan_db: ScanDB, error: Exception, fai
     assert row.metadata["ReservedConcurrencyCheckFailed"] is failed
     assert row.metadata["ReservedConcurrentExecutions"] is None
     assert scan_db.get_scan_errors(scan.id) == []
+
+
+@mock_aws
+def test_lambda_on_failure_destination_comes_from_event_invoke_config(scan_db: ScanDB):
+    """moto raises ResourceNotFoundException for a function with no invoke config, like AWS."""
+    session = boto3.Session(region_name="us-east-1")
+    role = session.client("iam").create_role(RoleName="r", AssumeRolePolicyDocument="{}")
+    client = session.client("lambda", region_name="us-east-1")
+    for name in ("plain", "routed"):
+        client.create_function(
+            FunctionName=name, Runtime="python3.12", Role=role["Role"]["Arn"],
+            Handler="h.h", Code={"ZipFile": b"x"},
+        )
+    dest = "arn:aws:sqs:us-east-1:123456789012:failures"
+    client.put_function_event_invoke_config(
+        FunctionName="routed", DestinationConfig={"OnFailure": {"Destination": dest}}
+    )
+
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    LambdaScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    rows = {r.resource_id: r.metadata for r in scan_db.get_resources(scan.id, service="lambda")}
+    assert rows["routed"]["OnFailureDestination"] == dest
+    assert rows["plain"]["OnFailureDestination"] is None
+    assert rows["routed"]["DestinationCheckFailed"] is False
+    assert rows["plain"]["DestinationCheckFailed"] is False
+
+
+@pytest.mark.parametrize(
+    ("error", "failed"),
+    [
+        (ClientError({"Error": {"Code": "AccessDeniedException"}},
+                     "GetFunctionEventInvokeConfig"), True),
+        (RuntimeError("connection reset"), True),
+        (ClientError({"Error": {"Code": "ResourceNotFoundException"}},
+                     "GetFunctionEventInvokeConfig"), False),
+    ],
+    ids=["access-denied", "other", "not-found"],
+)
+def test_lambda_event_invoke_config_lookup_errors(
+    scan_db: ScanDB, error: Exception, failed: bool
+):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    client = MagicMock()
+    client.get_function_concurrency.return_value = {}
+    client.get_function_event_invoke_config.side_effect = error
+
+    with (
+        patch("stackwise.scanner.compute.regional_client", return_value=client),
+        patch("stackwise.scanner.compute.paginate", return_value=[{"FunctionName": "f"}]),
+    ):
+        LambdaScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    row = scan_db.get_resources(scan.id, service="lambda")[0]
+    assert row.metadata["DestinationCheckFailed"] is failed
+    assert row.metadata["OnFailureDestination"] is None
+
+
+@mock_aws
+def test_asg_scanner_records_load_balancer_attachment(scan_db: ScanDB):
+    session = boto3.Session(region_name="us-east-1")
+    ec2 = session.client("ec2", region_name="us-east-1")
+    ec2.create_launch_template(
+        LaunchTemplateName="lb-lt",
+        LaunchTemplateData={"ImageId": "ami-12345678", "InstanceType": "t3.micro"},
+    )
+    vpc_id = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
+    subnet_id = ec2.create_subnet(
+        VpcId=vpc_id, CidrBlock="10.0.1.0/24", AvailabilityZone="us-east-1a"
+    )["Subnet"]["SubnetId"]
+    tg_arn = session.client("elbv2").create_target_group(
+        Name="tg", Protocol="HTTP", Port=80, VpcId=vpc_id
+    )["TargetGroups"][0]["TargetGroupArn"]
+    session.client("autoscaling").create_auto_scaling_group(
+        AutoScalingGroupName="behind-lb",
+        LaunchTemplate={"LaunchTemplateName": "lb-lt", "Version": "$Latest"},
+        MinSize=1, MaxSize=2, VPCZoneIdentifier=subnet_id, TargetGroupARNs=[tg_arn],
+    )
+
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    EC2Scanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    asg = next(
+        r for r in scan_db.get_resources(scan.id, service="ec2")
+        if r.resource_type == "auto_scaling_group"
+    )
+    assert asg.metadata["HasLoadBalancer"] is True
+
+
+@mock_aws
+def test_ecs_task_definition_stores_container_size_sums(scan_db: ScanDB):
+    session = boto3.Session(region_name="us-east-1")
+    ecs = session.client("ecs", region_name="us-east-1")
+    ecs.register_task_definition(
+        family="sized",
+        containerDefinitions=[
+            {"name": "a", "image": "nginx", "cpu": 128, "memory": 256},
+            {"name": "b", "image": "nginx", "cpu": 64, "memoryReservation": 128},
+        ],
+    )
+    ecs.register_task_definition(
+        family="no-cpu", containerDefinitions=[{"name": "a", "image": "nginx", "memory": 512}]
+    )
+
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    ECSScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    rows = {
+        r.metadata["family"]: r.metadata
+        for r in scan_db.get_resources(scan.id, service="ecs")
+        if r.resource_type == "task_definition"
+    }
+    assert rows["sized"]["ContainerCpu"] == 192
+    assert rows["sized"]["ContainerMemory"] == 384
+    # No container sets cpu: unknown, not 0.
+    assert rows["no-cpu"]["ContainerCpu"] is None
+    assert rows["no-cpu"]["ContainerMemory"] == 512
+
+
+def test_ecs_service_stores_capacity_provider_names(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    ecs = MagicMock()
+    ecs.describe_services.return_value = {"services": [{
+        "serviceName": "s",
+        "capacityProviderStrategy": [
+            {"capacityProvider": "FARGATE_SPOT", "weight": 1},
+            {"capacityProvider": "my-asg-provider", "weight": 1},
+        ],
+    }]}
+    pages = {
+        "list_clusters": ["arn:aws:ecs:us-east-1:1:cluster/c"],
+        "list_services": ["arn:aws:ecs:us-east-1:1:service/c/s"],
+        "list_task_definitions": [],
+    }
+
+    with (
+        patch("stackwise.scanner.compute.regional_client", return_value=ecs),
+        patch(
+            "stackwise.scanner.compute.paginate",
+            side_effect=lambda _c, op, *_a, **_k: pages[op],
+        ),
+    ):
+        ECSScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    row = scan_db.get_resources(scan.id, service="ecs")[0]
+    assert row.metadata["capacityProviderStrategy"] == ["FARGATE_SPOT", "my-asg-provider"]

@@ -32,6 +32,9 @@ class Settings:
     modules: list[str] = field(default_factory=lambda: list(ALL_MODULES))
     model: str = DEFAULT_MODEL
     engine: Engine = Engine.OLLAMA
+    # True when the user chose the engine. An unavailable engine they asked for fails
+    # the command; one that was only auto-selected falls back to rules-only.
+    engine_explicit: bool = False
     ollama_url: str = DEFAULT_OLLAMA_URL
     output_dir: Path = Path("./reports")
     data_dir: Path = field(
@@ -77,17 +80,8 @@ def detect_platform() -> dict:
 
 def auto_select_engine() -> Engine:
     """Pick the best available LLM engine for the current platform."""
-    plat = detect_platform()
-
-    if plat["os"] == "darwin" and plat["has_metal"]:
-        # Prefer MLX on Apple Silicon if mlx_lm is installed
-        try:
-            import mlx_lm  # noqa: F401
-
-            return Engine.MLX
-        except ImportError:
-            pass
-
+    # MLX is not implemented yet, so it is never picked automatically, even on Apple
+    # Silicon with mlx_lm installed: picking it would mean no LLM analysis at all.
     # Ollama is the cross-platform default
     if shutil.which("ollama") is not None:
         return Engine.OLLAMA
@@ -132,7 +126,14 @@ def resolve_settings(
     s.model = model or os.environ.get("STACKWISE_MODEL", DEFAULT_MODEL)
 
     if engine:
-        s.engine = Engine(engine)
+        try:
+            s.engine = Engine(engine.lower())
+        except ValueError:
+            raise ValueError(
+                f"Unknown engine: {engine}. "
+                f"Valid engines: {', '.join(e.value for e in Engine)}"
+            ) from None
+        s.engine_explicit = True
     else:
         s.engine = auto_select_engine()
 

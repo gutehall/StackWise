@@ -22,6 +22,18 @@ def _to_int(value):
         return None
 
 
+def _container_sum(containers: list, *keys: str):
+    """Sum a size over containers, using the first of *keys* each one sets; None if 0."""
+    total = 0
+    for container in containers:
+        for key in keys:
+            value = _to_int(container.get(key))
+            if value:
+                total += value
+                break
+    return total or None
+
+
 class EC2Scanner(BaseScanner):
     """Scan EC2 instances, Auto Scaling Groups, and Launch Templates."""
 
@@ -93,6 +105,9 @@ class EC2Scanner(BaseScanner):
                     "LaunchConfigurationName": asg.get("LaunchConfigurationName"),
                     "AvailabilityZones": asg.get("AvailabilityZones", []),
                     "HealthCheckType": asg.get("HealthCheckType"),
+                    "HasLoadBalancer": bool(
+                        asg.get("LoadBalancerNames") or asg.get("TargetGroupARNs")
+                    ),
                     "Tags": asg.get("Tags", []),
                 },
             )
@@ -182,6 +197,26 @@ class LambdaScanner(BaseScanner):
             except Exception:
                 logger.debug("get_function_concurrency failed for %s", fn_name, exc_info=True)
                 reserved_check_failed = True
+            # A DLQ isn't the only place failed async invocations can go: an on-failure
+            # destination lives in the event invoke config. None set is a 404, not an error.
+            on_failure = None
+            destination_check_failed = False
+            try:
+                config = client.get_function_event_invoke_config(FunctionName=fn_name)
+                on_failure = (
+                    (config.get("DestinationConfig") or {}).get("OnFailure") or {}
+                ).get("Destination")
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+                    logger.debug(
+                        "get_function_event_invoke_config failed for %s", fn_name, exc_info=True
+                    )
+                    destination_check_failed = True
+            except Exception:
+                logger.debug(
+                    "get_function_event_invoke_config failed for %s", fn_name, exc_info=True
+                )
+                destination_check_failed = True
             db.insert_resource(
                 scan_id=scan_id,
                 service="lambda",
@@ -204,6 +239,8 @@ class LambdaScanner(BaseScanner):
                     "DeadLetterConfig": fn.get("DeadLetterConfig"),
                     "ReservedConcurrentExecutions": reserved,
                     "ReservedConcurrencyCheckFailed": reserved_check_failed,
+                    "OnFailureDestination": on_failure,
+                    "DestinationCheckFailed": destination_check_failed,
                 },
             )
             count += 1
@@ -279,6 +316,10 @@ class ECSScanner(BaseScanner):
                                 "serviceName": svc_name,
                                 "clusterArn": cluster_arn,
                                 "launchType": svc.get("launchType"),
+                                "capacityProviderStrategy": [
+                                    p.get("capacityProvider")
+                                    for p in svc.get("capacityProviderStrategy") or []
+                                ],
                                 "desiredCount": svc.get("desiredCount"),
                                 "runningCount": svc.get("runningCount"),
                                 "ServiceCheckFailed": False,
@@ -309,6 +350,7 @@ class ECSScanner(BaseScanner):
                     continue
                 td_family = td.get("family", td_arn.split("/")[-1].rsplit(":", 1)[0])
                 td_revision = td.get("revision")
+                containers = td.get("containerDefinitions") or []
                 # Include the revision in the identity: each revision is a
                 # distinct AWS resource (own ARN), and collapsing them onto
                 # the shared family name would make diff_scans silently miss
@@ -328,6 +370,11 @@ class ECSScanner(BaseScanner):
                         "revision": td_revision,
                         "cpu": _to_int(td.get("cpu")),
                         "memory": _to_int(td.get("memory")),
+                        # Task-level sizes are optional on EC2; then the containers set them.
+                        "ContainerCpu": _container_sum(containers, "cpu"),
+                        "ContainerMemory": _container_sum(
+                            containers, "memory", "memoryReservation"
+                        ),
                         "status": td.get("status"),
                         "TaskDefinitionCheckFailed": False,
                     },

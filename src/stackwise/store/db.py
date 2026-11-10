@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS incomplete_scans (
     scan_id     TEXT PRIMARY KEY REFERENCES scans(id)
 );
 
+-- One row per scan, written only when the LLM runs. llm_status is 'complete' or
+-- 'partial'; failed_categories is a JSON list of the categories whose chunks failed.
+CREATE TABLE IF NOT EXISTS analysis_status (
+    scan_id           TEXT PRIMARY KEY,
+    llm_status        TEXT NOT NULL,
+    failed_categories TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_resources_scan ON resources(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
@@ -488,8 +497,8 @@ class ScanDB:
     def transaction(self) -> Iterator[None]:
         """Commit everything written inside the block at once, or roll all of it back.
 
-        Only insert_finding, insert_recommendation and the clear_* methods defer their
-        commit. Don't call other writers inside: they commit on their own.
+        Only insert_finding, insert_recommendation, set_analysis_status and the clear_*
+        methods defer their commit. Don't call other writers inside: they commit on their own.
         """
         if self._in_transaction:
             raise RuntimeError("transaction() can't be nested")
@@ -516,6 +525,43 @@ class ScanDB:
         )
         if not self._in_transaction:
             self.conn.commit()
+
+    def set_analysis_status(
+        self, scan_id: str, llm_status: str, failed_categories: list[str]
+    ) -> None:
+        """Record whether the scan's last LLM run finished or only partly succeeded."""
+        self.conn.execute(
+            "INSERT INTO analysis_status (scan_id, llm_status, failed_categories, updated_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(scan_id) DO UPDATE SET "
+            "llm_status = excluded.llm_status, "
+            "failed_categories = excluded.failed_categories, "
+            "updated_at = excluded.updated_at",
+            (scan_id, llm_status, json.dumps(failed_categories),
+             datetime.now(UTC).isoformat()),
+        )
+        if not self._in_transaction:
+            self.conn.commit()
+
+    def get_analysis_status(self, scan_id: str) -> dict | None:
+        """The scan's LLM run status, or None if the LLM never ran for it.
+
+        Read-only connections skip the schema, so a file older than the table has none.
+        """
+        has_table = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'analysis_status'"
+        ).fetchone()
+        if not has_table:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM analysis_status WHERE scan_id = ?", (scan_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "llm_status": row["llm_status"],
+            "failed_categories": json.loads(row["failed_categories"]),
+            "updated_at": row["updated_at"],
+        }
 
     # ── Scan errors ────────────────────────────────────────
 
