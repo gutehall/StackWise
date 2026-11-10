@@ -66,6 +66,7 @@ def _build_context(db: ScanDB, scan_id: str, *, with_charts: bool = True) -> dic
     resources = db.get_resources(scan_id)
     findings = db.get_findings(scan_id)
     recommendations = db.get_recommendations(scan_id)
+    analysis_status = db.get_analysis_status(scan_id)
     summary = db.summary(scan_id)
 
     # Order findings by severity then rule priority
@@ -117,6 +118,7 @@ def _build_context(db: ScanDB, scan_id: str, *, with_charts: bool = True) -> dic
         "resources_by_service": resources_by_service,
         "findings": findings,
         "recommendations": recommendations,
+        "analysis_status": analysis_status,
         "summary": summary,
         "total_findings": total_findings,
         "severity_chart": severity_chart,
@@ -266,6 +268,8 @@ def _build_json_payload(context: dict) -> dict:
             }
             for r in recommendations
         ],
+        # None when the LLM never ran for this scan.
+        "analysis_status": context.get("analysis_status"),
     }
 
 
@@ -341,9 +345,17 @@ def _html_to_markdown(context: dict, report_type: str = "engineering") -> str:
                     lines.append(f"  *Remediation:* {f.remediation}")
                 lines.append("")
 
-    if recs:
+    status = context.get("analysis_status") or {}
+    partial = status.get("llm_status") == "partial"
+    if recs or partial:
         lines.append(f"## Recommendations ({len(recs)})")
         lines.append("")
+        if partial:
+            lines.append(
+                "*LLM analysis was partial; these categories failed: "
+                f"{', '.join(status.get('failed_categories') or [])}.*"
+            )
+            lines.append("")
         for r in recs:
             lines.append(f"- **[{r.category}]** {r.title}")
             if r.detail:

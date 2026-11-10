@@ -11,7 +11,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
@@ -21,6 +21,7 @@ from moto import mock_aws
 from typer.testing import CliRunner
 
 from stackwise import __version__
+from stackwise.analyzer.llm_client import LLMChunkError
 from stackwise.cli import app
 from stackwise.scanner.compute import EC2Scanner
 from stackwise.store.db import ScanDB
@@ -1136,6 +1137,42 @@ def test_analyze_that_rolls_back_exits_1_and_keeps_previous_findings(
     assert "previous findings are unchanged" in result.output
     assert "Analysis complete" not in result.output
     assert _finding_ids(db_path, scan_id) == before
+
+
+def test_analyze_with_a_partial_llm_run_exits_0_and_says_so(tmp_path: Path, monkeypatch):
+    db_path, scan_id = _scan_with_imds_findings(tmp_path, monkeypatch)
+    db = ScanDB(db_path)
+    db.insert_resource(scan_id, "s3", "bucket", "b", "us-east-1", metadata={"Name": "b"})
+    db.close()
+
+    def _generate(prompt: str) -> str:
+        if prompt.startswith("## compute"):
+            raise LLMChunkError("timed out")
+        return "data"
+
+    client = MagicMock()
+    client.is_available.return_value = True
+    client.ensure_model.return_value = True
+    client.build_category_prompt.side_effect = lambda category, *a, **k: f"## {category}"
+    client.generate.side_effect = _generate
+    client.parse_recommendations.return_value = [
+        {"category": "reliability", "title": "Replicate buckets", "detail": "x"}
+    ]
+
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        result = runner.invoke(app, ["analyze", "--engine", "ollama"])
+
+    assert result.exit_code == 0, result.output
+    assert "LLM analysis was partial: failed for compute" in result.output
+    assert "Stored 1 recommendations" in result.output
+    assert "LLM produced" not in result.output
+    assert "Analysis complete" in result.output
+    ro = ScanDB(db_path, mode="ro")
+    try:
+        assert ro.get_analysis_status(scan_id)["llm_status"] == "partial"
+        assert [r.title for r in ro.get_recommendations(scan_id)] == ["Replicate buckets"]
+    finally:
+        ro.close()
 
 
 def test_analyze_with_a_broken_packaged_rules_file_exits_1(tmp_path: Path, monkeypatch):

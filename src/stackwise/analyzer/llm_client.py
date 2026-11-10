@@ -13,6 +13,14 @@ from stackwise.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# Resources JSON budget per prompt (~6K tokens ≈ 24KB) and the findings cap.
+_RESOURCES_JSON_BUDGET = 24_000
+_MAX_PROMPT_FINDINGS = 30
+
+
+class LLMChunkError(Exception):
+    """Ollama gave no usable answer for one prompt after every retry."""
+
 
 def _log_parse_failure(raw: str) -> None:
     """Log a truncated sample when LLM response fails to parse as JSON."""
@@ -102,7 +110,22 @@ that the deterministic rules might miss.
 
 ### Existing findings
 {findings_json}
-"""
+{omitted_note}"""
+
+
+def fit_resources(resources: list[dict]) -> list[dict]:
+    """The longest leading run of *resources* whose JSON fits the prompt budget.
+
+    Whole resources are dropped, so the prompt's JSON stays valid and the caller
+    knows exactly which resources the model saw.
+    """
+    size = 2  # the enclosing brackets
+    for count, res in enumerate(resources):
+        # json.dumps separates list items with ", "
+        size += len(json.dumps(res, default=str)) + (2 if count else 0)
+        if size > _RESOURCES_JSON_BUDGET:
+            return resources[:count]
+    return resources
 
 
 class OllamaClient:
@@ -154,6 +177,7 @@ class OllamaClient:
             },
         }
 
+        last_error: Exception | None = None
         for attempt in range(max_retries):
             try:
                 r = httpx.post(
@@ -162,14 +186,20 @@ class OllamaClient:
                     timeout=self.timeout,
                 )
                 r.raise_for_status()
-                return r.json().get("response", "")
-            except httpx.HTTPError as e:
+                body = r.json()  # JSONDecodeError is a ValueError
+                if not isinstance(body, dict) or not isinstance(body.get("response"), str):
+                    raise ValueError("Ollama response body has no 'response' text")
+                return body["response"]
+            except (httpx.HTTPError, ValueError) as e:
+                last_error = e
                 logger.warning("Ollama request failed (attempt %d): %s", attempt + 1, e)
                 if attempt < max_retries - 1:
                     time.sleep(2**attempt)
 
-        logger.error("Ollama unreachable after %d attempts", max_retries)
-        return ""
+        logger.error("Ollama gave no usable response after %d attempts", max_retries)
+        raise LLMChunkError(
+            f"no usable response after {max_retries} attempts: {last_error}"
+        ) from last_error
 
     # ── Prompt builders ────────────────────────────────────
 
@@ -181,14 +211,33 @@ class OllamaClient:
         *,
         chunk_index: int | None = None,
         total_chunks: int | None = None,
+        omitted_resources: int = 0,
     ) -> str:
-        """Build a prompt for a single resource category (or chunk)."""
-        # Truncate to keep within context window (~6K tokens ≈ 24KB of JSON)
-        resources_json = json.dumps(resources, indent=None, default=str)
-        if len(resources_json) > 24_000:
-            resources_json = resources_json[:24_000] + "\n... (truncated)"
+        """Build a prompt for a single resource category (or chunk).
 
-        findings_json = json.dumps(findings[:30], indent=None, default=str)
+        Resources that don't fit the budget are dropped whole (see fit_resources);
+        *omitted_resources* adds any the caller already dropped to the count the
+        prompt reports.
+        """
+        kept = fit_resources(resources)
+        omitted_resources += len(resources) - len(kept)
+        resources_json = json.dumps(kept, indent=None, default=str)
+
+        findings_json = json.dumps(
+            findings[:_MAX_PROMPT_FINDINGS], indent=None, default=str
+        )
+        omitted_findings = max(0, len(findings) - _MAX_PROMPT_FINDINGS)
+        omitted = []
+        if omitted_resources:
+            omitted.append(f"{omitted_resources} resources")
+        if omitted_findings:
+            omitted.append(f"{omitted_findings} findings")
+        omitted_note = (
+            f"\nNote: {' and '.join(omitted)} were omitted to fit the context window. "
+            "Do not make claims about resources not listed above.\n"
+            if omitted
+            else ""
+        )
 
         chunk_context = ""
         if chunk_index is not None and total_chunks is not None and total_chunks > 1:
@@ -201,11 +250,12 @@ class OllamaClient:
 
         return _CATEGORY_PROMPT.format(
             category=category,
-            count=len(resources),
+            count=len(kept),
             chunk_context=chunk_context,
             category_focus=category_focus,
             resources_json=resources_json,
             findings_json=findings_json,
+            omitted_note=omitted_note,
         )
 
     @staticmethod

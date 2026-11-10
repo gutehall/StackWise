@@ -237,6 +237,40 @@ def test_markdown_recommendations_section(scan_db: ScanDB, settings):
     assert "Impact: high | Effort: low" in content
 
 
+def test_markdown_shows_a_partial_llm_run(scan_db: ScanDB, settings):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    scan_db.insert_recommendation(
+        scan_id=scan.id, source="llm", category="cost", title="Right-size instances",
+    )
+    scan_db.set_analysis_status(scan.id, "partial", ["compute", "data"])
+
+    content = generate_report(settings, scan_db, scan.id, "engineering", "md").read_text()
+
+    assert "LLM analysis was partial; these categories failed: compute, data" in content
+
+
+def test_markdown_shows_a_partial_llm_run_with_no_recommendations(scan_db: ScanDB, settings):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    scan_db.set_analysis_status(scan.id, "partial", ["compute"])
+
+    content = generate_report(settings, scan_db, scan.id, "engineering", "md").read_text()
+
+    assert "Recommendations (0)" in content
+    assert "these categories failed: compute" in content
+
+
+def test_markdown_has_no_partial_line_for_a_complete_run(scan_db: ScanDB, settings):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    scan_db.insert_recommendation(
+        scan_id=scan.id, source="llm", category="cost", title="Right-size instances",
+    )
+    scan_db.set_analysis_status(scan.id, "complete", [])
+
+    content = generate_report(settings, scan_db, scan.id, "engineering", "md").read_text()
+
+    assert "partial" not in content
+
+
 def _scan_with_many_services_and_bad_costs(scan_db: ScanDB, n_services: int = 15) -> str:
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute", "cost"])
     for i in range(n_services):

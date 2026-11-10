@@ -468,3 +468,47 @@ def test_clears_outside_a_transaction_commit_and_keep_other_scans(scan_db: ScanD
     assert [r.title for r in scan_db.get_recommendations(a.id)] == ["r"]
     assert len(scan_db.get_findings(b.id)) == 1
     assert len(scan_db.get_recommendations(b.id)) == 1
+
+
+def test_analysis_status_is_upserted(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    assert scan_db.get_analysis_status(scan.id) is None
+
+    scan_db.set_analysis_status(scan.id, "partial", ["compute", "data"])
+    first = scan_db.get_analysis_status(scan.id)
+    assert first["llm_status"] == "partial"
+    assert first["failed_categories"] == ["compute", "data"]
+
+    scan_db.set_analysis_status(scan.id, "complete", [])
+    second = scan_db.get_analysis_status(scan.id)
+    assert (second["llm_status"], second["failed_categories"]) == ("complete", [])
+
+
+def test_analysis_status_waits_for_the_transaction(tmp_path: Path):
+    path = tmp_path / "scan.db"
+    db = ScanDB(path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    try:
+        with pytest.raises(RuntimeError, match="boom"), db.transaction():
+            db.set_analysis_status(scan.id, "complete", [])
+            other = sqlite3.connect(path)
+            assert other.execute("SELECT count(*) FROM analysis_status").fetchone()[0] == 0
+            other.close()
+            raise RuntimeError("boom")
+        assert db.get_analysis_status(scan.id) is None
+    finally:
+        db.close()
+
+
+def test_analysis_status_is_none_on_a_file_older_than_the_table(tmp_path: Path):
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE scans (id TEXT)")
+    conn.commit()
+    conn.close()
+
+    db = ScanDB(path, mode="ro")
+    try:
+        assert db.get_analysis_status("any") is None
+    finally:
+        db.close()

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 
-from stackwise.analyzer.llm_client import OllamaClient
+from stackwise.analyzer.llm_client import LLMChunkError, OllamaClient, fit_resources
 from stackwise.config import Settings
 
 
@@ -99,11 +101,39 @@ def test_build_category_prompt_with_chunk_context():
     assert "chunk 2/3" in prompt
 
 
-def test_build_category_prompt_truncates_large_resource_payload():
-    """Resources JSON over 24KB must be truncated to stay within context."""
+def _prompt_resources(prompt: str) -> list[dict]:
+    return json.loads(prompt.split("### Resources\n", 1)[1].split("\n", 1)[0])
+
+
+def test_build_category_prompt_drops_whole_resources_to_fit():
+    """Resources JSON over 24KB loses whole resources, never a slice of JSON."""
     resources = [{"id": f"r-{i}", "padding": "x" * 200} for i in range(200)]
     prompt = OllamaClient.build_category_prompt("compute", resources, [])
-    assert "... (truncated)" in prompt
+
+    shown = _prompt_resources(prompt)
+    assert 0 < len(shown) < len(resources)
+    assert shown == resources[: len(shown)] == fit_resources(resources)
+    assert len(json.dumps(shown)) <= 24_000
+    assert f"{len(resources) - len(shown)} resources were omitted" in prompt
+    assert "findings were omitted" not in prompt
+
+
+def test_build_category_prompt_counts_omitted_findings_and_caller_drops():
+    findings = [{"title": f"f{i}"} for i in range(35)]
+    prompt = OllamaClient.build_category_prompt(
+        "compute", [{"id": "r-1"}], findings, omitted_resources=4
+    )
+    assert "4 resources and 5 findings were omitted" in prompt
+    assert len(json.loads(prompt.split("### Existing findings\n", 1)[1].split("\n", 1)[0])) == 30
+
+
+def test_build_category_prompt_without_omissions_has_no_note():
+    prompt = OllamaClient.build_category_prompt("compute", [{"id": "r-1"}], [])
+    assert "omitted" not in prompt
+
+
+def test_fit_resources_drops_a_resource_too_big_on_its_own():
+    assert fit_resources([{"padding": "x" * 30_000}, {"id": "r-1"}]) == []
 
 
 def test_parse_recommendations_dict_wrapped_recommendations_key():
@@ -250,12 +280,56 @@ def test_generate_retries_then_succeeds():
         assert client.generate("prompt", max_retries=3) == "[]"
 
 
-def test_generate_all_retries_fail_returns_empty_string():
+def test_generate_all_retries_fail_raises():
     settings = Settings(ollama_url="http://localhost:11434", model="qwen3:14b")
     client = OllamaClient(settings)
 
     with (
-        patch("httpx.post", side_effect=httpx.ConnectError("refused")),
+        patch("httpx.post", side_effect=httpx.ConnectError("refused")) as post,
+        patch("time.sleep"),
+        pytest.raises(LLMChunkError, match="refused"),
+    ):
+        client.generate("prompt", max_retries=2)
+    assert post.call_count == 2
+
+
+def _resp(body=None, *, bad_json: bool = False) -> MagicMock:
+    resp = MagicMock()
+    if bad_json:
+        resp.json.side_effect = json.JSONDecodeError("Expecting value", "<html>", 0)
+    else:
+        resp.json.return_value = body
+    return resp
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [_resp(bad_json=True), _resp(["not", "a", "dict"]), _resp({"done": True}),
+     _resp({"response": None})],
+    ids=["invalid-json", "not-a-dict", "no-response-field", "response-not-text"],
+)
+def test_generate_retries_an_unusable_body_then_succeeds(bad: MagicMock):
+    client = OllamaClient(Settings(ollama_url="http://localhost:11434"))
+    with (
+        patch("httpx.post", side_effect=[bad, _resp({"response": "[]"})]) as post,
         patch("time.sleep"),
     ):
-        assert client.generate("prompt", max_retries=2) == ""
+        assert client.generate("prompt", max_retries=3) == "[]"
+    assert post.call_count == 2
+
+
+def test_generate_raises_when_every_body_is_unusable():
+    client = OllamaClient(Settings(ollama_url="http://localhost:11434"))
+    with (
+        patch("httpx.post", return_value=_resp(bad_json=True)) as post,
+        patch("time.sleep"),
+        pytest.raises(LLMChunkError),
+    ):
+        client.generate("prompt", max_retries=3)
+    assert post.call_count == 3
+
+
+def test_generate_returns_empty_string_for_a_valid_empty_answer():
+    client = OllamaClient(Settings(ollama_url="http://localhost:11434"))
+    with patch("httpx.post", return_value=_resp({"response": ""})):
+        assert client.generate("prompt") == ""
