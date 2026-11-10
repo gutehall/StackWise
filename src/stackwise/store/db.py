@@ -7,6 +7,8 @@ import logging
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -176,6 +178,9 @@ class ScanDB:
         self.db_path = db_path
         self._mode = mode
         self._lock = threading.Lock()
+        # While set, insert_finding and insert_recommendation leave the commit to
+        # transaction(), so analysis results land all at once or not at all.
+        self._in_transaction = False
         # Scanners catch broad exceptions around per-resource work, which can swallow
         # a failed write. This keeps it visible, so the scan can still fail.
         self.write_failures: set[str] = set()
@@ -410,7 +415,8 @@ class ScanDB:
             (rec.id, rec.scan_id, rec.resource_id, rec.rule_id,
              rec.severity, rec.title, rec.detail, rec.remediation),
         )
-        self.conn.commit()
+        if not self._in_transaction:
+            self.conn.commit()
         return rec
 
     def get_findings(self, scan_id: str, severity: str | None = None) -> list[FindingRecord]:
@@ -459,7 +465,8 @@ class ScanDB:
             (rec.id, rec.scan_id, rec.source, rec.category,
              rec.title, rec.detail, rec.impact, rec.effort),
         )
-        self.conn.commit()
+        if not self._in_transaction:
+            self.conn.commit()
         return rec
 
     def get_recommendations(self, scan_id: str) -> list[RecommendationRecord]:
@@ -474,6 +481,41 @@ class ScanDB:
             )
             for r in rows
         ]
+
+    # ── Analysis results ───────────────────────────────────
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Commit everything written inside the block at once, or roll all of it back.
+
+        Only insert_finding, insert_recommendation and the clear_* methods defer their
+        commit. Don't call other writers inside: they commit on their own.
+        """
+        if self._in_transaction:
+            raise RuntimeError("transaction() can't be nested")
+        self._in_transaction = True
+        try:
+            yield
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+        finally:
+            self._in_transaction = False
+
+    def clear_findings(self, scan_id: str) -> None:
+        """Delete a scan's findings before writing a new set, so a re-run doesn't append."""
+        self.conn.execute("DELETE FROM findings WHERE scan_id = ?", (scan_id,))
+        if not self._in_transaction:
+            self.conn.commit()
+
+    def clear_llm_recommendations(self, scan_id: str) -> None:
+        """Delete a scan's LLM recommendations before writing a new set."""
+        self.conn.execute(
+            "DELETE FROM recommendations WHERE scan_id = ? AND source = 'llm'", (scan_id,)
+        )
+        if not self._in_transaction:
+            self.conn.commit()
 
     # ── Scan errors ────────────────────────────────────────
 

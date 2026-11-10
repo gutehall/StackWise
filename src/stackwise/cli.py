@@ -210,8 +210,17 @@ def analyze(
 
     db = _open_scan(db_path, scan_id, writable=True)
     console.print(f"[bold]Analyzing scan {scan_id}[/bold] from {db_path}")
-    run_analysis(settings, db, scan_id)
-    db.close()
+    try:
+        run_analysis(settings, db, scan_id)
+    except Exception as e:
+        console.print(
+            f"\n[bold red]Analysis failed:[/bold red] {escape(str(e) or repr(e))}\n"
+            "  Nothing was saved. The previous findings are unchanged.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(1)
+    finally:
+        db.close()
 
     console.print("\n[bold green]Analysis complete.[/bold green]")
 

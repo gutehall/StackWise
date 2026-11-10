@@ -155,22 +155,51 @@ class Rule:
     compiled_condition: CodeType | None = field(default=None, repr=False, compare=False)
 
 
-def load_rules(rules_dir: Path | None = None) -> list[Rule]:
-    """Load all YAML rule files from the rules directory.
+@dataclass
+class RuleLoadResult:
+    """What load_rules_checked found: the usable rules and everything it rejected."""
+
+    rules: list[Rule]
+    # True when the rules came from STACKWISE_RULES_DIR or an explicit directory rather
+    # than the ones packaged with stackwise.
+    is_override: bool
+    rules_dir: Path
+    failed_files: list[str] = field(default_factory=list)
+    rejected_rules: list[str] = field(default_factory=list)
+
+    @property
+    def problems(self) -> list[str]:
+        return [f"file {f}" for f in self.failed_files] + [
+            f"rule {r}" for r in self.rejected_rules
+        ]
+
+
+class RulesLoadError(Exception):
+    """A packaged rules file or rule failed to load, so the analysis would be partial."""
+
+
+def load_rules_checked(rules_dir: Path | None = None) -> RuleLoadResult:
+    """Load all YAML rule files, and report every file or rule that was rejected.
 
     Each condition is validated and compiled once here (not per-resource in
-    evaluate_rules) — a rule whose condition fails validation is logged and
-    skipped rather than aborting the whole load.
+    evaluate_rules). A rejected file or rule is logged and skipped; the caller
+    decides from the result whether that is acceptable.
     """
     import os
     env_dir = os.environ.get("STACKWISE_RULES_DIR")
     base = rules_dir or (Path(env_dir) if env_dir else _default_rules_dir())
-    rules: list[Rule] = []
+    result = RuleLoadResult(
+        rules=[], is_override=bool(rules_dir or env_dir), rules_dir=base
+    )
     if not base.is_dir():
         logger.warning("Rules directory not found: %s", base)
-        return rules
+        result.failed_files.append(f"{base} (directory not found)")
+        return result
 
     for path in sorted(base.glob("*.yaml")):
+        # Kept only once the whole file has parsed: a file reported as failed must not
+        # still contribute the rules above the broken entry.
+        file_rules: list[Rule] = []
         try:
             with open(path) as f:
                 entries = yaml.safe_load(f) or []
@@ -181,8 +210,9 @@ def load_rules(rules_dir: Path | None = None) -> list[Rule]:
                     compiled = _compile_condition(condition, rule_id)
                 except RuleConditionError:
                     logger.exception("Rejecting rule %s from %s", rule_id, path)
+                    result.rejected_rules.append(f"{rule_id} ({path.name})")
                     continue
-                rules.append(
+                file_rules.append(
                     Rule(
                         id=rule_id,
                         title=entry["title"],
@@ -195,11 +225,22 @@ def load_rules(rules_dir: Path | None = None) -> list[Rule]:
                         compiled_condition=compiled,
                     )
                 )
-        except Exception:
+        except Exception as e:
             logger.exception("Failed to load rules from %s", path)
+            result.failed_files.append(f"{path.name} ({type(e).__name__})")
+            continue
+        result.rules.extend(file_rules)
 
-    logger.info("Loaded %d rules from %s", len(rules), base)
-    return rules
+    logger.info("Loaded %d rules from %s", len(result.rules), base)
+    return result
+
+
+def load_rules(rules_dir: Path | None = None) -> list[Rule]:
+    """Load the rules that are usable, skipping any file or rule that fails.
+
+    Analysis uses load_rules_checked instead, so it can refuse a partial rule set.
+    """
+    return load_rules_checked(rules_dir).rules
 
 
 def evaluate_rules(
@@ -236,23 +277,26 @@ def evaluate_rules(
                     {"__builtins__": _SAFE_BUILTINS},
                     {"resource": res.metadata},
                 )
-                if result:
-                    db.insert_finding(
-                        scan_id=scan_id,
-                        severity=rule.severity,
-                        title=rule.title,
-                        resource_id=res.id,
-                        rule_id=rule.id,
-                        detail=f"Resource {res.resource_id} in {res.region}",
-                        remediation=rule.remediation,
-                    )
-                    findings_count += 1
             except Exception:
                 logger.warning(
                     "Rule %s failed on resource %s: %s",
                     rule.id, res.resource_id, rule.condition,
                     exc_info=True,
                 )
+                continue
+            # Outside the try: a failed write must abort the analysis, not be logged as
+            # a broken rule while a partial set of findings gets committed.
+            if result:
+                db.insert_finding(
+                    scan_id=scan_id,
+                    severity=rule.severity,
+                    title=rule.title,
+                    resource_id=res.id,
+                    rule_id=rule.id,
+                    detail=f"Resource {res.resource_id} in {res.region}",
+                    remediation=rule.remediation,
+                )
+                findings_count += 1
 
     logger.info("Rule evaluation produced %d findings", findings_count)
     return findings_count

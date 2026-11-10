@@ -412,3 +412,59 @@ def test_insert_resource_if_new_reports_whether_it_created_a_row(scan_db: ScanDB
     assert scan_db.insert_resource_if_new(*args, metadata={"a": 1}) is True
     assert scan_db.insert_resource_if_new(*args, metadata={"a": 2}) is False
     assert [r.metadata for r in scan_db.get_resources(scan.id)] == [{"a": 1}]
+
+
+def test_transaction_commits_findings_once_at_the_end(tmp_path: Path):
+    path = tmp_path / "scan.db"
+    db = ScanDB(path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    try:
+        with db.transaction():
+            db.insert_finding(scan.id, "HIGH", "a")
+            # Another connection can't see it before the commit.
+            other = sqlite3.connect(path)
+            assert other.execute("SELECT count(*) FROM findings").fetchone()[0] == 0
+            other.close()
+        other = sqlite3.connect(path)
+        assert other.execute("SELECT count(*) FROM findings").fetchone()[0] == 1
+        other.close()
+    finally:
+        db.close()
+
+
+def test_transaction_rolls_back_on_error(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    scan_db.insert_finding(scan.id, "HIGH", "kept")
+    scan_db.insert_recommendation(scan_id=scan.id, source="llm", category="c", title="kept")
+
+    with pytest.raises(RuntimeError, match="boom"), scan_db.transaction():
+        scan_db.clear_findings(scan.id)
+        scan_db.clear_llm_recommendations(scan.id)
+        scan_db.insert_finding(scan.id, "HIGH", "new")
+        raise RuntimeError("boom")
+
+    assert [f.title for f in scan_db.get_findings(scan.id)] == ["kept"]
+    assert [r.title for r in scan_db.get_recommendations(scan.id)] == ["kept"]
+
+
+def test_transaction_cannot_nest(scan_db: ScanDB):
+    with pytest.raises(RuntimeError, match="nested"), scan_db.transaction():
+        with scan_db.transaction():
+            pass
+
+
+def test_clears_outside_a_transaction_commit_and_keep_other_scans(scan_db: ScanDB):
+    a = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    b = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    for scan in (a, b):
+        scan_db.insert_finding(scan.id, "HIGH", "f")
+        scan_db.insert_recommendation(scan_id=scan.id, source="llm", category="c", title="l")
+    scan_db.insert_recommendation(scan_id=a.id, source="rule", category="c", title="r")
+
+    scan_db.clear_findings(a.id)
+    scan_db.clear_llm_recommendations(a.id)
+
+    assert scan_db.get_findings(a.id) == []
+    assert [r.title for r in scan_db.get_recommendations(a.id)] == ["r"]
+    assert len(scan_db.get_findings(b.id)) == 1
+    assert len(scan_db.get_recommendations(b.id)) == 1

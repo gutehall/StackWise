@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 
 from stackwise.analyzer.llm_client import OllamaClient
-from stackwise.analyzer.rules import evaluate_rules, load_rules
+from stackwise.analyzer.rules import RulesLoadError, evaluate_rules, load_rules_checked
 from stackwise.config import Engine, Settings
 from stackwise.store.db import ScanDB
 
@@ -48,44 +48,87 @@ _SERVICE_CATEGORY = {
 _LLM_SKIP_CATEGORIES = {"discovery"}
 
 
+# Finding id for "custom rules failed to load". Not a rule in any YAML file.
+RULES_LOAD_FINDING_ID = "RULES-LOAD"
+
+
 def run_analysis(settings: Settings, db: ScanDB, scan_id: str) -> dict:
     """Run full analysis pipeline: rules then optional LLM enrichment.
+
+    Replaces the scan's findings. LLM recommendations are replaced only when the LLM
+    runs; a rules-only run, or one where Ollama is unavailable, keeps the previous ones,
+    which may refer to findings from the run that produced them. Raises, with the
+    previous results kept, if anything fails before the new ones are committed,
+    including an LLM error.
 
     Returns:
         Summary dict with counts.
     """
-    # ── Step 1: Rule-based analysis ────────────────────────
-    console.print("[bold]Running rule-based analysis…[/bold]")
-    rules = load_rules()
-    rule_findings = evaluate_rules(
-        rules, db, scan_id,
-        suppressed_rules=getattr(settings, "suppressed_rules", None),
-    )
-    console.print(f"  Rules produced [yellow]{rule_findings}[/yellow] findings")
+    # Replace the previous results in one transaction: a re-run must not append a
+    # second set, and a failure part-way must leave the previous set in place.
+    with db.transaction():
+        db.clear_findings(scan_id)
 
-    # ── Step 2: LLM enrichment (if available) ──────────────
-    llm_recs = 0
+        # ── Step 1: Rule-based analysis ────────────────────────
+        console.print("[bold]Running rule-based analysis…[/bold]")
+        loaded = load_rules_checked()
+        if loaded.problems and not loaded.is_override:
+            # A broken packaged file would silently drop a whole domain, such as every
+            # SEC-* rule, and the report would read as clean.
+            raise RulesLoadError(
+                f"packaged rules failed to load from {loaded.rules_dir}: "
+                + ", ".join(loaded.problems)
+            )
+        rule_findings = evaluate_rules(
+            loaded.rules, db, scan_id,
+            suppressed_rules=getattr(settings, "suppressed_rules", None),
+        )
+        if loaded.problems:
+            # A custom rules directory is the user's own: run what loaded, but say
+            # what didn't, so the missing checks don't read as passes.
+            db.insert_finding(
+                scan_id=scan_id,
+                severity="INFO",
+                title="Some custom rules could not be loaded",
+                rule_id=RULES_LOAD_FINDING_ID,
+                detail=f"Skipped from {loaded.rules_dir}: " + ", ".join(loaded.problems),
+                remediation=(
+                    "Fix or remove the listed rules in STACKWISE_RULES_DIR. "
+                    "Their checks did not run."
+                ),
+            )
+            rule_findings += 1
+            console.print(
+                f"  [yellow]⚠ Skipped custom rules: {', '.join(loaded.problems)}[/yellow]"
+            )
+        console.print(f"  Rules produced [yellow]{rule_findings}[/yellow] findings")
 
-    if settings.engine == Engine.RULES_ONLY:
-        console.print("[dim]LLM engine disabled — skipping AI analysis[/dim]")
-    else:
-        # MLX not yet implemented; fall back to Ollama when MLX selected
-        if settings.engine == Engine.MLX:
-            console.print(
-                "[dim]MLX engine not yet implemented — using Ollama[/dim]"
-            )
-        client = OllamaClient(settings)
-        if not client.is_available():
-            console.print("[yellow]⚠ Ollama not reachable — skipping AI analysis[/yellow]")
-        elif not client.ensure_model():
-            console.print(
-                f"[yellow]⚠ Model '{settings.model}' not found in Ollama — "
-                f"run 'ollama pull {settings.model}' first[/yellow]"
-            )
+        # ── Step 2: LLM enrichment (if available) ──────────────
+        llm_recs = 0
+
+        if settings.engine == Engine.RULES_ONLY:
+            console.print("[dim]LLM engine disabled — skipping AI analysis[/dim]")
         else:
-            console.print(f"[bold]Running LLM analysis with {settings.model}…[/bold]")
-            llm_recs = _run_llm_analysis(client, db, scan_id, settings)
-            console.print(f"  LLM produced [green]{llm_recs}[/green] recommendations")
+            # MLX not yet implemented; fall back to Ollama when MLX selected
+            if settings.engine == Engine.MLX:
+                console.print(
+                    "[dim]MLX engine not yet implemented — using Ollama[/dim]"
+                )
+            client = OllamaClient(settings)
+            if not client.is_available():
+                console.print("[yellow]⚠ Ollama not reachable — skipping AI analysis[/yellow]")
+            elif not client.ensure_model():
+                console.print(
+                    f"[yellow]⚠ Model '{settings.model}' not found in Ollama — "
+                    f"run 'ollama pull {settings.model}' first[/yellow]"
+                )
+            else:
+                console.print(f"[bold]Running LLM analysis with {settings.model}…[/bold]")
+                # Only replaced when the LLM actually runs: a rules-only run, or one where
+                # Ollama is down, keeps the previous recommendations instead of losing them.
+                db.clear_llm_recommendations(scan_id)
+                llm_recs = _run_llm_analysis(client, db, scan_id, settings)
+                console.print(f"  LLM produced [green]{llm_recs}[/green] recommendations")
 
     return {
         "rule_findings": rule_findings,
