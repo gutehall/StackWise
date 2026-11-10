@@ -18,7 +18,7 @@
   resource_type: user
   service: iam
   condition: |
-    not resource.get('MFACheckFailed') and (not resource.get('MFADevices') or len(resource.get('MFADevices', [])) == 0)
+    not resource.get('MFACheckFailed') and (not resource.get('MFADevices') or len((resource.get('MFADevices') or [])) == 0)
   remediation: >
     Enable MFA for all IAM users with console access.
 
@@ -135,7 +135,7 @@
   resource_type: finding
   service: guardduty
   condition: |
-    resource.get('Severity', 0) >= 4
+    (resource.get('Severity') or 0) >= 4
   remediation: >
     Review and remediate high-severity GuardDuty findings.
 

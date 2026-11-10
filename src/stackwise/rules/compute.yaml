@@ -43,7 +43,7 @@
   resource_type: function
   service: lambda
   condition: |
-    resource.get('Runtime', '') in ('python3.8', 'python3.7', 'nodejs14.x', 'nodejs16.x', 'java8', 'dotnetcore3.1', 'ruby2.7', 'go1.x')
+    (resource.get('Runtime') or '') in ('python3.8', 'python3.7', 'nodejs14.x', 'nodejs16.x', 'java8', 'dotnetcore3.1', 'ruby2.7', 'go1.x')
   remediation: >
     Upgrade to a supported runtime to continue receiving security patches.
     See https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html
@@ -87,7 +87,7 @@
   resource_type: instance
   service: ec2
   condition: |
-    resource.get('MetadataOptions', {}).get('HttpTokens') != 'required'
+    (resource.get('MetadataOptions') or {}).get('HttpTokens') != 'required'
   remediation: >
     Require IMDSv2 to prevent SSRF attacks. Set HttpTokens to required.
 
@@ -107,7 +107,7 @@
   resource_type: function
   service: lambda
   condition: |
-    not resource.get('VpcConfig') or not resource.get('VpcConfig', {}).get('VpcId')
+    not resource.get('VpcConfig') or not (resource.get('VpcConfig') or {}).get('VpcId')
   remediation: >
     Place Lambda in VPC if it needs to access private resources.
 
@@ -117,7 +117,7 @@
   resource_type: function
   service: lambda
   condition: |
-    not resource.get('DeadLetterConfig') or not resource.get('DeadLetterConfig', {}).get('TargetArn')
+    not resource.get('DeadLetterConfig') or not (resource.get('DeadLetterConfig') or {}).get('TargetArn')
   remediation: >
     Configure a DLQ to capture failed invocations for debugging.
 
@@ -167,7 +167,7 @@
   resource_type: cluster
   service: eks
   condition: |
-    not resource.get('ClusterCheckFailed') and resource.get('resourcesVpcConfig', {}).get('endpointPublicAccess') is True
+    not resource.get('ClusterCheckFailed') and (resource.get('resourcesVpcConfig') or {}).get('endpointPublicAccess') is True
   remediation: >
     Disable public endpoint and use private access for production clusters.
 
@@ -190,7 +190,7 @@
   resource_type: nodegroup
   service: eks
   condition: |
-    not resource.get('NodegroupCheckFailed') and (not resource.get('scalingConfig') or resource.get('scalingConfig', {}).get('minSize') == resource.get('scalingConfig', {}).get('maxSize'))
+    not resource.get('NodegroupCheckFailed') and (not resource.get('scalingConfig') or (resource.get('scalingConfig') or {}).get('minSize') == (resource.get('scalingConfig') or {}).get('maxSize'))
   remediation: >
     Configure scaling to handle workload variations.
 
@@ -200,7 +200,7 @@
   resource_type: launch_template
   service: ec2
   condition: |
-    not resource.get('MetadataOptionsCheckFailed') and resource.get('MetadataOptions', {}).get('HttpTokens') != 'required'
+    not resource.get('MetadataOptionsCheckFailed') and (resource.get('MetadataOptions') or {}).get('HttpTokens') != 'required'
   remediation: >
     Require IMDSv2 (HttpTokens=required) in the launch template's default
     version to prevent SSRF attacks on instances launched from it.

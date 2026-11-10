@@ -7,7 +7,7 @@
   resource_type: tagged_resource
   service: resourcegroupstaggingapi
   condition: |
-    not resource.get('Tags') or len(resource.get('Tags', [])) == 0
+    not resource.get('Tags') or len((resource.get('Tags') or [])) == 0
   remediation: >
     Add cost allocation tags (e.g. Environment, Project) for cost tracking.
 

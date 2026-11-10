@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import glob
+import logging
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -863,3 +865,49 @@ def test_compute_optimizer_rules_use_live_fields(
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def _null_field_cases():
+    """For each rule, every field it reads set to None together, then one at a time."""
+    for rule in load_rules():
+        keys = sorted(set(re.findall(r"resource\.get\('(\w+)'", rule.condition)))
+        yield rule, {k: None for k in keys}
+        for key in keys:
+            yield rule, {key: None}
+
+
+def test_no_rule_raises_on_a_present_but_null_field(scan_db: ScanDB, caplog):
+    """dict.get(key, default) returns None, not the default, when the key is present
+    with a None value. A rule that then calls .get on it raised, was logged, and
+    silently produced no finding."""
+    failures = []
+    for rule, metadata in _null_field_cases():
+        scan = scan_db.create_scan("123", ["us-east-1"], ["all"])
+        scan_db.insert_resource(
+            scan.id, rule.service or "any", rule.resource_type, "r", "us-east-1",
+            metadata=metadata,
+        )
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="stackwise.analyzer.rules"):
+            evaluate_rules([rule], scan_db, scan.id)
+        if "failed on resource" in caplog.text:
+            failures.append((rule.id, sorted(metadata)))
+
+    assert failures == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"MetadataOptions": None}, True),
+        ({"MetadataOptions": {"HttpTokens": "optional"}}, True),
+        ({"MetadataOptions": {"HttpTokens": "required"}}, False),
+    ],
+)
+def test_cmp008_fires_when_metadata_options_is_null(scan_db: ScanDB, metadata, fires):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(scan.id, "ec2", "instance", "i-1", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == "CMP-008" for f in scan_db.get_findings(scan.id)) is fires

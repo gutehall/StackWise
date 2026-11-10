@@ -38,7 +38,7 @@
   resource_type: bucket
   service: s3
   condition: |
-    not resource.get('LifecycleCheckFailed') and (not resource.get('LifecycleRules') or len(resource.get('LifecycleRules', [])) == 0)
+    not resource.get('LifecycleCheckFailed') and (not resource.get('LifecycleRules') or len((resource.get('LifecycleRules') or [])) == 0)
   remediation: >
     Add lifecycle rules to transition or expire objects and reduce storage costs.
 
@@ -91,7 +91,7 @@
   resource_type: db_instance
   service: rds
   condition: |
-    resource.get('Engine', '').startswith('mysql') and (resource.get('EngineVersion', '') or '').startswith('5.')
+    (resource.get('Engine') or '').startswith('mysql') and ((resource.get('EngineVersion') or '') or '').startswith('5.')
   remediation: >
     Upgrade to a supported engine version for security patches.
 
@@ -122,7 +122,7 @@
   resource_type: table
   service: dynamodb
   condition: |
-    not resource.get('DescribeTableCheckFailed') and not resource.get('PointInTimeRecoveryCheckFailed') and resource.get('PointInTimeRecoveryDescription', {}).get('PointInTimeRecoveryStatus') != 'ENABLED'
+    not resource.get('DescribeTableCheckFailed') and not resource.get('PointInTimeRecoveryCheckFailed') and (resource.get('PointInTimeRecoveryDescription') or {}).get('PointInTimeRecoveryStatus') != 'ENABLED'
   remediation: >
     Enable point-in-time recovery for backup and restore capability.
 
@@ -132,7 +132,7 @@
   resource_type: table
   service: dynamodb
   condition: |
-    not resource.get('DescribeTableCheckFailed') and (not resource.get('SSEDescription') or resource.get('SSEDescription', {}).get('Status') != 'ENABLED')
+    not resource.get('DescribeTableCheckFailed') and (not resource.get('SSEDescription') or (resource.get('SSEDescription') or {}).get('Status') != 'ENABLED')
   remediation: >
     Enable encryption at rest for DynamoDB tables.
 
@@ -167,7 +167,7 @@
   resource_type: file_system
   service: efs
   condition: |
-    not resource.get('LifecycleCheckFailed') and (not resource.get('LifecyclePolicies') or len(resource.get('LifecyclePolicies', [])) == 0)
+    not resource.get('LifecycleCheckFailed') and (not resource.get('LifecyclePolicies') or len((resource.get('LifecyclePolicies') or [])) == 0)
   remediation: >
     Consider lifecycle policies to transition infrequently accessed files to Infrequent Access.
 
