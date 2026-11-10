@@ -9,6 +9,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from stackwise.scanner.base import BaseScanner
+from stackwise.scanner.tagging import store_tagged_resources
 from stackwise.store.db import ScanDB
 from stackwise.utils.aws import paginate, regional_client
 
@@ -46,24 +47,7 @@ class CostScanner(BaseScanner):
                 "get_resources",
                 "ResourceTagMappingList",
             )
-            for res in resources:
-                arn = res.get("ResourceARN", "")
-                res_id = arn.split("/")[-1] if "/" in arn else arn.split(":")[-1]
-                if not res_id:
-                    res_id = arn
-                db.insert_resource(
-                    scan_id=scan_id,
-                    service="resourcegroupstaggingapi",
-                    resource_type="tagged_resource",
-                    resource_id=res_id,
-                    region=region,
-                    arn=arn,
-                    metadata={
-                        "ResourceARN": arn,
-                        "Tags": res.get("Tags", []),
-                    },
-                )
-                count += 1
+            count += store_tagged_resources(db, scan_id, region, resources)
         except Exception as e:
             logger.debug("Tagged resources scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, "get_resources", e)

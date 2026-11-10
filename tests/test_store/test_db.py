@@ -403,3 +403,12 @@ def test_scan_left_in_wal_by_a_crash_still_opens_read_only(tmp_path: Path):
     finally:
         ro.close()
         db.conn.close()
+
+
+def test_insert_resource_if_new_reports_whether_it_created_a_row(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    args = (scan.id, "ec2", "instance", "i-1", "us-east-1")
+
+    assert scan_db.insert_resource_if_new(*args, metadata={"a": 1}) is True
+    assert scan_db.insert_resource_if_new(*args, metadata={"a": 2}) is False
+    assert [r.metadata for r in scan_db.get_resources(scan.id)] == [{"a": 1}]
