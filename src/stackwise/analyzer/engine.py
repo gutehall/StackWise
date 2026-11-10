@@ -114,6 +114,41 @@ def _normalize_title(title: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", title.lower()).split())
 
 
+class EngineUnavailableError(RuntimeError):
+    """The LLM engine the user asked for can't be used."""
+
+
+def _llm_client_or_none(settings: Settings) -> OllamaClient | None:
+    """Return a ready Ollama client, or None to run rules only.
+
+    Raises EngineUnavailableError when the user explicitly asked for an engine that
+    can't run. An auto-selected engine that turns out to be unavailable only warns.
+    """
+    if settings.engine == Engine.RULES_ONLY:
+        console.print("[dim]LLM engine disabled — skipping AI analysis[/dim]")
+        return None
+    if settings.engine == Engine.MLX:
+        # Never auto-selected, so reaching here means the user asked for it.
+        raise EngineUnavailableError(
+            "The MLX engine is not implemented yet. Use --engine ollama or --engine rules-only."
+        )
+    explicit = getattr(settings, "engine_explicit", False)
+    client = OllamaClient(settings)
+    if not client.is_available():
+        problem = f"Ollama is not reachable at {settings.ollama_url}"
+    elif not client.ensure_model():
+        problem = (
+            f"Model '{settings.model}' is not in Ollama. "
+            f"Run 'ollama pull {settings.model}' first"
+        )
+    else:
+        return client
+    if explicit:
+        raise EngineUnavailableError(f"{problem}.")
+    console.print(f"[yellow]⚠ {problem} — skipping AI analysis[/yellow]")
+    return None
+
+
 def run_analysis(settings: Settings, db: ScanDB, scan_id: str) -> dict:
     """Run full analysis pipeline: rules then optional LLM enrichment.
 
@@ -127,6 +162,9 @@ def run_analysis(settings: Settings, db: ScanDB, scan_id: str) -> dict:
     Returns:
         Summary dict with counts.
     """
+    # Before any work: an engine the user asked for but can't have fails the command.
+    client = _llm_client_or_none(settings)
+
     # Replace the previous results in one transaction: a re-run must not append a
     # second set, and a failure part-way must leave the previous set in place.
     with db.transaction():
@@ -169,40 +207,24 @@ def run_analysis(settings: Settings, db: ScanDB, scan_id: str) -> dict:
         # ── Step 2: LLM enrichment (if available) ──────────────
         llm_recs = 0
 
-        if settings.engine == Engine.RULES_ONLY:
-            console.print("[dim]LLM engine disabled — skipping AI analysis[/dim]")
-        else:
-            # MLX not yet implemented; fall back to Ollama when MLX selected
-            if settings.engine == Engine.MLX:
+        if client is not None:
+            console.print(f"[bold]Running LLM analysis with {settings.model}…[/bold]")
+            # Only replaced when the LLM actually runs: a rules-only run, or one where
+            # Ollama is down, keeps the previous recommendations instead of losing them.
+            db.clear_llm_recommendations(scan_id)
+            llm_result = _run_llm_analysis(client, db, scan_id, settings)
+            llm_recs = llm_result.count
+            failed = sorted(set(llm_result.failed_categories))
+            db.set_analysis_status(scan_id, "partial" if failed else "complete", failed)
+            if failed:
                 console.print(
-                    "[dim]MLX engine not yet implemented — using Ollama[/dim]"
-                )
-            client = OllamaClient(settings)
-            if not client.is_available():
-                console.print("[yellow]⚠ Ollama not reachable — skipping AI analysis[/yellow]")
-            elif not client.ensure_model():
-                console.print(
-                    f"[yellow]⚠ Model '{settings.model}' not found in Ollama — "
-                    f"run 'ollama pull {settings.model}' first[/yellow]"
+                    f"  [yellow]⚠ LLM analysis was partial: failed for "
+                    f"{', '.join(failed)}. Stored {llm_recs} recommendations "
+                    f"from the other categories.[/yellow]",
+                    soft_wrap=True,
                 )
             else:
-                console.print(f"[bold]Running LLM analysis with {settings.model}…[/bold]")
-                # Only replaced when the LLM actually runs: a rules-only run, or one where
-                # Ollama is down, keeps the previous recommendations instead of losing them.
-                db.clear_llm_recommendations(scan_id)
-                llm_result = _run_llm_analysis(client, db, scan_id, settings)
-                llm_recs = llm_result.count
-                failed = sorted(set(llm_result.failed_categories))
-                db.set_analysis_status(scan_id, "partial" if failed else "complete", failed)
-                if failed:
-                    console.print(
-                        f"  [yellow]⚠ LLM analysis was partial: failed for "
-                        f"{', '.join(failed)}. Stored {llm_recs} recommendations "
-                        f"from the other categories.[/yellow]",
-                        soft_wrap=True,
-                    )
-                else:
-                    console.print(f"  LLM produced [green]{llm_recs}[/green] recommendations")
+                console.print(f"  LLM produced [green]{llm_recs}[/green] recommendations")
 
     return {
         "rule_findings": rule_findings,

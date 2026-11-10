@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from stackwise.analyzer.engine import _normalize_title, _run_llm_analysis, run_analysis
+from stackwise.analyzer.engine import (
+    EngineUnavailableError,
+    _normalize_title,
+    _run_llm_analysis,
+    run_analysis,
+)
 from stackwise.analyzer.llm_client import LLMChunkError, OllamaClient
 from stackwise.analyzer.rules import RulesLoadError, load_rules_checked
 from stackwise.config import Engine, Settings
@@ -221,19 +226,48 @@ def test_run_analysis_model_not_found(scan_db: ScanDB, tmp_path: Path):
     assert result["llm_recommendations"] == 0
 
 
-def test_run_analysis_mlx_falls_back_to_ollama(scan_db: ScanDB, tmp_path: Path):
-    """MLX isn't implemented yet — selecting it must still go through the
-    Ollama client, with a message explaining the fallback."""
-    settings = Settings(engine=Engine.MLX, data_dir=tmp_path / "stackwise")
-    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+@pytest.mark.parametrize(
+    ("engine", "available", "has_model", "match"),
+    [
+        (Engine.MLX, True, True, "MLX engine is not implemented"),
+        (Engine.OLLAMA, False, True, "Ollama is not reachable"),
+        (Engine.OLLAMA, True, False, "is not in Ollama"),
+    ],
+    ids=["mlx", "ollama-down", "model-missing"],
+)
+def test_an_explicit_engine_that_cannot_run_fails_before_any_analysis(
+    scan_db: ScanDB, tmp_path: Path, engine, available, has_model, match
+):
+    settings = Settings(engine=engine, engine_explicit=True, data_dir=tmp_path / "stackwise")
+    scan_id = _scan_with_insecure_instances(scan_db)
+    run_analysis(Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "s"), scan_db, scan_id)
+    before = sorted(f.id for f in scan_db.get_findings(scan_id))
+    client = MagicMock()
+    client.is_available.return_value = available
+    client.ensure_model.return_value = has_model
 
-    mock_client = MagicMock()
-    mock_client.is_available.return_value = False
+    with (
+        patch("stackwise.analyzer.engine.OllamaClient", return_value=client),
+        pytest.raises(EngineUnavailableError, match=match),
+    ):
+        run_analysis(settings, scan_db, scan_id)
 
-    with patch("stackwise.analyzer.engine.OllamaClient", return_value=mock_client) as mock_cls:
-        run_analysis(settings, scan_db, scan.id)
+    assert sorted(f.id for f in scan_db.get_findings(scan_id)) == before
 
-    mock_cls.assert_called_once()
+
+def test_an_auto_selected_engine_that_is_down_falls_back_to_rules(
+    scan_db: ScanDB, tmp_path: Path
+):
+    settings = Settings(engine=Engine.OLLAMA, engine_explicit=False, data_dir=tmp_path / "s")
+    scan_id = _scan_with_insecure_instances(scan_db)
+    client = MagicMock()
+    client.is_available.return_value = False
+
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=client):
+        result = run_analysis(settings, scan_db, scan_id)
+
+    assert result["llm_recommendations"] == 0
+    assert result["rule_findings"] > 0
 
 
 def test_run_analysis_full_success_path_runs_llm(scan_db: ScanDB, tmp_path: Path):

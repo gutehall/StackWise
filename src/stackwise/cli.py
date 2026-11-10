@@ -199,7 +199,7 @@ def analyze(
     """Run rule-based + AI analysis on the latest scan."""
     from stackwise.analyzer.engine import run_analysis
 
-    settings = resolve_settings(
+    settings = _settings_or_exit(
         profile=profile, model=model, engine=engine,
         suppressed_rules=suppress,
     )
@@ -247,7 +247,7 @@ def report(
     """Generate reports from the latest analyzed scan."""
     from stackwise.report.generator import generate_report
 
-    settings = resolve_settings(profile=profile, output_dir=output_dir)
+    settings = _settings_or_exit(profile=profile, output_dir=output_dir)
     db_path, scan_id = _read_latest_scan(settings, account_id=account)
     if not db_path:
         console.print("[red]No scan found. Run 'stackwise scan' first.[/red]")
@@ -294,6 +294,11 @@ def run(
     output_dir: str | None = typer.Option(None, "--output-dir", "-o"),
 ) -> None:
     """Scan → analyze → report in one command."""
+    # Check every flag before scanning, so a typo can't fail the run after a full scan.
+    _settings_or_exit(
+        profile=profile, regions=regions, modules=modules, model=model, engine=engine,
+        suppressed_rules=suppress, output_dir=output_dir,
+    )
     scan(
         profile=profile, regions=regions, modules=modules,
         skip_cost_explorer=skip_cost_explorer,
@@ -335,7 +340,12 @@ def diff(
     """Compare two scans for drift detection (resources and findings)."""
     from stackwise.diff import diff_scans, previous_completed_scan
 
-    settings = resolve_settings(profile=profile)
+    output_format = output_format.lower()
+    if output_format not in ("text", "json"):
+        console.print(f"[red]Unknown diff format: {escape(output_format)}. Use text or json.[/red]")
+        raise typer.Exit(1)
+
+    settings = _settings_or_exit(profile=profile)
 
     if compare:
         compare_path = Path(compare)
@@ -459,7 +469,7 @@ def list_scans(
     that profile (scans are stored by account ID, not profile — there's no
     other way to know which account a profile maps to without a live AWS call).
     """
-    settings = resolve_settings(profile=profile)
+    settings = _settings_or_exit(profile=profile)
     scans_base = settings.data_dir / "scans"
     if not scans_base.exists():
         console.print("No scans found.")
@@ -528,6 +538,15 @@ def _write_latest_scan(settings, account_id: str, scan_id: str, db_path: Path) -
     last_account = _last_account_file(settings)
     last_account.parent.mkdir(parents=True, exist_ok=True)
     last_account.write_text(account_id)
+
+
+def _settings_or_exit(**kwargs):
+    """resolve_settings, but a bad flag value is an error message and exit 1."""
+    try:
+        return resolve_settings(**kwargs)
+    except ValueError as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
+        raise typer.Exit(1)
 
 
 def _open_scan(db_path: Path, scan_id: str, *, writable: bool = False) -> ScanDB:

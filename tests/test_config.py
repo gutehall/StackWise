@@ -126,12 +126,25 @@ def test_detect_platform_linux_without_nvidia(monkeypatch):
     assert info["has_nvidia"] is False
 
 
-def test_auto_select_engine_prefers_mlx_on_apple_silicon(monkeypatch):
+def test_auto_select_engine_never_picks_unimplemented_mlx(monkeypatch):
+    """MLX isn't implemented, so picking it would mean no LLM analysis at all."""
     monkeypatch.setattr("stackwise.config.platform.system", lambda: "Darwin")
     monkeypatch.setattr("stackwise.config.platform.machine", lambda: "arm64")
-    fake_mlx_lm = MagicMock()
-    with patch.dict(sys.modules, {"mlx_lm": fake_mlx_lm}):
-        assert auto_select_engine() == Engine.MLX
+    monkeypatch.setattr("stackwise.config.shutil.which", lambda name: None)
+    with patch.dict(sys.modules, {"mlx_lm": MagicMock()}):
+        assert auto_select_engine() == Engine.RULES_ONLY
+
+
+def test_unknown_engine_is_a_clear_error():
+    with pytest.raises(ValueError, match="Unknown engine: bogus. Valid engines: ollama"):
+        resolve_settings(engine="bogus")
+
+
+def test_engine_is_case_insensitive_and_marked_explicit(monkeypatch):
+    monkeypatch.setattr("stackwise.config.shutil.which", lambda name: None)
+    assert resolve_settings(engine="OLLAMA").engine == Engine.OLLAMA
+    assert resolve_settings(engine="ollama").engine_explicit is True
+    assert resolve_settings().engine_explicit is False
 
 
 def test_auto_select_engine_falls_back_to_ollama_without_mlx(monkeypatch):
@@ -154,3 +167,11 @@ def test_auto_select_engine_uses_ollama_on_linux_when_available(monkeypatch):
     monkeypatch.setattr("stackwise.config.platform.machine", lambda: "x86_64")
     monkeypatch.setattr("stackwise.config.shutil.which", lambda name: "/usr/local/bin/ollama")
     assert auto_select_engine() == Engine.OLLAMA
+
+
+def test_detect_platform_apple_silicon_has_metal(monkeypatch):
+    monkeypatch.setattr("stackwise.config.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("stackwise.config.platform.machine", lambda: "arm64")
+    info = detect_platform()
+    assert info["os"] == "darwin"
+    assert info["has_metal"] is True

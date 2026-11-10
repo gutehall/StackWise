@@ -1229,3 +1229,42 @@ def test_report_pdf_without_weasyprint_exits_1_and_writes_no_html(tmp_path: Path
     assert result.exit_code == 1
     assert "WeasyPrint" in result.output
     assert list(out.glob("*.html")) == [] and list(out.glob("*.pdf")) == []
+
+
+@pytest.mark.parametrize("engine", ["mlx", "bogus"])
+def test_analyze_with_an_unusable_engine_exits_1_cleanly(tmp_path: Path, monkeypatch, engine):
+    _scan_with_imds_findings(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["analyze", "--engine", engine])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "Analysis complete" not in result.output
+
+
+def test_run_with_an_unknown_engine_fails_before_scanning(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+
+    with patch("stackwise.cli.scan") as scan_cmd:
+        result = runner.invoke(app, ["run", "--engine", "bogus"])
+
+    assert result.exit_code == 1
+    assert "Unknown engine: bogus" in result.output
+    scan_cmd.assert_not_called()
+
+
+@mock_aws
+@pytest.mark.parametrize(("fmt", "exit_code"), [("foo", 1), ("JSON", 0), ("Text", 0)])
+def test_diff_format_is_checked_case_insensitively(tmp_path: Path, monkeypatch, fmt, exit_code):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    _scan_at(1)
+
+    result = runner.invoke(app, ["diff", "--format", fmt])
+
+    assert result.exit_code == exit_code, result.output
+    if exit_code:
+        assert "Unknown diff format" in result.output
+        assert "Resources" not in result.output
+    elif fmt == "JSON":
+        assert "resources_added" in json.loads(result.stdout)
