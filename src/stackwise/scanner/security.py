@@ -12,6 +12,9 @@ from stackwise.utils.aws import paginate, regional_client
 
 logger = logging.getLogger(__name__)
 
+# Resource id of the row stored for a region with no detector, so SEC-009 can report it.
+_NO_DETECTOR_ID = "no-detector"
+
 
 class SecurityScanner(BaseScanner):
     """Scan IAM roles/users, KMS keys, Secrets Manager, GuardDuty. Most are global (us-east-1)."""
@@ -30,7 +33,9 @@ class SecurityScanner(BaseScanner):
         # ── IAM (global) — only run in us-east-1 ──────────────
         if region == "us-east-1":
             count += self._scan_iam(session, db, scan_id, region)
-            count += self._scan_guardduty(session, db, scan_id, region)
+
+        # ── GuardDuty (regional) ──────────────────────────────
+        count += self._scan_guardduty(session, db, scan_id, region)
 
         # ── KMS (regional) ────────────────────────────────────
         count += self._scan_kms_regional(session, db, scan_id, region)
@@ -131,7 +136,7 @@ class SecurityScanner(BaseScanner):
                 )
                 count += 1
         except Exception as e:
-            logger.debug("IAM scan failed: %s", exc_info=True)
+            logger.debug("IAM scan failed", exc_info=True)
             self._record_list_failure(db, scan_id, region, operation, e)
         return count
 
@@ -183,7 +188,7 @@ class SecurityScanner(BaseScanner):
                 )
                 count += 1
         except Exception as e:
-            logger.debug("KMS scan failed in %s: %s", region, exc_info=True)
+            logger.debug("KMS scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, "list_keys", e)
         return count
 
@@ -216,7 +221,7 @@ class SecurityScanner(BaseScanner):
                 )
                 count += 1
         except Exception as e:
-            logger.debug("Secrets Manager scan failed in %s: %s", region, exc_info=True)
+            logger.debug("Secrets Manager scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, "list_secrets", e)
         return count
 
@@ -231,11 +236,27 @@ class SecurityScanner(BaseScanner):
         try:
             gd = regional_client(session, "guardduty", region)
             detectors = paginate(gd, "list_detectors", "DetectorIds")
+            if not detectors:
+                # The list succeeded and is empty, so GuardDuty is off in this region.
+                db.insert_resource(
+                    scan_id=scan_id,
+                    service="guardduty",
+                    resource_type="detector",
+                    resource_id=_NO_DETECTOR_ID,
+                    region=region,
+                    metadata={"Status": "NOT_FOUND", "DetectorCheckFailed": False},
+                )
+                count += 1
             for det_id in detectors:
+                metadata = {"DetectorId": det_id, "DetectorCheckFailed": False}
+                det: dict = {}
                 try:
                     det = gd.get_detector(DetectorId=det_id)
+                    metadata["Status"] = det.get("Status")
+                    metadata["FindingPublishingFrequency"] = det.get("FindingPublishingFrequency")
                 except Exception:
-                    continue
+                    logger.debug("get_detector failed for %s", det_id, exc_info=True)
+                    metadata["DetectorCheckFailed"] = True
                 db.insert_resource(
                     scan_id=scan_id,
                     service="guardduty",
@@ -246,17 +267,13 @@ class SecurityScanner(BaseScanner):
                         f"arn:aws:guardduty:{region}:"
                         f"{det.get('Service', {}).get('AccountId', '')}:detector/{det_id}"
                     ),
-                    metadata={
-                        "DetectorId": det_id,
-                        "Status": det.get("Status"),
-                        "FindingPublishingFrequency": det.get("FindingPublishingFrequency"),
-                    },
+                    metadata=metadata,
                 )
                 count += 1
                 count += self._scan_guardduty_findings(gd, db, scan_id, region, det_id)
 
         except Exception as e:
-            logger.debug("GuardDuty scan failed in %s: %s", region, exc_info=True)
+            logger.debug("GuardDuty scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, "list_detectors", e)
         return count
 
@@ -264,12 +281,19 @@ class SecurityScanner(BaseScanner):
         self, gd, db: ScanDB, scan_id: str, region: str, detector_id: str
     ) -> int:
         count = 0
-        operation = "list_findings"
         try:
             finding_ids = paginate(gd, "list_findings", "FindingIds", DetectorId=detector_id)
-            for i in range(0, len(finding_ids), 50):  # get_findings takes at most 50 IDs
-                batch = finding_ids[i : i + 50]
-                operation = "get_findings"
+        except Exception as e:
+            logger.debug(
+                "GuardDuty list_findings failed for detector %s in %s", detector_id, region,
+                exc_info=True,
+            )
+            self._record_list_failure(db, scan_id, region, "list_findings", e)
+            return count
+
+        for i in range(0, len(finding_ids), 50):  # get_findings takes at most 50 IDs
+            batch = finding_ids[i : i + 50]
+            try:
                 resp = gd.get_findings(DetectorId=detector_id, FindingIds=batch)
                 for f in resp.get("Findings", []):
                     finding_id = f.get("Id", "")
@@ -289,12 +313,13 @@ class SecurityScanner(BaseScanner):
                         },
                     )
                     count += 1
-        except Exception as e:
-            logger.debug(
-                "GuardDuty findings scan failed for detector %s in %s", detector_id, region,
-                exc_info=True,
-            )
-            self._record_list_failure(db, scan_id, region, operation, e)
+            except Exception as e:
+                # One bad batch must not lose the batches after it.
+                logger.debug(
+                    "GuardDuty get_findings failed for detector %s in %s", detector_id, region,
+                    exc_info=True,
+                )
+                self._record_list_failure(db, scan_id, region, "get_findings", e)
         return count
 
 

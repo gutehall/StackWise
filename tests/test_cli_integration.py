@@ -958,3 +958,102 @@ def test_reading_a_finished_scan_leaves_no_sidecar_files(tmp_path: Path, monkeyp
     assert runner.invoke(app, ["report", "--output-dir", str(tmp_path / "out")]).exit_code == 0
 
     assert [p for p in _account_dir(tmp_path).iterdir() if ".db-" in p.name] == []
+
+
+@pytest.mark.parametrize("output_format", ["html", "md", "json"])
+def test_reports_render_a_bucket_whose_region_is_unknown(
+    tmp_path: Path, monkeypatch, output_format: str
+):
+    db_path = tmp_path / "scan.db"
+    db = ScanDB(db_path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["data"])
+    db.insert_resource(
+        scan.id, "s3", "bucket", "b", "unknown", metadata={"LocationCheckFailed": True}
+    )
+    db.close()
+    _point_latest_at(db_path, scan.id, monkeypatch, tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "all", "--format", output_format,
+         "--output-dir", str(tmp_path / "out")],
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+@mock_aws
+def test_region_with_no_config_recorder_gets_one_finding(tmp_path: Path, monkeypatch):
+    """moto starts with no recorder, so this goes through the real scan and rules."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    args = ["scan", "--regions", "us-east-1", "--modules", "discovery"]
+    assert runner.invoke(app, args).exit_code == 0
+
+    result = runner.invoke(app, ["analyze", "--engine", "rules-only"])
+    assert result.exit_code == 0, result.output
+
+    db = ScanDB(_scan_files(tmp_path)[0], mode="ro")
+    try:
+        findings = db.get_findings(db.latest_scan().id)
+    finally:
+        db.close()
+    assert len([f for f in findings if f.rule_id == "DSC-001"]) == 1
+
+
+@mock_aws
+def test_failed_ecs_and_eks_describes_do_not_show_as_drift(tmp_path: Path, monkeypatch):
+    """A healthy scan, then one where every per-resource describe fails. The second
+    must pass and diff must show no change, which only holds if a flagged row keeps
+    the id a successful scan stores."""
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    iam = boto3.client("iam", region_name="us-east-1")
+    role_arn = iam.create_role(RoleName="r", AssumeRolePolicyDocument="{}")["Role"]["Arn"]
+    ec2 = boto3.client("ec2", region_name="us-east-1")
+    vpc_id = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
+    subnets = [
+        ec2.create_subnet(
+            VpcId=vpc_id, CidrBlock=f"10.0.{i}.0/24", AvailabilityZone=f"us-east-1{az}"
+        )["Subnet"]["SubnetId"]
+        for i, az in enumerate(("a", "b"), start=1)
+    ]
+    eks = boto3.client("eks", region_name="us-east-1")
+    eks.create_cluster(name="c1", roleArn=role_arn, resourcesVpcConfig={"subnetIds": subnets})
+    eks.create_nodegroup(clusterName="c1", nodegroupName="ng1", subnets=subnets, nodeRole=role_arn)
+    ecs = boto3.client("ecs", region_name="us-east-1")
+    ecs.create_cluster(clusterName="ecs1")
+    ecs.register_task_definition(
+        family="fam", containerDefinitions=[{"name": "c", "image": "nginx", "memory": 128}]
+    )
+    ecs.create_service(cluster="ecs1", serviceName="svc", taskDefinition="fam", desiredCount=1)
+
+    args = ["scan", "--regions", "us-east-1", "--modules", "compute"]
+    _scan_at(0, args)
+
+    failing = {"DescribeServices", "DescribeTaskDefinition", "DescribeCluster", "DescribeNodegroup"}
+
+    def _make_api_call(self, operation_name, api_params):
+        if operation_name in failing:
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, operation_name)
+        return _real_make_api_call(self, operation_name, api_params)
+
+    with patch.object(BaseClient, "_make_api_call", _make_api_call):
+        _scan_at(1, args)
+
+    result = runner.invoke(app, ["diff", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["resources_added"] == []
+    assert payload["resources_removed"] == []
+
+    healthy, flagged = _scan_files(tmp_path)
+    db = ScanDB(flagged, mode="ro")
+    try:
+        rows = db.get_resources(db.latest_scan().id)
+    finally:
+        db.close()
+    assert {r.resource_id for r in rows if r.service == "eks"} == {"c1", "c1/ng1"}
+    assert {r.resource_id for r in rows if r.service == "ecs"} == {"ecs1/svc", "fam:1"}
+    assert all(
+        any(k.endswith("CheckFailed") and v for k, v in r.metadata.items())
+        for r in rows if r.service in ("eks", "ecs")
+    )

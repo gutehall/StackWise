@@ -33,6 +33,7 @@ class NetworkScanner(BaseScanner):
         try:
             vpcs = paginate(ec2, "describe_vpcs", "Vpcs")
             flow_logs_by_vpc: dict[str, list] = {}
+            flow_logs_check_failed = False
             try:
                 flow_logs = paginate(ec2, "describe_flow_logs", "FlowLogs")
                 for fl in flow_logs:
@@ -41,10 +42,20 @@ class NetworkScanner(BaseScanner):
                         flow_logs_by_vpc.setdefault(rid, []).append(fl)
             except Exception:
                 logger.debug("describe_flow_logs failed in %s", region, exc_info=True)
+                flow_logs_check_failed = True
 
             for vpc in vpcs:
                 vpc_id = vpc["VpcId"]
-                fl_list = flow_logs_by_vpc.get(vpc_id, [])
+                metadata = {
+                    "VpcId": vpc_id,
+                    "CidrBlock": vpc.get("CidrBlock"),
+                    "IsDefault": vpc.get("IsDefault", False),
+                    "FlowLogsCheckFailed": flow_logs_check_failed,
+                }
+                if not flow_logs_check_failed:
+                    fl_list = flow_logs_by_vpc.get(vpc_id, [])
+                    metadata["FlowLogsEnabled"] = len(fl_list) > 0
+                    metadata["FlowLogs"] = fl_list
                 db.insert_resource(
                     scan_id=scan_id,
                     service="ec2",
@@ -52,13 +63,7 @@ class NetworkScanner(BaseScanner):
                     resource_id=vpc_id,
                     region=region,
                     arn=f"arn:aws:ec2:{region}:{vpc.get('OwnerId', '')}:vpc/{vpc_id}",
-                    metadata={
-                        "VpcId": vpc_id,
-                        "CidrBlock": vpc.get("CidrBlock"),
-                        "IsDefault": vpc.get("IsDefault", False),
-                        "FlowLogsEnabled": len(fl_list) > 0,
-                        "FlowLogs": fl_list,
-                    },
+                    metadata=metadata,
                 )
                 count += 1
         except Exception as e:
@@ -95,25 +100,33 @@ class NetworkScanner(BaseScanner):
             lbs = paginate(elbv2, "describe_load_balancers", "LoadBalancers")
             for lb in lbs:
                 lb_arn = lb["LoadBalancerArn"]
-                attrs: list[dict] = []
+                metadata = {
+                    "LoadBalancerName": lb.get("LoadBalancerName"),
+                    "Scheme": lb.get("Scheme"),
+                    "Type": lb.get("Type"),
+                    "State": lb.get("State", {}).get("Code"),
+                    "AttributesCheckFailed": False,
+                    "ListenersCheckFailed": False,
+                }
                 try:
                     attr_resp = elbv2.describe_load_balancer_attributes(
                         LoadBalancerArn=lb_arn
                     )
-                    attrs = attr_resp.get("Attributes", [])
+                    metadata["Attributes"] = attr_resp.get("Attributes", [])
                 except Exception:
                     logger.debug("describe_load_balancer_attributes failed for %s", lb_arn)
-                listeners: list[dict] = []
+                    metadata["AttributesCheckFailed"] = True
                 try:
                     listener_resp = paginate(
                         elbv2, "describe_listeners", "Listeners", LoadBalancerArn=lb_arn
                     )
-                    listeners = [
+                    metadata["Listeners"] = [
                         {"Protocol": lst.get("Protocol"), "Port": lst.get("Port")}
                         for lst in listener_resp
                     ]
                 except Exception:
                     logger.debug("describe_listeners failed for %s", lb_arn)
+                    metadata["ListenersCheckFailed"] = True
                 db.insert_resource(
                     scan_id=scan_id,
                     service="elbv2",
@@ -121,14 +134,7 @@ class NetworkScanner(BaseScanner):
                     resource_id=lb.get("LoadBalancerName", lb_arn),
                     region=region,
                     arn=lb_arn,
-                    metadata={
-                        "LoadBalancerName": lb.get("LoadBalancerName"),
-                        "Scheme": lb.get("Scheme"),
-                        "Type": lb.get("Type"),
-                        "State": lb.get("State", {}).get("Code"),
-                        "Attributes": attrs,
-                        "Listeners": listeners,
-                    },
+                    metadata=metadata,
                 )
                 count += 1
         except Exception as e:
@@ -173,19 +179,28 @@ class NetworkScanner(BaseScanner):
                     full = api
                 # Throttling on a REST API is set per-stage (default method settings
                 # under the "*/*" key) — there is no API-level throttle field, so we
-                # take the first stage that has one configured.
-                throttle: dict = {}
+                # take the first stage that has one configured. A limit of 0 is configured:
+                # it blocks all traffic.
+                metadata = {
+                    "id": api_id,
+                    "name": full.get("name", api.get("name")),
+                    "ApiKeySource": full.get("apiKeySource"),
+                    "ThrottleCheckFailed": False,
+                }
                 try:
+                    throttle: dict = {}
                     stages = apigw.get_stages(restApiId=api_id).get("item", [])
                     for stage in stages:
                         settings = stage.get("methodSettings", {}).get("*/*", {})
                         rate = settings.get("throttlingRateLimit")
                         burst = settings.get("throttlingBurstLimit")
-                        if rate or burst:
+                        if rate is not None or burst is not None:
                             throttle = {"rateLimit": rate, "burstLimit": burst}
                             break
+                    metadata["Throttle"] = throttle
                 except Exception:
                     logger.debug("get_stages failed for %s", api_id, exc_info=True)
+                    metadata["ThrottleCheckFailed"] = True
                 db.insert_resource(
                     scan_id=scan_id,
                     service="apigateway",
@@ -193,12 +208,7 @@ class NetworkScanner(BaseScanner):
                     resource_id=api_id,
                     region=region,
                     arn=f"arn:aws:apigateway:{region}::/restapis/{api_id}",
-                    metadata={
-                        "id": api_id,
-                        "name": full.get("name", api.get("name")),
-                        "ApiKeySource": full.get("apiKeySource"),
-                        "Throttle": throttle,
-                    },
+                    metadata=metadata,
                 )
                 count += 1
         except Exception as e:

@@ -473,3 +473,326 @@ def test_evaluate_rules_catches_runtime_exception_in_condition(scan_db: ScanDB):
 
     assert count == 0
     assert scan_db.get_findings(scan.id) == []
+
+
+_VPC = ("ec2", "vpc")
+_LB = ("elbv2", "load_balancer")
+_API = ("apigateway", "rest_api")
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like the insecure setting.
+        (_VPC, {"FlowLogsCheckFailed": True}, "NET-002", False),
+        (_LB, {"AttributesCheckFailed": True}, "NET-006", False),
+        (_LB, {"AttributesCheckFailed": True}, "NET-008", False),
+        (_LB, {"ListenersCheckFailed": True}, "NET-007", False),
+        (_API, {"ThrottleCheckFailed": True}, "NET-010", False),
+        # The real misconfiguration still fires.
+        (_VPC, {"FlowLogsCheckFailed": False, "FlowLogsEnabled": False, "FlowLogs": []},
+         "NET-002", True),
+        (_LB, {"AttributesCheckFailed": False, "Attributes": []}, "NET-006", True),
+        (_LB, {"AttributesCheckFailed": False,
+               "Attributes": [{"Key": "access_logs.s3.enabled", "Value": "false"}]},
+         "NET-006", True),
+        (_LB, {"AttributesCheckFailed": False, "Attributes": []}, "NET-008", True),
+        (_LB, {"ListenersCheckFailed": False, "Listeners": [{"Protocol": "HTTP", "Port": 80}]},
+         "NET-007", True),
+        (_API, {"ThrottleCheckFailed": False, "Throttle": {}}, "NET-010", True),
+        # A correct setting doesn't fire.
+        (_VPC, {"FlowLogsCheckFailed": False, "FlowLogsEnabled": True, "FlowLogs": [{}]},
+         "NET-002", False),
+        (_LB, {"AttributesCheckFailed": False,
+               "Attributes": [{"Key": "access_logs.s3.enabled", "Value": "true"}]},
+         "NET-006", False),
+        (_LB, {"AttributesCheckFailed": False,
+               "Attributes": [{"Key": "deletion_protection.enabled", "Value": "true"}]},
+         "NET-008", False),
+        (_LB, {"ListenersCheckFailed": False, "Listeners": [{"Protocol": "HTTPS", "Port": 443}]},
+         "NET-007", False),
+        # A limit of 0 blocks all traffic, so it counts as configured.
+        (_API, {"Throttle": {"rateLimit": 0, "burstLimit": None}}, "NET-010", False),
+        (_API, {"Throttle": {"rateLimit": None, "burstLimit": 0}}, "NET-010", False),
+        (_API, {"Throttle": {"rateLimit": 100, "burstLimit": 50}}, "NET-010", False),
+        # Older scans have no flag, and behave as before.
+        (_VPC, {"FlowLogsEnabled": False, "FlowLogs": []}, "NET-002", True),
+        (_API, {"Throttle": {}}, "NET-010", True),
+    ],
+)
+def test_network_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, kind: tuple[str, str], metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "res-1", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    found = any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id))
+    assert found is fires
+
+
+@pytest.mark.parametrize(
+    ("kind", "failed", "rule_id"),
+    [
+        (_VPC, {"FlowLogsCheckFailed": True}, "NET-012"),
+        (_LB, {"AttributesCheckFailed": True}, "NET-013"),
+        (_LB, {"ListenersCheckFailed": True}, "NET-013"),
+        (_API, {"ThrottleCheckFailed": True}, "NET-014"),
+    ],
+)
+def test_network_check_that_could_not_run_is_reported(
+    scan_db: ScanDB, kind: tuple[str, str], failed: dict, rule_id: str
+):
+    """A skipped check must stay visible, or the report reads as a clean pass."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    failing = scan_db.insert_resource(
+        scan.id, kind[0], kind[1], "bad", "us-east-1", metadata=failed
+    )
+    scan_db.insert_resource(
+        scan.id, kind[0], kind[1], "ok", "us-east-1",
+        metadata={name: False for name in failed},
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    matches = [f for f in scan_db.get_findings(scan.id) if f.rule_id == rule_id]
+    assert [f.resource_id for f in matches] == [failing.id]
+    assert matches[0].severity == "INFO"
+
+
+_TABLE = ("dynamodb", "table")
+_EFS = ("efs", "file_system")
+_TABLE_OK = {
+    "DescribeTableCheckFailed": False,
+    "PointInTimeRecoveryCheckFailed": False,
+    "SSEDescription": {"Status": "ENABLED"},
+    "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"},
+    "PointInTimeRecoveryDescription": {"PointInTimeRecoveryStatus": "ENABLED"},
+}
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like the insecure setting.
+        (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-011", False),
+        (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-012", False),
+        (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-013", False),
+        (_EFS, {"LifecycleCheckFailed": True}, "DAT-015", False),
+        # A PITR error skips only DAT-011: the other settings were read.
+        (_TABLE, {"PointInTimeRecoveryCheckFailed": True, "DescribeTableCheckFailed": False,
+                  "SSEDescription": {"Status": "ENABLED"}}, "DAT-011", False),
+        (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True,
+                  "SSEDescription": None}, "DAT-012", True),
+        (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True,
+                  "BillingModeSummary": {"BillingMode": "PROVISIONED"}}, "DAT-013", True),
+        # The real misconfiguration still fires.
+        (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryDescription":
+                  {"PointInTimeRecoveryStatus": "DISABLED"}}, "DAT-011", True),
+        (_TABLE, {**_TABLE_OK, "SSEDescription": None}, "DAT-012", True),
+        (_EFS, {"LifecycleCheckFailed": False, "LifecyclePolicies": []}, "DAT-015", True),
+        # A correct setting doesn't fire.
+        (_TABLE, _TABLE_OK, "DAT-011", False),
+        (_TABLE, _TABLE_OK, "DAT-012", False),
+        (_EFS, {"LifecycleCheckFailed": False,
+                "LifecyclePolicies": [{"TransitionToIA": "AFTER_30_DAYS"}]}, "DAT-015", False),
+        # Older scans have no flag, and behave as before.
+        (_EFS, {"LifecyclePolicies": []}, "DAT-015", True),
+        (_TABLE, {"SSEDescription": None}, "DAT-012", True),
+        # A check that could not run stays visible.
+        (_TABLE, {"DescribeTableCheckFailed": True}, "DAT-020", True),
+        (_TABLE, {**_TABLE_OK, "PointInTimeRecoveryCheckFailed": True}, "DAT-020", True),
+        (_TABLE, _TABLE_OK, "DAT-020", False),
+        (_EFS, {"LifecycleCheckFailed": True}, "DAT-021", True),
+        (_EFS, {"LifecycleCheckFailed": False, "LifecyclePolicies": []}, "DAT-021", False),
+    ],
+)
+def test_data_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, kind, metadata, rule_id, fires
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "res-1", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    found = any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id))
+    assert found is fires
+
+
+@pytest.mark.parametrize(
+    ("summary", "fires"),
+    [
+        (None, False),
+        ({"BillingMode": "PROVISIONED"}, True),
+        ({"BillingMode": "PAY_PER_REQUEST"}, False),
+    ],
+    ids=["no-summary", "provisioned", "on-demand"],
+)
+def test_dat013_handles_a_table_with_no_billing_summary(
+    scan_db: ScanDB, caplog, summary: dict | None, fires: bool
+):
+    """AWS can omit BillingModeSummary, so the scanner stores None. The rule must
+    evaluate cleanly on that row, not raise and get skipped."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(
+        scan.id, "dynamodb", "table", "t1", "us-east-1", metadata={"BillingModeSummary": summary}
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert "DAT-013" not in caplog.text
+    assert any(f.rule_id == "DAT-013" for f in scan_db.get_findings(scan.id)) is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        # A failed status check must not look like a stopped recorder.
+        ({"RecordingCheckFailed": True}, "DSC-001", False),
+        ({"RecordingCheckFailed": True}, "DSC-003", True),
+        # A recorder really not recording, or none at all, still fires.
+        ({"RecordingCheckFailed": False, "recording": False}, "DSC-001", True),
+        ({"RecordingCheckFailed": False, "recording": False, "RecorderAbsent": True},
+         "DSC-001", True),
+        ({"RecordingCheckFailed": False, "recording": False}, "DSC-003", False),
+        # A healthy recorder doesn't fire.
+        ({"RecordingCheckFailed": False, "recording": True}, "DSC-001", False),
+        # Older scans have no flag, and behave as before.
+        ({"recording": False}, "DSC-001", True),
+        ({"recording": True}, "DSC-001", False),
+    ],
+)
+def test_discovery_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["discovery"])
+    scan_db.insert_resource(scan.id, "config", "recorder", "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like a disabled detector.
+        ({"DetectorCheckFailed": True}, "SEC-009", False),
+        ({"DetectorCheckFailed": True}, "SEC-014", True),
+        # A disabled detector, or none at all, still fires.
+        ({"DetectorCheckFailed": False, "Status": "DISABLED"}, "SEC-009", True),
+        ({"DetectorCheckFailed": False, "Status": "NOT_FOUND"}, "SEC-009", True),
+        ({"DetectorCheckFailed": False, "Status": "DISABLED"}, "SEC-014", False),
+        # An enabled detector doesn't fire.
+        ({"DetectorCheckFailed": False, "Status": "ENABLED"}, "SEC-009", False),
+        # Older scans have no flag, and behave as before.
+        ({"Status": "DISABLED"}, "SEC-009", True),
+        ({"Status": "ENABLED"}, "SEC-009", False),
+    ],
+)
+def test_guardduty_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["security"])
+    scan_db.insert_resource(scan.id, "guardduty", "detector", "d", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like IMDSv1 allowed.
+        ({"MetadataOptionsCheckFailed": True}, "CMP-019", False),
+        ({"MetadataOptionsCheckFailed": True}, "CMP-020", True),
+        # A template that really allows IMDSv1 still fires, including no options set.
+        ({"MetadataOptionsCheckFailed": False, "MetadataOptions": {"HttpTokens": "optional"}},
+         "CMP-019", True),
+        ({"MetadataOptionsCheckFailed": False, "MetadataOptions": {}}, "CMP-019", True),
+        ({"MetadataOptionsCheckFailed": False, "MetadataOptions": {}}, "CMP-020", False),
+        # A template that requires IMDSv2 doesn't fire.
+        ({"MetadataOptionsCheckFailed": False, "MetadataOptions": {"HttpTokens": "required"}},
+         "CMP-019", False),
+        # Older scans have no flag, and behave as before.
+        ({"MetadataOptions": {}}, "CMP-019", True),
+        ({"MetadataOptions": {"HttpTokens": "required"}}, "CMP-019", False),
+    ],
+)
+def test_launch_template_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(
+        scan.id, "ec2", "launch_template", "lt", "us-east-1", metadata=metadata
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+_ECS_SVC = ("ecs", "service")
+_ECS_TD = ("ecs", "task_definition")
+_EKS_CLUSTER = ("eks", "cluster")
+_EKS_NG = ("eks", "nodegroup")
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # A failed check must not look like the setting. CMP-015, CMP-017 and CMP-018
+        # would all fire on a row with no values.
+        (_ECS_SVC, {"ServiceCheckFailed": True}, "CMP-014", False),
+        (_ECS_TD, {"TaskDefinitionCheckFailed": True}, "CMP-015", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": True}, "CMP-016", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": True}, "CMP-017", False),
+        (_EKS_NG, {"NodegroupCheckFailed": True}, "CMP-018", False),
+        # A check that could not run stays visible.
+        (_ECS_SVC, {"ServiceCheckFailed": True}, "CMP-021", True),
+        (_ECS_TD, {"TaskDefinitionCheckFailed": True}, "CMP-022", True),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": True}, "CMP-023", True),
+        (_EKS_NG, {"NodegroupCheckFailed": True}, "CMP-024", True),
+        # The real setting still fires.
+        (_ECS_SVC, {"ServiceCheckFailed": False, "launchType": "EC2"}, "CMP-014", True),
+        (_ECS_TD, {"TaskDefinitionCheckFailed": False, "cpu": 128, "memory": 2048},
+         "CMP-015", True),
+        (_ECS_TD, {"TaskDefinitionCheckFailed": False, "cpu": 512, "memory": 256},
+         "CMP-015", True),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False,
+                        "resourcesVpcConfig": {"endpointPublicAccess": True}}, "CMP-016", True),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.21"}, "CMP-017", True),
+        (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": None}, "CMP-018", True),
+        (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": {"minSize": 2, "maxSize": 2}},
+         "CMP-018", True),
+        # A correct setting doesn't fire, and neither do the visibility rules.
+        (_ECS_TD, {"TaskDefinitionCheckFailed": False, "cpu": 512, "memory": 2048},
+         "CMP-015", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.31"}, "CMP-017", False),
+        (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": {"minSize": 1, "maxSize": 3}},
+         "CMP-018", False),
+        (_ECS_SVC, {"ServiceCheckFailed": False}, "CMP-021", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.31"}, "CMP-023", False),
+        # Older scans have no flag, and behave as before.
+        (_ECS_SVC, {"launchType": "EC2"}, "CMP-014", True),
+        (_EKS_CLUSTER, {"version": "1.21"}, "CMP-017", True),
+    ],
+)
+def test_ecs_and_eks_rules_separate_failed_checks_from_misconfiguration(
+    scan_db: ScanDB, kind: tuple[str, str], metadata: dict, rule_id: str, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_rule_ids_are_unique():
+    """Suppression and diff key on the rule id, so a reused id ties two rules together."""
+    ids = [r.id for r in load_rules()]
+
+    assert sorted(i for i in set(ids) if ids.count(i) > 1) == []

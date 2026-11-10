@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import boto3
+import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
@@ -336,28 +338,99 @@ def test_secrets_manager_top_level_failure_does_not_raise(scan_db: ScanDB):
     ]
 
 
-def test_guardduty_get_detector_failure_skips_detector(scan_db: ScanDB):
-    """A get_detector failure for one detector must skip just that detector,
-    not raise out of _scan_guardduty."""
-    session = MagicMock()
-    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["security"])
+def _guardduty_paginate(detectors: list[str], findings: list[str] | None = None):
+    def _paginate(client, method, key, **kw):
+        return detectors if method == "list_detectors" else (findings or [])
 
+    return _paginate
+
+
+def test_guardduty_get_detector_failure_stores_flagged_detector(scan_db: ScanDB):
+    """A get_detector failure must keep the detector, flagged, with Status unset so
+    it can't look disabled, and must still collect that detector's findings."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["security"])
     gd = MagicMock()
     gd.get_detector.side_effect = RuntimeError("boom")
+    gd.get_findings.return_value = {"Findings": [{"Id": "f-1", "Severity": 8}]}
 
     with (
         patch("stackwise.scanner.security.regional_client", return_value=gd),
         patch(
             "stackwise.scanner.security.paginate",
-            side_effect=lambda client, method, key, **kw: (
-                ["det-1"] if method == "list_detectors" else []
-            ),
+            side_effect=_guardduty_paginate(["det-1"], ["f-1"]),
         ),
     ):
-        count = SecurityScanner()._scan_guardduty(session, scan_db, scan.id, "us-east-1")
+        count = SecurityScanner()._scan_guardduty(MagicMock(), scan_db, scan.id, "us-east-1")
 
-    assert count == 0
-    assert scan_db.get_resources(scan.id, service="guardduty") == []
+    assert count == 2
+    rows = {r.resource_id: r for r in scan_db.get_resources(scan.id, service="guardduty")}
+    assert rows["det-1"].metadata["DetectorCheckFailed"] is True
+    assert "Status" not in rows["det-1"].metadata
+    assert "f-1" in rows
+    assert scan_db.get_scan_errors(scan.id) == []
+
+
+def test_region_with_no_detector_stores_not_found(scan_db: ScanDB):
+    """A region with no detector must not look compliant."""
+    scan = scan_db.create_scan("123456789012", ["eu-west-1"], ["security"])
+
+    with (
+        patch("stackwise.scanner.security.regional_client", return_value=MagicMock()),
+        patch("stackwise.scanner.security.paginate", side_effect=_guardduty_paginate([])),
+    ):
+        count = SecurityScanner()._scan_guardduty(MagicMock(), scan_db, scan.id, "eu-west-1")
+
+    assert count == 1
+    row = scan_db.get_resources(scan.id, service="guardduty")[0]
+    assert (row.resource_id, row.region) == ("no-detector", "eu-west-1")
+    assert row.arn is None
+    assert row.metadata["Status"] == "NOT_FOUND"
+
+
+def test_failed_findings_batch_does_not_lose_the_others(scan_db: ScanDB):
+    """120 findings make three batches. The middle one fails: its failure is recorded,
+    and the batches either side are still stored."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["security"])
+    ids = [f"f-{i}" for i in range(120)]
+
+    def _get_findings(**kwargs):
+        if kwargs["FindingIds"][0] == "f-50":
+            raise RuntimeError("boom")
+        return {"Findings": [{"Id": fid} for fid in kwargs["FindingIds"]]}
+
+    gd = MagicMock()
+    gd.get_findings.side_effect = _get_findings
+
+    with patch("stackwise.scanner.security.paginate", return_value=ids):
+        count = SecurityScanner()._scan_guardduty_findings(
+            gd, scan_db, scan.id, "us-east-1", "det-1"
+        )
+
+    assert gd.get_findings.call_count == 3
+    assert count == 70
+    stored = {r.resource_id for r in scan_db.get_resources(scan.id, service="guardduty")}
+    assert "f-0" in stored and "f-100" in stored and "f-50" not in stored
+    assert [e.operation for e in scan_db.get_scan_errors(scan.id)] == ["get_findings"]
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["_scan_iam", "_scan_kms_regional", "_scan_secrets", "_scan_guardduty"],
+)
+def test_debug_log_of_a_failed_scan_has_the_traceback(scan_db: ScanDB, caplog, method: str):
+    """A stray %s with no argument made the log call itself raise TypeError. pytest's
+    log handler re-raises logging errors, so that fails here."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["security"])
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="stackwise.scanner.security"),
+        patch("stackwise.scanner.security.regional_client", return_value=MagicMock()),
+        patch("stackwise.scanner.security.paginate", side_effect=RuntimeError("the-aws-error")),
+    ):
+        getattr(SecurityScanner(), method)(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    assert any(r.exc_info for r in caplog.records)
+    assert "the-aws-error" in caplog.text
 
 
 def test_guardduty_top_level_failure_does_not_raise(scan_db: ScanDB):
@@ -413,20 +486,24 @@ def test_scan_region_runs_iam_and_guardduty_in_us_east_1(scan_db: ScanDB):
 
 
 @mock_aws
-def test_scan_region_skips_iam_and_guardduty_outside_us_east_1(scan_db: ScanDB):
-    """IAM and GuardDuty are global/mostly-global — _scan_region must only run
-    them in us-east-1, while KMS and Secrets Manager run in every region."""
+def test_scan_region_outside_us_east_1_skips_only_iam(scan_db: ScanDB):
+    """IAM is global, so it only runs in us-east-1. GuardDuty detectors are regional,
+    so a detector in another region must be stored."""
     session = boto3.Session(region_name="eu-west-1")
-    kms = session.client("kms", region_name="eu-west-1")
-    kms.create_key(Description="test-key")
+    session.client("kms", region_name="eu-west-1").create_key(Description="test-key")
+    gd = session.client("guardduty", region_name="eu-west-1")
+    det_id = gd.create_detector(Enable=False)["DetectorId"]
 
     scan = scan_db.create_scan("123456789012", ["eu-west-1"], ["security"])
     SecurityScanner()._scan_region(session, scan_db, scan.id, "eu-west-1")
 
     resources = scan_db.get_resources(scan.id)
     assert [r for r in resources if r.service == "iam"] == []
-    assert [r for r in resources if r.service == "guardduty"] == []
     assert [r for r in resources if r.service == "kms"] != []
+    detector = next(r for r in resources if r.service == "guardduty")
+    assert (detector.resource_id, detector.region) == (det_id, "eu-west-1")
+    assert detector.metadata["Status"] == "DISABLED"
+    assert detector.metadata["DetectorCheckFailed"] is False
 
 
 def test_iam_list_users_failure_names_the_operation(scan_db: ScanDB):

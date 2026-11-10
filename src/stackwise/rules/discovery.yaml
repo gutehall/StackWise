@@ -7,7 +7,7 @@
   resource_type: recorder
   service: config
   condition: |
-    resource.get('recording') is not True
+    not resource.get('RecordingCheckFailed') and resource.get('recording') is not True
   remediation: >
     Enable AWS Config recording for compliance and drift detection.
 
@@ -20,3 +20,16 @@
     not resource.get('Tags') or len(resource.get('Tags', [])) == 0
   remediation: >
     Add tags for resource discovery and cost allocation.
+
+# Checks that could not run
+- id: DSC-003
+  title: "AWS Config recorder status could not be verified"
+  severity: INFO
+  resource_type: recorder
+  service: config
+  condition: |
+    resource.get('RecordingCheckFailed')
+  remediation: >
+    The recorder status check failed (permissions or API error), so DSC-001 was skipped
+    for this recorder. Verify manually, and check for
+    config:DescribeConfigurationRecorderStatus.

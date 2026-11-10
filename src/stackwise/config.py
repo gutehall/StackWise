@@ -116,7 +116,7 @@ def resolve_settings(
     elif env_regions := os.environ.get("STACKWISE_REGIONS"):
         s.regions = [r.strip() for r in env_regions.split(",")]
 
-    # Always include us-east-1 for global/regional services (IAM, GuardDuty, etc.)
+    # Always include us-east-1 for global services (IAM, S3 listing, Cost Explorer)
     if "us-east-1" not in s.regions:
         s.regions = ["us-east-1"] + s.regions
 

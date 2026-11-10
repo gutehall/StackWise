@@ -24,6 +24,15 @@ _S3_NOT_CONFIGURED_CODES = {
 }
 
 
+# Stored as the region when get_bucket_location fails, rather than guessing one.
+# diff ignores a bucket's region, so a later real region isn't reported as drift.
+_S3_UNKNOWN_REGION = "unknown"
+
+# Legacy eu-west-1 buckets report this instead of a region name. A bucket in us-east-1
+# reports no constraint at all.
+_S3_LEGACY_LOCATIONS = {"EU": "eu-west-1"}
+
+
 def _s3_check_failed(bucket_name: str, method: str, error: Exception) -> bool:
     """True if *error* means the check genuinely couldn't be verified."""
     if isinstance(error, ClientError):
@@ -52,8 +61,18 @@ class S3Scanner(BaseScanner):
 
         s3_client = regional_client(session, "s3", "us-east-1")
         count = 0
+        buckets: list[dict] = []
         try:
-            buckets = s3_client.list_buckets().get("Buckets", [])
+            # Paged by hand: the list_buckets paginator is newer than the oldest boto3
+            # this package allows, and a missing paginator would fail the scan.
+            kwargs: dict = {}
+            while True:
+                resp = s3_client.list_buckets(**kwargs)
+                buckets.extend(resp.get("Buckets", []))
+                token = resp.get("ContinuationToken")
+                if not token:
+                    break
+                kwargs["ContinuationToken"] = token
         except Exception as e:
             logger.exception("S3 list_buckets failed")
             self._record_list_failure(db, scan_id, region, "list_buckets", e)
@@ -68,9 +87,13 @@ class S3Scanner(BaseScanner):
 
             try:
                 loc = s3_client.get_bucket_location(Bucket=bucket_name)
-                bucket_region = loc.get("LocationConstraint") or "us-east-1"
-            except Exception:
-                bucket_region = "us-east-1"
+                constraint = loc.get("LocationConstraint") or "us-east-1"
+                bucket_region = _S3_LEGACY_LOCATIONS.get(constraint, constraint)
+                metadata["LocationCheckFailed"] = False
+            except Exception as e:
+                logger.warning("get_bucket_location failed for bucket %s: %s", bucket_name, e)
+                bucket_region = _S3_UNKNOWN_REGION
+                metadata["LocationCheckFailed"] = True
 
             try:
                 ver = s3_client.get_bucket_versioning(Bucket=bucket_name)
@@ -219,34 +242,49 @@ class DynamoDBScanner(BaseScanner):
             ddb = regional_client(session, "dynamodb", region)
             tables = paginate(ddb, "list_tables", "TableNames")
             for table_name in tables:
+                # Always store the table: a failed lookup must not make it vanish, or
+                # diff reports it as removed.
+                metadata = {
+                    "TableName": table_name,
+                    "DescribeTableCheckFailed": False,
+                    "PointInTimeRecoveryCheckFailed": False,
+                }
+                arn = None
                 try:
-                    desc = ddb.describe_table(TableName=table_name)
-                    tbl = desc.get("Table", {})
-                    pitr = ddb.describe_continuous_backups(TableName=table_name)
-                    pitr_desc = pitr.get("ContinuousBackupsDescription", {})
-                    pitr_status = pitr_desc.get("PointInTimeRecoveryDescription", {}).get(
-                        "PointInTimeRecoveryStatus"
-                    )
-                    db.insert_resource(
-                        scan_id=scan_id,
-                        service="dynamodb",
-                        resource_type="table",
-                        resource_id=table_name,
-                        region=region,
-                        arn=tbl.get("TableArn"),
-                        metadata={
-                            "TableName": table_name,
-                            "TableStatus": tbl.get("TableStatus"),
-                            "BillingModeSummary": tbl.get("BillingModeSummary"),
-                            "SSEDescription": tbl.get("SSEDescription"),
-                            "PointInTimeRecoveryDescription": {
-                                "PointInTimeRecoveryStatus": pitr_status,
-                            },
-                        },
-                    )
-                    count += 1
+                    tbl = ddb.describe_table(TableName=table_name).get("Table", {})
                 except Exception:
-                    logger.debug("describe_table failed for %s", table_name)
+                    logger.debug("describe_table failed for %s", table_name, exc_info=True)
+                    metadata["DescribeTableCheckFailed"] = True
+                else:
+                    arn = tbl.get("TableArn")
+                    metadata["TableStatus"] = tbl.get("TableStatus")
+                    metadata["BillingModeSummary"] = tbl.get("BillingModeSummary")
+                    metadata["SSEDescription"] = tbl.get("SSEDescription")
+                    try:
+                        pitr = ddb.describe_continuous_backups(TableName=table_name)
+                        pitr_desc = pitr.get("ContinuousBackupsDescription", {})
+                        metadata["PointInTimeRecoveryDescription"] = {
+                            "PointInTimeRecoveryStatus": pitr_desc.get(
+                                "PointInTimeRecoveryDescription", {}
+                            ).get("PointInTimeRecoveryStatus"),
+                        }
+                    except Exception:
+                        logger.debug(
+                            "describe_continuous_backups failed for %s",
+                            table_name,
+                            exc_info=True,
+                        )
+                        metadata["PointInTimeRecoveryCheckFailed"] = True
+                db.insert_resource(
+                    scan_id=scan_id,
+                    service="dynamodb",
+                    resource_type="table",
+                    resource_id=table_name,
+                    region=region,
+                    arn=arn,
+                    metadata=metadata,
+                )
+                count += 1
         except Exception as e:
             logger.debug("DynamoDB scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, "list_tables", e)
@@ -275,14 +313,21 @@ class EFSScanner(BaseScanner):
             filesystems = paginate(efs, "describe_file_systems", "FileSystems")
             for fs in filesystems:
                 fs_id = fs.get("FileSystemId", "")
+                metadata = {
+                    "FileSystemId": fs_id,
+                    "Name": fs.get("Name"),
+                    "Encrypted": fs.get("Encrypted"),
+                    "LifeCycleState": fs.get("LifeCycleState"),
+                    "LifecycleCheckFailed": False,
+                }
                 try:
                     lc = efs.describe_lifecycle_configuration(FileSystemId=fs_id)
-                    lifecycle_policies = lc.get("LifecyclePolicies", [])
+                    metadata["LifecyclePolicies"] = lc.get("LifecyclePolicies", [])
                 except Exception:
                     logger.debug(
                         "describe_lifecycle_configuration failed for %s", fs_id, exc_info=True
                     )
-                    lifecycle_policies = []
+                    metadata["LifecycleCheckFailed"] = True
                 db.insert_resource(
                     scan_id=scan_id,
                     service="efs",
@@ -290,13 +335,7 @@ class EFSScanner(BaseScanner):
                     resource_id=fs_id,
                     region=region,
                     arn=fs.get("FileSystemArn"),
-                    metadata={
-                        "FileSystemId": fs_id,
-                        "Name": fs.get("Name"),
-                        "Encrypted": fs.get("Encrypted"),
-                        "LifeCycleState": fs.get("LifeCycleState"),
-                        "LifecyclePolicies": lifecycle_policies,
-                    },
+                    metadata=metadata,
                 )
                 count += 1
         except Exception as e:

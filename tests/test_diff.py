@@ -215,3 +215,65 @@ def test_filename_order_holds_across_the_old_and_new_naming(tmp_path: Path):
     assert previous_completed_scan(same_second) == old
     assert previous_completed_scan(later) == same_second
     assert previous_completed_scan(next_old) == later
+
+
+def _scan_with_bucket(path: Path, name: str, region: str, *, finding: bool = True) -> Path:
+    db = ScanDB(path)
+    scan = db.create_scan("123", ["us-east-1"], ["data"])
+    bucket = db.insert_resource(scan.id, "s3", "bucket", name, region, metadata={})
+    if finding:
+        db.insert_finding(
+            scan.id, "HIGH", "No versioning", resource_id=bucket.id, rule_id="DAT-001"
+        )
+    db.close()
+    return path
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("unknown", "eu-west-1"),  # a failed location lookup, then a healthy scan
+        ("eu-west-1", "unknown"),  # and the other way around
+        ("us-east-1", "eu-west-1"),  # an older scan that guessed us-east-1
+        ("EU", "eu-west-1"),  # an older scan that stored the raw constraint
+    ],
+)
+def test_bucket_with_a_different_stored_region_is_not_drift(
+    tmp_path: Path, before: str, after: str
+):
+    base = _scan_with_bucket(tmp_path / "a.db", "my-bucket", before)
+    compare = _scan_with_bucket(tmp_path / "b.db", "my-bucket", after)
+
+    result = diff_scans(base, compare)
+
+    assert result.resources_added == []
+    assert result.resources_removed == []
+    assert result.findings_added == []
+    assert result.findings_removed == []
+    assert result.findings_unchanged == 1
+
+
+def test_a_really_different_bucket_is_still_drift(tmp_path: Path):
+    base = _scan_with_bucket(tmp_path / "a.db", "old-bucket", "eu-west-1", finding=False)
+    compare = _scan_with_bucket(tmp_path / "b.db", "new-bucket", "eu-west-1", finding=False)
+
+    result = diff_scans(base, compare)
+
+    assert [r.resource_id for r in result.resources_added] == ["new-bucket"]
+    assert [r.resource_id for r in result.resources_removed] == ["old-bucket"]
+
+
+def test_region_still_matters_for_other_resources(tmp_path: Path):
+    """Most ids are only unique within a region, so region stays in their key."""
+    paths = []
+    for name, region in (("a.db", "us-east-1"), ("b.db", "eu-west-1")):
+        db = ScanDB(tmp_path / name)
+        scan = db.create_scan("123", ["us-east-1"], ["data"])
+        db.insert_resource(scan.id, "dynamodb", "table", "orders", region, metadata={})
+        db.close()
+        paths.append(tmp_path / name)
+
+    result = diff_scans(*paths)
+
+    assert [r.region for r in result.resources_added] == ["eu-west-1"]
+    assert [r.region for r in result.resources_removed] == ["us-east-1"]

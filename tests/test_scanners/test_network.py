@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import boto3
+import pytest
 from moto import mock_aws
 
 from stackwise.scanner.network import NetworkScanner
@@ -233,7 +234,8 @@ def test_deleted_nat_gateway_is_skipped(scan_db: ScanDB):
 @mock_aws
 def test_flow_logs_lookup_failure_still_stores_vpc(scan_db: ScanDB):
     """A describe_flow_logs failure is narrower than the outer VPC try/except —
-    the VPC itself must still be stored (as FlowLogsEnabled=False), not dropped."""
+    the VPC must still be stored, flagged, with the setting left unset rather than
+    looking like flow logs are off."""
     session = boto3.Session(region_name="us-east-1")
     ec2 = session.client("ec2", region_name="us-east-1")
     vpc_id = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
@@ -254,15 +256,17 @@ def test_flow_logs_lookup_failure_still_stores_vpc(scan_db: ScanDB):
         if r.resource_type == "vpc" and r.resource_id == vpc_id
     ]
     assert len(vpcs) == 1
-    assert vpcs[0].metadata["FlowLogsEnabled"] is False
+    assert vpcs[0].metadata["FlowLogsCheckFailed"] is True
+    assert "FlowLogsEnabled" not in vpcs[0].metadata
+    assert "FlowLogs" not in vpcs[0].metadata
     assert scan_db.get_scan_errors(scan.id) == []
 
 
 @mock_aws
 def test_lb_attribute_and_listener_failures_still_store_lb(scan_db: ScanDB):
     """describe_load_balancer_attributes and describe_listeners failures are each
-    narrower than the outer LB try/except — the LB must still be stored, with
-    empty Attributes/Listeners rather than being dropped entirely."""
+    narrower than the outer LB try/except — the LB must still be stored, flagged,
+    with the settings left unset rather than looking empty."""
     session = boto3.Session(region_name="us-east-1")
     ec2 = session.client("ec2", region_name="us-east-1")
     vpc_id = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
@@ -302,8 +306,10 @@ def test_lb_attribute_and_listener_failures_still_store_lb(scan_db: ScanDB):
         if r.resource_type == "load_balancer"
     ]
     assert len(lbs) == 1
-    assert lbs[0].metadata["Attributes"] == []
-    assert lbs[0].metadata["Listeners"] == []
+    assert lbs[0].metadata["AttributesCheckFailed"] is True
+    assert lbs[0].metadata["ListenersCheckFailed"] is True
+    assert "Attributes" not in lbs[0].metadata
+    assert "Listeners" not in lbs[0].metadata
 
 
 @mock_aws
@@ -330,9 +336,9 @@ def test_get_rest_api_failure_falls_back_to_summary(scan_db: ScanDB):
 
 
 @mock_aws
-def test_get_stages_failure_leaves_throttle_empty(scan_db: ScanDB):
+def test_get_stages_failure_flags_throttle(scan_db: ScanDB):
     """A get_stages failure must not crash the API Gateway scan — the API is
-    still stored, just with an empty (unverified) Throttle."""
+    still stored, flagged, with Throttle left unset."""
     session = boto3.Session(region_name="us-east-1")
     apigw = session.client("apigateway", region_name="us-east-1")
     apigw.create_rest_api(name="test-api")
@@ -348,7 +354,41 @@ def test_get_stages_failure_leaves_throttle_empty(scan_db: ScanDB):
         if r.resource_type == "rest_api"
     ]
     assert len(apis) == 1
-    assert apis[0].metadata["Throttle"] == {}
+    assert apis[0].metadata["ThrottleCheckFailed"] is True
+    assert "Throttle" not in apis[0].metadata
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        ({"throttlingRateLimit": 0}, {"rateLimit": 0, "burstLimit": None}),
+        ({"throttlingBurstLimit": 0}, {"rateLimit": None, "burstLimit": 0}),
+        ({}, {}),
+    ],
+    ids=["rate-zero", "burst-zero", "none"],
+)
+def test_throttle_limit_of_zero_counts_as_configured(
+    scan_db: ScanDB, settings: dict, expected: dict
+):
+    """A limit of 0 blocks all traffic, so it is configured, not missing."""
+    session = MagicMock()
+    apigw = MagicMock()
+    apigw.get_rest_api.return_value = {"name": "api"}
+    apigw.get_stages.return_value = {"item": [{"methodSettings": {"*/*": settings}}]}
+
+    def _paginate(client, method, key, **kw):
+        return [{"id": "api-1"}] if method == "get_rest_apis" else []
+
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["network"])
+    with (
+        patch("stackwise.scanner.network.regional_client", return_value=apigw),
+        patch("stackwise.scanner.network.paginate", side_effect=_paginate),
+    ):
+        NetworkScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    api = scan_db.get_resources(scan.id, service="apigateway")[0]
+    assert api.metadata["Throttle"] == expected
+    assert api.metadata["ThrottleCheckFailed"] is False
 
 
 def test_top_level_api_failures_degrade_gracefully(scan_db: ScanDB):

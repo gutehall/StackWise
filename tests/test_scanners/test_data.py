@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import boto3
+import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
@@ -160,9 +161,9 @@ def test_s3_list_buckets_top_level_failure_returns_zero(scan_db: ScanDB):
     ]
 
 
-def test_s3_get_bucket_location_failure_defaults_region(scan_db: ScanDB):
-    """A get_bucket_location failure must fall back to us-east-1 rather than
-    dropping the bucket."""
+def test_s3_get_bucket_location_failure_does_not_invent_a_region(scan_db: ScanDB):
+    """A get_bucket_location failure must keep the bucket, flagged, without guessing
+    us-east-1: region is part of the stored identity."""
     session = MagicMock()
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
 
@@ -188,8 +189,78 @@ def test_s3_get_bucket_location_failure_defaults_region(scan_db: ScanDB):
 
     resources = scan_db.get_resources(scan.id, service="s3")
     bucket = next(r for r in resources if r.resource_id == "test-bucket")
-    assert bucket.region == "us-east-1"
+    assert bucket.region == "unknown"
+    assert bucket.metadata["LocationCheckFailed"] is True
     assert scan_db.get_scan_errors(scan.id) == []
+
+
+def _s3_client_with_no_optional_config() -> MagicMock:
+    client = MagicMock()
+    client.get_bucket_versioning.return_value = {}
+    client.get_bucket_encryption.return_value = {}
+    client.get_public_access_block.return_value = {}
+    client.get_bucket_lifecycle_configuration.return_value = {}
+    client.get_bucket_location.return_value = {"LocationConstraint": "eu-north-1"}
+    return client
+
+
+def test_s3_second_page_of_buckets_is_stored(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+    s3_client = _s3_client_with_no_optional_config()
+    s3_client.list_buckets.side_effect = [
+        {"Buckets": [{"Name": "first"}], "ContinuationToken": "page-2"},
+        {"Buckets": [{"Name": "second"}], "ContinuationToken": "page-3"},
+        {"Buckets": [{"Name": "third"}]},
+    ]
+
+    with patch("stackwise.scanner.data.regional_client", return_value=s3_client):
+        count = S3Scanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    assert count == 3
+    stored = {r.resource_id for r in scan_db.get_resources(scan.id, service="s3")}
+    assert stored == {"first", "second", "third"}
+    assert [c.kwargs for c in s3_client.list_buckets.call_args_list] == [
+        {},
+        {"ContinuationToken": "page-2"},
+        {"ContinuationToken": "page-3"},
+    ]
+
+
+def test_s3_failure_on_a_later_page_fails_the_list(scan_db: ScanDB):
+    """Part of a bucket list must not look like the whole account."""
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+    s3_client = _s3_client_with_no_optional_config()
+    s3_client.list_buckets.side_effect = [
+        {"Buckets": [{"Name": "first"}], "ContinuationToken": "page-2"},
+        RuntimeError("boom"),
+    ]
+
+    with patch("stackwise.scanner.data.regional_client", return_value=s3_client):
+        S3Scanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
+        ("s3", "list_buckets"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("constraint", "region"),
+    [("EU", "eu-west-1"), (None, "us-east-1"), ("", "us-east-1"), ("eu-west-1", "eu-west-1")],
+)
+def test_s3_location_constraint_becomes_a_real_region(
+    scan_db: ScanDB, constraint: str | None, region: str
+):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+    s3_client = _s3_client_with_no_optional_config()
+    s3_client.list_buckets.return_value = {"Buckets": [{"Name": "b"}]}
+    s3_client.get_bucket_location.return_value = {"LocationConstraint": constraint}
+
+    with patch("stackwise.scanner.data.regional_client", return_value=s3_client):
+        S3Scanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    bucket = scan_db.get_resources(scan.id, service="s3")[0]
+    assert bucket.region == region
+    assert bucket.metadata["LocationCheckFailed"] is False
 
 
 def test_s3_versioning_check_failure_is_flagged(scan_db: ScanDB):
@@ -367,28 +438,68 @@ def test_dynamodb_table_without_pitr_reports_disabled(scan_db: ScanDB):
     )
 
 
-def test_dynamodb_describe_table_failure_does_not_abort_scan(scan_db: ScanDB):
-    """A describe_table failure for one table must not stop the scan of
-    others (or raise out of _scan_region)."""
+def test_dynamodb_describe_table_failure_stores_flagged_row(scan_db: ScanDB):
+    """A describe_table failure must keep the table visible, flagged, and must not
+    stop the scan of the others."""
     session = MagicMock()
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
 
+    def _describe_table(**kwargs):
+        if kwargs["TableName"] == "broken-table":
+            raise RuntimeError("boom")
+        return {"Table": {"TableStatus": "ACTIVE", "SSEDescription": {"Status": "ENABLED"}}}
+
     ddb = MagicMock()
-    ddb.describe_table.side_effect = RuntimeError("boom")
+    ddb.describe_table.side_effect = _describe_table
+    ddb.describe_continuous_backups.return_value = {}
 
     with (
         patch("stackwise.scanner.data.regional_client", return_value=ddb),
         patch(
             "stackwise.scanner.data.paginate",
             side_effect=lambda client, method, key, **kw: (
-                ["broken-table"] if method == "list_tables" else []
+                ["broken-table", "good-table"] if method == "list_tables" else []
             ),
         ),
     ):
         count = DynamoDBScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
 
-    assert count == 0
-    assert scan_db.get_resources(scan.id, service="dynamodb") == []
+    assert count == 2
+    rows = {r.resource_id: r.metadata for r in scan_db.get_resources(scan.id, service="dynamodb")}
+    assert rows["broken-table"] == {
+        "TableName": "broken-table",
+        "DescribeTableCheckFailed": True,
+        "PointInTimeRecoveryCheckFailed": False,
+    }
+    assert rows["good-table"]["DescribeTableCheckFailed"] is False
+    assert scan_db.get_scan_errors(scan.id) == []
+
+
+def test_dynamodb_continuous_backups_failure_keeps_the_table(scan_db: ScanDB):
+    """AccessDenied on DescribeContinuousBackups must only lose the PITR check, not
+    the settings describe_table already returned."""
+    session = MagicMock()
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+
+    ddb = MagicMock()
+    ddb.describe_table.return_value = {
+        "Table": {"TableArn": "arn:table", "SSEDescription": {"Status": "ENABLED"}}
+    }
+    ddb.describe_continuous_backups.side_effect = RuntimeError("denied")
+
+    with (
+        patch("stackwise.scanner.data.regional_client", return_value=ddb),
+        patch("stackwise.scanner.data.paginate", return_value=["t1"]),
+    ):
+        count = DynamoDBScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    assert count == 1
+    table = scan_db.get_resources(scan.id, service="dynamodb")[0]
+    assert table.arn == "arn:table"
+    assert table.metadata["SSEDescription"] == {"Status": "ENABLED"}
+    assert table.metadata["PointInTimeRecoveryCheckFailed"] is True
+    assert table.metadata["DescribeTableCheckFailed"] is False
+    assert "PointInTimeRecoveryDescription" not in table.metadata
     assert scan_db.get_scan_errors(scan.id) == []
 
 
@@ -410,8 +521,8 @@ def test_dynamodb_top_level_failure_does_not_raise(scan_db: ScanDB):
 
 
 def test_efs_lifecycle_lookup_failure_still_stores_filesystem(scan_db: ScanDB):
-    """A describe_lifecycle_configuration failure must not drop the file
-    system — it should still be stored with an empty LifecyclePolicies list."""
+    """A describe_lifecycle_configuration failure must not drop the file system,
+    and must be flagged rather than look like no policies exist."""
     session = MagicMock()
     scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
 
@@ -431,7 +542,8 @@ def test_efs_lifecycle_lookup_failure_still_stores_filesystem(scan_db: ScanDB):
 
     resources = scan_db.get_resources(scan.id, service="efs")
     fs = next(r for r in resources if r.resource_id == "fs-1")
-    assert fs.metadata["LifecyclePolicies"] == []
+    assert fs.metadata["LifecycleCheckFailed"] is True
+    assert "LifecyclePolicies" not in fs.metadata
 
 
 def test_efs_top_level_failure_does_not_raise(scan_db: ScanDB):

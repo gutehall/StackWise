@@ -104,6 +104,9 @@ class EC2Scanner(BaseScanner):
                 lt_id = lt["LaunchTemplateId"]
                 default_version = lt.get("DefaultVersionNumber")
                 launch_template_data: dict = {}
+                # Stays set unless the default version is actually read: an empty result
+                # tells us nothing about the template's settings either.
+                metadata_check_failed = True
                 if default_version is not None:
                     try:
                         versions = ec2.describe_launch_template_versions(
@@ -111,25 +114,29 @@ class EC2Scanner(BaseScanner):
                         ).get("LaunchTemplateVersions", [])
                         if versions:
                             launch_template_data = versions[0].get("LaunchTemplateData", {})
+                            metadata_check_failed = False
                     except Exception:
                         logger.debug(
                             "describe_launch_template_versions failed for %s", lt_id,
                             exc_info=True,
                         )
+                metadata = {
+                    "LaunchTemplateId": lt_id,
+                    "LaunchTemplateName": lt.get("LaunchTemplateName"),
+                    "DefaultVersionNumber": default_version,
+                    "LatestVersionNumber": lt.get("LatestVersionNumber"),
+                    "EbsOptimized": launch_template_data.get("EbsOptimized"),
+                    "MetadataOptionsCheckFailed": metadata_check_failed,
+                }
+                if not metadata_check_failed:
+                    metadata["MetadataOptions"] = launch_template_data.get("MetadataOptions", {})
                 db.insert_resource(
                     scan_id=scan_id,
                     service="ec2",
                     resource_type="launch_template",
                     resource_id=lt_id,
                     region=region,
-                    metadata={
-                        "LaunchTemplateId": lt_id,
-                        "LaunchTemplateName": lt.get("LaunchTemplateName"),
-                        "DefaultVersionNumber": default_version,
-                        "LatestVersionNumber": lt.get("LatestVersionNumber"),
-                        "MetadataOptions": launch_template_data.get("MetadataOptions", {}),
-                        "EbsOptimized": launch_template_data.get("EbsOptimized"),
-                    },
+                    metadata=metadata,
                 )
                 count += 1
         except Exception as e:
@@ -215,67 +222,98 @@ class ECSScanner(BaseScanner):
                 for svc_arn in svc_arns:
                     if not svc_arn:
                         continue
+                    # The name in the ARN is the name describe_services returns, so a
+                    # flagged row keeps the identity a successful scan would store.
+                    arn_name = svc_arn.split("/")[-1]
                     try:
-                        desc = ecs.describe_services(
+                        svcs = ecs.describe_services(
                             cluster=cluster_arn,
                             services=[svc_arn],
-                        )
-                        for svc in desc.get("services", []):
-                            svc_name = svc.get("serviceName", svc_arn.split("/")[-1])
-                            db.insert_resource(
-                                scan_id=scan_id,
-                                service="ecs",
-                                resource_type="service",
-                                resource_id=f"{cluster_name}/{svc_name}",
-                                region=region,
-                                arn=svc.get("serviceArn"),
-                                metadata={
-                                    "serviceName": svc_name,
-                                    "clusterArn": cluster_arn,
-                                    "launchType": svc.get("launchType"),
-                                    "desiredCount": svc.get("desiredCount"),
-                                    "runningCount": svc.get("runningCount"),
-                                },
-                            )
-                            count += 1
+                        ).get("services", [])
                     except Exception:
-                        logger.debug("describe_services failed for %s", svc_arn)
+                        logger.debug("describe_services failed for %s", svc_arn, exc_info=True)
+                        db.insert_resource(
+                            scan_id=scan_id,
+                            service="ecs",
+                            resource_type="service",
+                            resource_id=f"{cluster_name}/{arn_name}",
+                            region=region,
+                            arn=svc_arn,
+                            metadata={
+                                "serviceName": arn_name,
+                                "clusterArn": cluster_arn,
+                                "ServiceCheckFailed": True,
+                            },
+                        )
+                        count += 1
+                        continue
+                    for svc in svcs:
+                        svc_name = svc.get("serviceName", arn_name)
+                        db.insert_resource(
+                            scan_id=scan_id,
+                            service="ecs",
+                            resource_type="service",
+                            resource_id=f"{cluster_name}/{svc_name}",
+                            region=region,
+                            arn=svc.get("serviceArn"),
+                            metadata={
+                                "serviceName": svc_name,
+                                "clusterArn": cluster_arn,
+                                "launchType": svc.get("launchType"),
+                                "desiredCount": svc.get("desiredCount"),
+                                "runningCount": svc.get("runningCount"),
+                                "ServiceCheckFailed": False,
+                            },
+                        )
+                        count += 1
 
             operation = "list_task_definitions"
             task_def_arns = paginate(ecs, "list_task_definitions", "taskDefinitionArns")
             for td_arn in task_def_arns:
                 try:
-                    desc = ecs.describe_task_definition(
+                    td = ecs.describe_task_definition(
                         taskDefinition=td_arn,
-                    )
-                    td = desc.get("taskDefinition", {})
-                    td_family = td.get("family", td_arn.split("/")[-1].rsplit(":", 1)[0])
-                    td_revision = td.get("revision")
-                    # Include the revision in the identity: each revision is a
-                    # distinct AWS resource (own ARN), and collapsing them onto
-                    # the shared family name would make diff_scans silently miss
-                    # added/removed revisions.
-                    resource_id = (
-                        f"{td_family}:{td_revision}" if td_revision is not None else td_family
-                    )
+                    ).get("taskDefinition", {})
+                except Exception:
+                    logger.debug("describe_task_definition failed for %s", td_arn, exc_info=True)
+                    # The ARN ends in family:revision, the id a successful scan stores.
                     db.insert_resource(
                         scan_id=scan_id,
                         service="ecs",
                         resource_type="task_definition",
-                        resource_id=resource_id,
+                        resource_id=td_arn.split("/")[-1],
                         region=region,
-                        arn=td.get("taskDefinitionArn"),
-                        metadata={
-                            "family": td_family,
-                            "revision": td_revision,
-                            "cpu": _to_int(td.get("cpu")),
-                            "memory": _to_int(td.get("memory")),
-                            "status": td.get("status"),
-                        },
+                        arn=td_arn,
+                        metadata={"TaskDefinitionCheckFailed": True},
                     )
                     count += 1
-                except Exception:
-                    logger.debug("describe_task_definition failed for %s", td_arn)
+                    continue
+                td_family = td.get("family", td_arn.split("/")[-1].rsplit(":", 1)[0])
+                td_revision = td.get("revision")
+                # Include the revision in the identity: each revision is a
+                # distinct AWS resource (own ARN), and collapsing them onto
+                # the shared family name would make diff_scans silently miss
+                # added/removed revisions.
+                resource_id = (
+                    f"{td_family}:{td_revision}" if td_revision is not None else td_family
+                )
+                db.insert_resource(
+                    scan_id=scan_id,
+                    service="ecs",
+                    resource_type="task_definition",
+                    resource_id=resource_id,
+                    region=region,
+                    arn=td.get("taskDefinitionArn"),
+                    metadata={
+                        "family": td_family,
+                        "revision": td_revision,
+                        "cpu": _to_int(td.get("cpu")),
+                        "memory": _to_int(td.get("memory")),
+                        "status": td.get("status"),
+                        "TaskDefinitionCheckFailed": False,
+                    },
+                )
+                count += 1
         except Exception as e:
             logger.debug("ECS scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, operation, e)
@@ -300,63 +338,76 @@ class EKSScanner(BaseScanner):
             eks = regional_client(session, "eks", region)
             clusters = paginate(eks, "list_clusters", "clusters")
             for cluster_name in clusters:
+                metadata = {"name": cluster_name, "ClusterCheckFailed": False}
+                arn = None
                 try:
-                    desc = eks.describe_cluster(name=cluster_name)
-                    cluster = desc.get("cluster", {})
-                    db.insert_resource(
-                        scan_id=scan_id,
-                        service="eks",
-                        resource_type="cluster",
-                        resource_id=cluster_name,
-                        region=region,
-                        arn=cluster.get("arn"),
-                        metadata={
-                            "name": cluster_name,
-                            "version": cluster.get("version"),
-                            "status": cluster.get("status"),
-                            "resourcesVpcConfig": cluster.get("resourcesVpcConfig", {}),
-                        },
-                    )
-                    count += 1
+                    cluster = eks.describe_cluster(name=cluster_name).get("cluster", {})
+                    arn = cluster.get("arn")
+                    metadata["version"] = cluster.get("version")
+                    metadata["status"] = cluster.get("status")
+                    metadata["resourcesVpcConfig"] = cluster.get("resourcesVpcConfig", {})
+                except Exception:
+                    logger.debug("describe_cluster failed for %s", cluster_name, exc_info=True)
+                    metadata["ClusterCheckFailed"] = True
+                db.insert_resource(
+                    scan_id=scan_id,
+                    service="eks",
+                    resource_type="cluster",
+                    resource_id=cluster_name,
+                    region=region,
+                    arn=arn,
+                    metadata=metadata,
+                )
+                count += 1
 
+                try:
                     nodegroups = paginate(
                         eks,
                         "list_nodegroups",
                         "nodegroups",
                         clusterName=cluster_name,
                     )
-                    for ng_name in nodegroups:
-                        try:
-                            ng_desc = eks.describe_nodegroup(
-                                clusterName=cluster_name,
-                                nodegroupName=ng_name,
-                            )
-                            ng = ng_desc.get("nodegroup", {})
-                            db.insert_resource(
-                                scan_id=scan_id,
-                                service="eks",
-                                resource_type="nodegroup",
-                                resource_id=f"{cluster_name}/{ng_name}",
-                                region=region,
-                                arn=ng.get("nodegroupArn"),
-                                metadata={
-                                    "nodegroupName": ng_name,
-                                    "clusterName": cluster_name,
-                                    "scalingConfig": ng.get("scalingConfig"),
-                                    "status": ng.get("status"),
-                                },
-                            )
-                            count += 1
-                        except Exception:
-                            logger.debug(
-                                "describe_nodegroup failed for %s/%s",
-                                cluster_name,
-                                ng_name,
-                            )
-                except Exception:
-                    logger.debug(
-                        "describe_cluster failed for %s", cluster_name, exc_info=True
+                except Exception as e:
+                    # Unlike a describe failure, the ids are unknown here, so no row can
+                    # be stored. Only a failed scan keeps diff from reporting the cluster's
+                    # node groups as removed.
+                    logger.debug("list_nodegroups failed for %s", cluster_name, exc_info=True)
+                    self._record_list_failure(db, scan_id, region, "list_nodegroups", e)
+                    continue
+
+                for ng_name in nodegroups:
+                    metadata = {
+                        "nodegroupName": ng_name,
+                        "clusterName": cluster_name,
+                        "NodegroupCheckFailed": False,
+                    }
+                    arn = None
+                    try:
+                        ng = eks.describe_nodegroup(
+                            clusterName=cluster_name,
+                            nodegroupName=ng_name,
+                        ).get("nodegroup", {})
+                        arn = ng.get("nodegroupArn")
+                        metadata["scalingConfig"] = ng.get("scalingConfig")
+                        metadata["status"] = ng.get("status")
+                    except Exception:
+                        logger.debug(
+                            "describe_nodegroup failed for %s/%s",
+                            cluster_name,
+                            ng_name,
+                            exc_info=True,
+                        )
+                        metadata["NodegroupCheckFailed"] = True
+                    db.insert_resource(
+                        scan_id=scan_id,
+                        service="eks",
+                        resource_type="nodegroup",
+                        resource_id=f"{cluster_name}/{ng_name}",
+                        region=region,
+                        arn=arn,
+                        metadata=metadata,
                     )
+                    count += 1
         except Exception as e:
             logger.debug("EKS scan failed in %s", region, exc_info=True)
             self._record_list_failure(db, scan_id, region, "list_clusters", e)

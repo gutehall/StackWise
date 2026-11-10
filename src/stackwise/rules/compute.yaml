@@ -147,7 +147,7 @@
   resource_type: service
   service: ecs
   condition: |
-    resource.get('launchType') == 'EC2'
+    not resource.get('ServiceCheckFailed') and resource.get('launchType') == 'EC2'
   remediation: >
     Consider Fargate for simpler operations and no EC2 management.
 
@@ -157,7 +157,7 @@
   resource_type: task_definition
   service: ecs
   condition: |
-    (resource.get('cpu') or 0) < 256 or (resource.get('memory') or 0) < 512
+    not resource.get('TaskDefinitionCheckFailed') and ((resource.get('cpu') or 0) < 256 or (resource.get('memory') or 0) < 512)
   remediation: >
     Ensure task has adequate CPU and memory for the workload.
 
@@ -167,7 +167,7 @@
   resource_type: cluster
   service: eks
   condition: |
-    resource.get('resourcesVpcConfig', {}).get('endpointPublicAccess') is True
+    not resource.get('ClusterCheckFailed') and resource.get('resourcesVpcConfig', {}).get('endpointPublicAccess') is True
   remediation: >
     Disable public endpoint and use private access for production clusters.
 
@@ -180,7 +180,7 @@
   # support. This threshold must be bumped periodically — see
   # https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html
   condition: |
-    tuple(int(p) for p in (resource.get('version') or '0.0').split('.')[:2]) < (1, 28)
+    not resource.get('ClusterCheckFailed') and tuple(int(p) for p in (resource.get('version') or '0.0').split('.')[:2]) < (1, 28)
   remediation: >
     Upgrade to a supported Kubernetes version. See EKS version support policy.
 
@@ -190,7 +190,7 @@
   resource_type: nodegroup
   service: eks
   condition: |
-    not resource.get('scalingConfig') or resource.get('scalingConfig', {}).get('minSize') == resource.get('scalingConfig', {}).get('maxSize')
+    not resource.get('NodegroupCheckFailed') and (not resource.get('scalingConfig') or resource.get('scalingConfig', {}).get('minSize') == resource.get('scalingConfig', {}).get('maxSize'))
   remediation: >
     Configure scaling to handle workload variations.
 
@@ -200,7 +200,64 @@
   resource_type: launch_template
   service: ec2
   condition: |
-    resource.get('MetadataOptions', {}).get('HttpTokens') != 'required'
+    not resource.get('MetadataOptionsCheckFailed') and resource.get('MetadataOptions', {}).get('HttpTokens') != 'required'
   remediation: >
     Require IMDSv2 (HttpTokens=required) in the launch template's default
     version to prevent SSRF attacks on instances launched from it.
+
+# Checks that could not run
+- id: CMP-020
+  title: "EC2 launch template metadata options could not be verified"
+  severity: INFO
+  resource_type: launch_template
+  service: ec2
+  condition: |
+    resource.get('MetadataOptionsCheckFailed')
+  remediation: >
+    The default version could not be read (permissions or API error), so CMP-019 was
+    skipped for this launch template. Verify manually, and check for
+    ec2:DescribeLaunchTemplateVersions.
+
+- id: CMP-021
+  title: "ECS service configuration could not be verified"
+  severity: INFO
+  resource_type: service
+  service: ecs
+  condition: |
+    resource.get('ServiceCheckFailed')
+  remediation: >
+    The describe_services check failed (permissions or API error), so CMP-014 was
+    skipped for this service. Verify manually.
+
+- id: CMP-022
+  title: "ECS task definition could not be verified"
+  severity: INFO
+  resource_type: task_definition
+  service: ecs
+  condition: |
+    resource.get('TaskDefinitionCheckFailed')
+  remediation: >
+    The describe_task_definition check failed (permissions or API error), so CMP-015
+    was skipped for this task definition. Verify manually.
+
+- id: CMP-023
+  title: "EKS cluster configuration could not be verified"
+  severity: INFO
+  resource_type: cluster
+  service: eks
+  condition: |
+    resource.get('ClusterCheckFailed')
+  remediation: >
+    The describe_cluster check failed (permissions or API error), so CMP-016 and
+    CMP-017 were skipped for this cluster. Verify manually.
+
+- id: CMP-024
+  title: "EKS node group configuration could not be verified"
+  severity: INFO
+  resource_type: nodegroup
+  service: eks
+  condition: |
+    resource.get('NodegroupCheckFailed')
+  remediation: >
+    The describe_nodegroup check failed (permissions or API error), so CMP-018 was
+    skipped for this node group. Verify manually.

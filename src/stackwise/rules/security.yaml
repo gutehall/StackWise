@@ -125,7 +125,7 @@
   resource_type: detector
   service: guardduty
   condition: |
-    resource.get('Status') != 'ENABLED'
+    not resource.get('DetectorCheckFailed') and resource.get('Status') != 'ENABLED'
   remediation: >
     Enable GuardDuty for threat detection across the account.
 
@@ -138,3 +138,15 @@
     resource.get('Severity', 0) >= 4
   remediation: >
     Review and remediate high-severity GuardDuty findings.
+
+# Checks that could not run
+- id: SEC-014
+  title: "GuardDuty detector status could not be verified"
+  severity: INFO
+  resource_type: detector
+  service: guardduty
+  condition: |
+    resource.get('DetectorCheckFailed')
+  remediation: >
+    The get_detector check failed (permissions or API error), so SEC-009 was skipped
+    for this detector. Verify manually, and check for guardduty:GetDetector.
