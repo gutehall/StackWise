@@ -141,9 +141,11 @@ Both DB connections are guaranteed closed via `try/finally`, including on error 
 
 `config.py::Settings` / `resolve_settings()` merges CLI flags → env vars → defaults. `us-east-1`
 is always force-included in `regions` since several services (IAM, S3 bucket listing, Cost Explorer) are
-only scannable there. `auto_select_engine()` picks MLX on Apple Silicon (if `mlx_lm` installed),
-falls back to Ollama, falls back to rules-only — MLX isn't actually implemented yet
-(`analyzer/engine.py` falls back to Ollama with a warning if `Engine.MLX` is selected).
+only scannable there. `auto_select_engine()` picks Ollama if the `ollama` binary is on PATH,
+else rules-only. MLX isn't implemented, so it's never auto-selected, and an explicit
+`--engine mlx` exits 1. An engine the user chose explicitly that can't run (Ollama down,
+model not pulled) fails `analyze` before it starts; an auto-selected one that's down only
+warns and runs rules-only (`analyzer/engine.py::_llm_client_or_none`).
 
 ### CLI plumbing worth knowing
 
