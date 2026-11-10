@@ -21,6 +21,13 @@ def _to_base64(fig: plt.Figure) -> str:
     return data
 
 
+def _palette(n: int) -> list | None:
+    """Set3 colors for up to 12 items. Past that, None lets Matplotlib pick, since a
+    short color list raises for more items than colors."""
+    palette = plt.cm.Set3.colors
+    return list(palette[:n]) if n <= len(palette) else None
+
+
 def severity_bar_chart(findings_by_severity: dict[str, int]) -> str:
     """Generate a severity distribution bar chart as a base64 PNG."""
     order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
@@ -68,7 +75,7 @@ def cost_pie_chart(cost_by_service: dict[str, float]) -> str:
 
     labels = list(data.keys())
     sizes = list(data.values())
-    colors = plt.cm.Set3.colors[: len(labels)]
+    colors = _palette(len(labels))
 
     fig, ax = plt.subplots(figsize=(5, 4))
     wedges, texts, autotexts = ax.pie(
@@ -97,7 +104,7 @@ def resource_distribution_chart(resources_by_service: dict[str, list]) -> str:
 
     labels = list(resources_by_service.keys())
     values = [len(v) for v in resources_by_service.values()]
-    colors = plt.cm.Set3.colors[: len(labels)]
+    colors = _palette(len(labels))
 
     fig, ax = plt.subplots(figsize=(6, 3.5))
     bars = ax.bar(labels, values, color=colors)

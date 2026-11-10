@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from jinja2 import FileSystemLoader, select_autoescape
@@ -35,9 +36,33 @@ def _get_env() -> SandboxedEnvironment:
     )
 
 
-def _build_context(db: ScanDB, scan_id: str) -> dict:
-    """Collect all data needed by report templates."""
+def _cost_by_service(meta: dict) -> dict[str, float]:
+    """Sum UnblendedCost per service, skipping any row that isn't usable."""
+    groups = meta.get("Groups")
+    if not isinstance(groups, list):
+        return {}
+    totals: dict[str, float] = {}
+    for g in groups:
+        try:
+            keys = g.get("Keys") or []
+            svc = keys[0] if keys else "Other"
+            amount = float(g["Metrics"]["UnblendedCost"]["Amount"])
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+            logger.warning("Skipping unreadable cost row: %r", g)
+            continue
+        totals[svc] = totals.get(svc, 0.0) + amount
+    return totals
+
+
+def _build_context(db: ScanDB, scan_id: str, *, with_charts: bool = True) -> dict:
+    """Collect all data needed by report templates.
+
+    Charts are only drawn when *with_charts* is set: only the HTML and PDF templates
+    show them, and drawing must not be able to break the other formats.
+    """
     scan = db.get_scan(scan_id)
+    if scan is None:
+        raise ValueError(f"Scan {scan_id} not found in this database")
     resources = db.get_resources(scan_id)
     findings = db.get_findings(scan_id)
     recommendations = db.get_recommendations(scan_id)
@@ -60,23 +85,17 @@ def _build_context(db: ScanDB, scan_id: str) -> dict:
     for r in resources:
         resources_by_service.setdefault(r.service, []).append(r)
         if r.service == "ce" and r.resource_type == "cost_summary":
-            # Cost Explorer metadata may have Groups or ResultsByTime
-            meta = r.metadata or {}
-            if "Groups" in meta:
-                for g in meta.get("Groups", []):
-                    svc = g.get("Keys", [""])[0] if g.get("Keys") else "Other"
-                    cost_by_service[svc] = cost_by_service.get(svc, 0) + float(
-                        g.get("Metrics", {}).get("UnblendedCost", {}).get("Amount", 0)
-                    )
+            for svc, amount in _cost_by_service(r.metadata or {}).items():
+                cost_by_service[svc] = cost_by_service.get(svc, 0.0) + amount
 
     # Chart data (base64 PNG)
-    findings_by_sev = summary.get("findings", {})
-    severity_chart = severity_bar_chart(findings_by_sev)
-    resource_chart = resource_distribution_chart(resources_by_service)
-    cost_chart = ""
-    if cost_by_service:
-        from stackwise.report.charts import cost_pie_chart
-        cost_chart = cost_pie_chart(cost_by_service)
+    severity_chart = resource_chart = cost_chart = ""
+    if with_charts:
+        severity_chart = severity_bar_chart(summary.get("findings", {}))
+        resource_chart = resource_distribution_chart(resources_by_service)
+        if cost_by_service:
+            from stackwise.report.charts import cost_pie_chart
+            cost_chart = cost_pie_chart(cost_by_service)
 
     total_findings = sum(summary.get("findings", {}).values())
 
@@ -108,6 +127,21 @@ def _build_context(db: ScanDB, scan_id: str) -> dict:
     }
 
 
+def _temp_path_for(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.tmp")
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Write via a temp file and replace, so a crash can't leave a truncated report."""
+    tmp_path = _temp_path_for(path)
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def generate_report(
     settings: Settings,
     db: ScanDB,
@@ -135,29 +169,33 @@ def generate_report(
         logger.error("Template '%s' not found in %s", template_name, TEMPLATES_DIR)
         raise
 
-    context = _build_context(db, scan_id)
+    renders_html = output_format in ("html", "pdf")
+    context = _build_context(db, scan_id, with_charts=renders_html)
     context["report_type"] = report_type
-    html_content = template.render(**context)
+    html_content = template.render(**context) if renders_html else ""
 
     scan = context["scan"]
-    base_name = f"stackwise-{report_type}-{scan.account_id}-{scan.timestamp[:10]}"
+    # The scan id keeps two scans from the same day from overwriting each other's report.
+    base_name = f"stackwise-{report_type}-{scan.account_id}-{scan.timestamp[:10]}-{scan.id}"
 
     if output_format == "html":
         out_path = settings.output_dir / f"{base_name}.html"
-        out_path.write_text(html_content, encoding="utf-8")
+        _write_atomically(out_path, html_content)
         logger.info("HTML report written to %s", out_path)
         return out_path
 
     if output_format == "pdf":
         out_path = settings.output_dir / f"{base_name}.pdf"
+        tmp_path = _temp_path_for(out_path)
         try:
             from weasyprint import HTML as WeasyHTML  # noqa: N811
 
             base_url = Path(__file__).parent.as_uri() + "/"
-            WeasyHTML(string=html_content, base_url=base_url).write_pdf(str(out_path))
+            WeasyHTML(string=html_content, base_url=base_url).write_pdf(str(tmp_path))
+            os.replace(tmp_path, out_path)
         except BaseException as e:
-            # A failed write can leave a partial file; it must not look like the report.
-            out_path.unlink(missing_ok=True)
+            # A failed write leaves the previous report as it was, not a partial file.
+            tmp_path.unlink(missing_ok=True)
             if isinstance(e, (ImportError, OSError)):
                 raise ReportFormatUnavailableError(
                     "PDF output needs WeasyPrint and its system libraries (Pango, Cairo). "
@@ -170,14 +208,14 @@ def generate_report(
     if output_format == "md":
         out_path = settings.output_dir / f"{base_name}.md"
         md = _html_to_markdown(context, report_type)
-        out_path.write_text(md, encoding="utf-8")
+        _write_atomically(out_path, md)
         logger.info("Markdown report written to %s", out_path)
         return out_path
 
     if output_format == "json":
         out_path = settings.output_dir / f"{base_name}.json"
         payload = _build_json_payload(context)
-        out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        _write_atomically(out_path, json.dumps(payload, indent=2, default=str))
         logger.info("JSON report written to %s", out_path)
         return out_path
 

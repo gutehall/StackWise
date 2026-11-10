@@ -235,3 +235,102 @@ def test_markdown_recommendations_section(scan_db: ScanDB, settings):
     assert "Recommendations (1)" in content
     assert "Right-size instances" in content
     assert "Impact: high | Effort: low" in content
+
+
+def _scan_with_many_services_and_bad_costs(scan_db: ScanDB, n_services: int = 15) -> str:
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute", "cost"])
+    for i in range(n_services):
+        scan_db.insert_resource(scan.id, f"svc{i}", "thing", f"r{i}", "us-east-1", metadata={})
+    groups = [
+        {"Keys": [f"Service {i}"], "Metrics": {"UnblendedCost": {"Amount": str(i + 1)}}}
+        for i in range(n_services)
+    ]
+    groups += [
+        {"Keys": ["Null amount"], "Metrics": {"UnblendedCost": {"Amount": None}}},
+        {"Keys": ["Text amount"], "Metrics": {"UnblendedCost": {"Amount": "n/a"}}},
+        "not a dict",
+        {"Keys": ["No metrics"]},
+    ]
+    scan_db.insert_resource(
+        scan.id, "ce", "cost_summary", "cost-summary", "us-east-1", metadata={"Groups": groups}
+    )
+    return scan.id
+
+
+@pytest.mark.parametrize("output_format", ["json", "md", "html"])
+@pytest.mark.parametrize("report_type", ["engineering", "executive", "architecture"])
+def test_many_services_and_bad_cost_rows_do_not_abort_the_report(
+    scan_db: ScanDB, settings, output_format: str, report_type: str
+):
+    scan_id = _scan_with_many_services_and_bad_costs(scan_db)
+
+    path = generate_report(settings, scan_db, scan_id, report_type, output_format)
+
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_unreadable_cost_rows_are_skipped():
+    from stackwise.report.generator import _cost_by_service
+
+    meta = {"Groups": [
+        {"Keys": ["EC2"], "Metrics": {"UnblendedCost": {"Amount": "2.5"}}},
+        {"Keys": ["EC2"], "Metrics": {"UnblendedCost": {"Amount": "1"}}},
+        {"Keys": ["S3"], "Metrics": {"UnblendedCost": {"Amount": None}}},
+        {"Keys": [], "Metrics": {"UnblendedCost": {"Amount": "4"}}},
+        None,
+    ]}
+
+    assert _cost_by_service(meta) == {"EC2": 3.5, "Other": 4.0}
+    assert _cost_by_service({"Groups": "nope"}) == {}
+    assert _cost_by_service({}) == {}
+
+
+def test_json_and_markdown_draw_no_charts(scan_db: ScanDB, settings):
+    scan_id = _scan_with_many_services_and_bad_costs(scan_db)
+
+    with patch("stackwise.report.generator.severity_bar_chart") as chart:
+        generate_report(settings, scan_db, scan_id, "executive", "json")
+        generate_report(settings, scan_db, scan_id, "executive", "md")
+
+    chart.assert_not_called()
+
+
+def test_two_scans_on_the_same_day_get_separate_reports(scan_db: ScanDB, settings):
+    first = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    second = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    assert first.timestamp[:10] == second.timestamp[:10]
+
+    a = generate_report(settings, scan_db, first.id, "engineering", "json")
+    b = generate_report(settings, scan_db, second.id, "engineering", "json")
+
+    assert a != b
+    assert a.exists() and b.exists()
+
+
+@pytest.mark.parametrize("output_format", ["html", "md", "json"])
+def test_a_crash_during_the_write_keeps_the_previous_report(
+    scan_db: ScanDB, settings, output_format: str
+):
+    scan_id = _scan_with_one_instance(scan_db)
+    path = generate_report(settings, scan_db, scan_id, "engineering", output_format)
+    before = path.read_bytes()
+
+    real_write = Path.write_text
+
+    def _half_write_then_crash(self, text, *args, **kwargs):
+        real_write(self, text[: len(text) // 2], *args, **kwargs)
+        raise OSError("disk full")
+
+    with (
+        patch.object(Path, "write_text", _half_write_then_crash),
+        pytest.raises(OSError, match="disk full"),
+    ):
+        generate_report(settings, scan_db, scan_id, "engineering", output_format)
+
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in settings.output_dir.iterdir()) == [path.name]
+
+
+def test_a_missing_scan_raises_before_rendering(scan_db: ScanDB, settings):
+    with pytest.raises(ValueError, match="not found"):
+        generate_report(settings, scan_db, "no-such-scan", "engineering", "json")
