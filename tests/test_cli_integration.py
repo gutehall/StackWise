@@ -1135,3 +1135,43 @@ def test_analyze_that_rolls_back_exits_1_and_keeps_previous_findings(
     assert "previous findings are unchanged" in result.output
     assert "Analysis complete" not in result.output
     assert _finding_ids(db_path, scan_id) == before
+
+
+def test_analyze_with_a_broken_packaged_rules_file_exits_1(tmp_path: Path, monkeypatch):
+    db_path, scan_id = _scan_with_imds_findings(tmp_path, monkeypatch)
+    monkeypatch.delenv("STACKWISE_RULES_DIR", raising=False)
+    args = ["analyze", "--engine", "rules-only"]
+    assert runner.invoke(app, args).exit_code == 0
+    before = _finding_ids(db_path, scan_id)
+
+    broken = tmp_path / "rules"
+    broken.mkdir()
+    (broken / "security.yaml").write_text("- id: [unclosed")
+    with patch("stackwise.analyzer.rules._default_rules_dir", return_value=broken):
+        result = runner.invoke(app, args)
+
+    assert result.exit_code == 1
+    assert "security.yaml" in result.output
+    assert "Analysis complete" not in result.output
+    assert _finding_ids(db_path, scan_id) == before
+
+
+@pytest.mark.parametrize("output_format", ["html", "md", "json"])
+def test_reports_render_the_custom_rules_notice(tmp_path: Path, monkeypatch, output_format):
+    """Its rule id isn't in any rules file, so lookups by id must not fail."""
+    db_path = tmp_path / "scan.db"
+    db = ScanDB(db_path)
+    scan = db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    db.insert_finding(
+        scan.id, "INFO", "Some custom rules could not be loaded",
+        rule_id="RULES-LOAD", detail="Skipped: rule X", remediation="Fix them.",
+    )
+    db.close()
+    _point_latest_at(db_path, scan.id, monkeypatch, tmp_path)
+
+    result = runner.invoke(
+        app, ["report", "--type", "all", "--format", output_format,
+              "--output-dir", str(tmp_path / "out")],
+    )
+
+    assert result.exit_code == 0, result.output

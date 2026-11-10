@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from stackwise.analyzer.engine import _run_llm_analysis, run_analysis
+from stackwise.analyzer.rules import RulesLoadError, load_rules_checked
 from stackwise.config import Engine, Settings
 from stackwise.store.db import ScanDB
 
@@ -354,3 +355,101 @@ def test_llm_recommendations_are_replaced_only_when_the_llm_runs(
         Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise"), scan_db, scan_id
     )
     assert sorted(r.title for r in scan_db.get_recommendations(scan_id)) == ["Rule rec", "Second"]
+
+
+_GOOD_RULE = """
+- id: TST-001
+  title: "Instance allows IMDSv1"
+  severity: MEDIUM
+  resource_type: instance
+  service: ec2
+  condition: |
+    (resource.get('MetadataOptions') or {}).get('HttpTokens') != 'required'
+  remediation: Require IMDSv2.
+"""
+
+_REJECTED_RULE = """
+- id: TST-002
+  title: "Tries an import"
+  severity: HIGH
+  resource_type: instance
+  service: ec2
+  condition: |
+    __import__('os').system('true')
+  remediation: n/a
+"""
+
+
+def _rules_dir(tmp_path: Path, files: dict[str, str]) -> Path:
+    d = tmp_path / "rules"
+    d.mkdir()
+    for name, text in files.items():
+        (d / name).write_text(text)
+    return d
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"good.yaml": _GOOD_RULE, "broken.yaml": "- id: [unclosed"},
+        {"good.yaml": _GOOD_RULE + _REJECTED_RULE},
+    ],
+    ids=["syntax-error", "rejected-rule"],
+)
+def test_a_broken_packaged_rules_file_aborts_and_keeps_previous_findings(
+    scan_db: ScanDB, tmp_path: Path, monkeypatch, files: dict[str, str]
+):
+    monkeypatch.delenv("STACKWISE_RULES_DIR", raising=False)
+    settings = Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise")
+    scan_id = _scan_with_insecure_instances(scan_db)
+    run_analysis(settings, scan_db, scan_id)
+    before = sorted(f.id for f in scan_db.get_findings(scan_id))
+
+    broken = _rules_dir(tmp_path, files)
+    with (
+        patch("stackwise.analyzer.rules._default_rules_dir", return_value=broken),
+        pytest.raises(RulesLoadError, match="packaged rules failed to load"),
+    ):
+        run_analysis(settings, scan_db, scan_id)
+
+    assert sorted(f.id for f in scan_db.get_findings(scan_id)) == before
+
+
+def test_a_rejected_override_rule_is_reported_and_the_rest_still_run(
+    scan_db: ScanDB, tmp_path: Path, monkeypatch
+):
+    rules = _rules_dir(
+        tmp_path, {"mine.yaml": _GOOD_RULE + _REJECTED_RULE, "bad.yaml": "- id: [unclosed"}
+    )
+    monkeypatch.setenv("STACKWISE_RULES_DIR", str(rules))
+    settings = Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise")
+    scan_id = _scan_with_insecure_instances(scan_db, n=2)
+
+    result = run_analysis(settings, scan_db, scan_id)
+
+    findings = scan_db.get_findings(scan_id)
+    assert len([f for f in findings if f.rule_id == "TST-001"]) == 2
+    notice = [f for f in findings if f.rule_id == "RULES-LOAD"]
+    assert len(notice) == 1
+    assert notice[0].severity == "INFO"
+    assert "TST-002" in notice[0].detail and "bad.yaml" in notice[0].detail
+    assert result["rule_findings"] == 3
+
+
+def test_a_missing_override_directory_is_reported(scan_db: ScanDB, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_RULES_DIR", str(tmp_path / "nope"))
+    settings = Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise")
+    scan_id = _scan_with_insecure_instances(scan_db, n=1)
+
+    run_analysis(settings, scan_db, scan_id)
+
+    [notice] = scan_db.get_findings(scan_id)
+    assert notice.rule_id == "RULES-LOAD"
+    assert "directory not found" in notice.detail
+
+
+def test_the_packaged_rules_load_cleanly():
+    """The shipped rules must never trip the abort."""
+    loaded = load_rules_checked()
+    assert loaded.problems == []
+    assert loaded.rules

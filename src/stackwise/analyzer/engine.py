@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 
 from stackwise.analyzer.llm_client import OllamaClient
-from stackwise.analyzer.rules import evaluate_rules, load_rules
+from stackwise.analyzer.rules import RulesLoadError, evaluate_rules, load_rules_checked
 from stackwise.config import Engine, Settings
 from stackwise.store.db import ScanDB
 
@@ -48,6 +48,10 @@ _SERVICE_CATEGORY = {
 _LLM_SKIP_CATEGORIES = {"discovery"}
 
 
+# Finding id for "custom rules failed to load". Not a rule in any YAML file.
+RULES_LOAD_FINDING_ID = "RULES-LOAD"
+
+
 def run_analysis(settings: Settings, db: ScanDB, scan_id: str) -> dict:
     """Run full analysis pipeline: rules then optional LLM enrichment.
 
@@ -64,11 +68,36 @@ def run_analysis(settings: Settings, db: ScanDB, scan_id: str) -> dict:
 
         # ── Step 1: Rule-based analysis ────────────────────────
         console.print("[bold]Running rule-based analysis…[/bold]")
-        rules = load_rules()
+        loaded = load_rules_checked()
+        if loaded.problems and not loaded.is_override:
+            # A broken packaged file would silently drop a whole domain, such as every
+            # SEC-* rule, and the report would read as clean.
+            raise RulesLoadError(
+                f"packaged rules failed to load from {loaded.rules_dir}: "
+                + ", ".join(loaded.problems)
+            )
         rule_findings = evaluate_rules(
-            rules, db, scan_id,
+            loaded.rules, db, scan_id,
             suppressed_rules=getattr(settings, "suppressed_rules", None),
         )
+        if loaded.problems:
+            # A custom rules directory is the user's own: run what loaded, but say
+            # what didn't, so the missing checks don't read as passes.
+            db.insert_finding(
+                scan_id=scan_id,
+                severity="INFO",
+                title="Some custom rules could not be loaded",
+                rule_id=RULES_LOAD_FINDING_ID,
+                detail=f"Skipped from {loaded.rules_dir}: " + ", ".join(loaded.problems),
+                remediation=(
+                    "Fix or remove the listed rules in STACKWISE_RULES_DIR. "
+                    "Their checks did not run."
+                ),
+            )
+            rule_findings += 1
+            console.print(
+                f"  [yellow]⚠ Skipped custom rules: {', '.join(loaded.problems)}[/yellow]"
+            )
         console.print(f"  Rules produced [yellow]{rule_findings}[/yellow] findings")
 
         # ── Step 2: LLM enrichment (if available) ──────────────
