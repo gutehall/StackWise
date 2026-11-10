@@ -12,14 +12,17 @@
     Enable AWS Config recording for compliance and drift detection.
 
 - id: DSC-002
-  title: "Resource is untagged"
+  title: "Tagging API returned this resource with an empty tag set"
   severity: LOW
   resource_type: tagged_resource
   service: resourcegroupstaggingapi
+  # GetResources only lists resources that have, or recently had, tags. A resource that
+  # was never tagged isn't listed, so no finding here doesn't mean everything is tagged.
   condition: |
-    not resource.get('Tags') or len((resource.get('Tags') or [])) == 0
+    not resource.get('Tags')
   remediation: >
-    Add tags for resource discovery and cost allocation.
+    Add tags for resource discovery and cost allocation. Resources that were never
+    tagged don't appear in the tagging API, so check other inventories for those.
 
 # Checks that could not run
 - id: DSC-003

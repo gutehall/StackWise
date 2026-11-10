@@ -1130,3 +1130,26 @@ def test_secret_with_rotation_disabled_gets_one_finding(scan_db: ScanDB):
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert [f.rule_id for f in scan_db.get_findings(scan.id)] == ["SEC-007"]
+
+
+@pytest.mark.parametrize(
+    ("tags", "expected"),
+    [([], ["DSC-002"]), (None, ["DSC-002"]), ([{"Key": "Env", "Value": "p"}], [])],
+    ids=["empty", "null", "tagged"],
+)
+def test_empty_tag_set_gets_one_finding(scan_db: ScanDB, tags, expected):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["cost", "discovery"])
+    scan_db.insert_resource(
+        scan.id, "resourcegroupstaggingapi", "tagged_resource", "arn:aws:s3:::b", "us-east-1",
+        metadata={"ResourceARN": "arn:aws:s3:::b", "Tags": tags},
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert [f.rule_id for f in scan_db.get_findings(scan.id)] == expected
+
+
+def test_tag_finding_does_not_claim_a_full_inventory():
+    rule = next(r for r in load_rules() if r.id == "DSC-002")
+    assert "Tagging API returned" in rule.title
+    assert not any(r.id == "CST-001" for r in load_rules())
