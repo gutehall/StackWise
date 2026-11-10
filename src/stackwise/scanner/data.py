@@ -189,6 +189,12 @@ class RDSScanner(BaseScanner):
                         "StorageEncrypted": inst.get("StorageEncrypted"),
                         "PubliclyAccessible": inst.get("PubliclyAccessible"),
                         "DBInstanceStatus": inst.get("DBInstanceStatus"),
+                        # Aurora members and read replicas report MultiAZ false: their
+                        # availability is set on the cluster or the source instead.
+                        "DBClusterIdentifier": inst.get("DBClusterIdentifier"),
+                        "ReadReplicaSourceDBInstanceIdentifier": inst.get(
+                            "ReadReplicaSourceDBInstanceIdentifier"
+                        ),
                     },
                 )
                 count += 1
@@ -372,6 +378,7 @@ class ElastiCacheScanner(BaseScanner):
                     arn=cluster.get("ARN"),
                     metadata={
                         "CacheClusterId": cluster_id,
+                        "Engine": cluster.get("Engine"),
                         "ReplicationGroupId": cluster.get("ReplicationGroupId"),
                         "AtRestEncryptionEnabled": cluster.get("AtRestEncryptionEnabled"),
                         "CacheNodeType": cluster.get("CacheNodeType"),
@@ -396,6 +403,7 @@ class ElastiCacheScanner(BaseScanner):
                         "ReplicationGroupId": rg_id,
                         "AtRestEncryptionEnabled": rg.get("AtRestEncryptionEnabled"),
                         "Status": rg.get("Status"),
+                        "MemberClusterCount": len(rg.get("MemberClusters") or []),
                     },
                 )
                 count += 1

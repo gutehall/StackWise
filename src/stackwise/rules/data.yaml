@@ -62,8 +62,10 @@
   severity: MEDIUM
   resource_type: db_instance
   service: rds
+  # Aurora members are covered by the cluster rule (DAT-009), and a read replica's
+  # availability comes from its source, so neither is a single-AZ instance.
   condition: |
-    resource.get('MultiAZ') is not True
+    resource.get('MultiAZ') is not True and not resource.get('DBClusterIdentifier') and not resource.get('ReadReplicaSourceDBInstanceIdentifier')
   remediation: >
     Enable Multi-AZ for production databases to improve availability.
 
@@ -181,8 +183,9 @@
   severity: MEDIUM
   resource_type: cache_cluster
   service: elasticache
+  # Memcached has no replication groups, so only Redis and Valkey can be missing one.
   condition: |
-    not resource.get('ReplicationGroupId')
+    resource.get('Engine') in ('redis', 'valkey') and not resource.get('ReplicationGroupId')
   remediation: >
     Use replication groups for high availability and failover.
 
@@ -191,8 +194,9 @@
   severity: HIGH
   resource_type: cache_cluster
   service: elasticache
+  # Memcached doesn't report AtRestEncryptionEnabled at all.
   condition: |
-    resource.get('AtRestEncryptionEnabled') is not True
+    resource.get('Engine') in ('redis', 'valkey') and resource.get('AtRestEncryptionEnabled') is not True
   remediation: >
     Enable encryption at rest for ElastiCache.
 
@@ -229,3 +233,13 @@
     The lifecycle check failed (permissions or API error), so DAT-015 was skipped for
     this file system. Verify manually, and check for
     elasticfilesystem:DescribeLifecycleConfiguration.
+
+- id: DAT-022
+  title: "ElastiCache replication group has a single node"
+  severity: MEDIUM
+  resource_type: replication_group
+  service: elasticache
+  condition: |
+    resource.get('MemberClusterCount') == 1
+  remediation: >
+    Add a replica to the replication group so it can fail over.

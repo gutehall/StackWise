@@ -630,3 +630,48 @@ def test_elasticache_replication_groups_failure_names_the_operation(scan_db: Sca
     assert [(e.scanner, e.operation) for e in scan_db.get_scan_errors(scan.id)] == [
         ("elasticache", "describe_replication_groups"),
     ]
+
+
+def test_rds_instance_keeps_its_cluster_and_replica_source(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+    instances = [
+        {"DBInstanceIdentifier": "aurora-1", "MultiAZ": False, "DBClusterIdentifier": "c1"},
+        {"DBInstanceIdentifier": "replica", "MultiAZ": False,
+         "ReadReplicaSourceDBInstanceIdentifier": "primary"},
+        {"DBInstanceIdentifier": "primary", "MultiAZ": True},
+    ]
+
+    def _paginate(client, method, key, **kw):
+        return instances if method == "describe_db_instances" else []
+
+    with (
+        patch("stackwise.scanner.data.regional_client", return_value=MagicMock()),
+        patch("stackwise.scanner.data.paginate", side_effect=_paginate),
+    ):
+        RDSScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    rows = {r.resource_id: r.metadata for r in scan_db.get_resources(scan.id, service="rds")}
+    assert rows["aurora-1"]["DBClusterIdentifier"] == "c1"
+    assert rows["replica"]["ReadReplicaSourceDBInstanceIdentifier"] == "primary"
+    assert rows["primary"]["DBClusterIdentifier"] is None
+
+
+def test_elasticache_stores_engine_and_member_count(scan_db: ScanDB):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["data"])
+
+    def _paginate(client, method, key, **kw):
+        if method == "describe_cache_clusters":
+            return [{"CacheClusterId": "mc", "Engine": "memcached"}]
+        return [{"ReplicationGroupId": "rg", "MemberClusters": ["rg-001"]},
+                {"ReplicationGroupId": "rg2"}]
+
+    with (
+        patch("stackwise.scanner.data.regional_client", return_value=MagicMock()),
+        patch("stackwise.scanner.data.paginate", side_effect=_paginate),
+    ):
+        ElastiCacheScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    rows = {r.resource_id: r.metadata for r in scan_db.get_resources(scan.id)}
+    assert rows["mc"]["Engine"] == "memcached"
+    assert rows["rg"]["MemberClusterCount"] == 1
+    assert rows["rg2"]["MemberClusterCount"] == 0

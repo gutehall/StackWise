@@ -966,3 +966,40 @@ def test_obs005_describes_a_missing_customer_managed_key():
     rule = next(r for r in load_rules() if r.id == "OBS-005")
     assert rule.title == "Log group has no customer-managed KMS key"
     assert rule.severity == "LOW"
+
+
+_RDS = ("rds", "db_instance")
+_CACHE = ("elasticache", "cache_cluster")
+_RG = ("elasticache", "replication_group")
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata", "rule_id", "fires"),
+    [
+        # An Aurora member or a read replica is not a single-AZ instance.
+        (_RDS, {"MultiAZ": False, "DBClusterIdentifier": "c1"}, "DAT-005", False),
+        (_RDS, {"MultiAZ": False, "ReadReplicaSourceDBInstanceIdentifier": "p"}, "DAT-005",
+         False),
+        (_RDS, {"MultiAZ": False}, "DAT-005", True),
+        (_RDS, {"MultiAZ": True}, "DAT-005", False),
+        # Memcached has no replication groups and no at-rest encryption field.
+        (_CACHE, {"Engine": "memcached"}, "DAT-016", False),
+        (_CACHE, {"Engine": "memcached"}, "DAT-017", False),
+        (_CACHE, {"Engine": "redis"}, "DAT-016", True),
+        (_CACHE, {"Engine": "valkey"}, "DAT-016", True),
+        (_CACHE, {"Engine": "redis", "ReplicationGroupId": "rg"}, "DAT-016", False),
+        (_CACHE, {"Engine": "redis", "AtRestEncryptionEnabled": False}, "DAT-017", True),
+        (_CACHE, {"Engine": "redis", "AtRestEncryptionEnabled": True}, "DAT-017", False),
+        # A one-node replication group can't fail over.
+        (_RG, {"MemberClusterCount": 1}, "DAT-022", True),
+        (_RG, {"MemberClusterCount": 2}, "DAT-022", False),
+        (_RG, {}, "DAT-022", False),
+    ],
+)
+def test_rules_match_the_resource_shape(scan_db: ScanDB, kind, metadata, rule_id, fires):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["data"])
+    scan_db.insert_resource(scan.id, kind[0], kind[1], "r", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
