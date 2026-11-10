@@ -199,8 +199,10 @@
   <h2>AI Recommendations</h2>
   {% if analysis_status and analysis_status.llm_status == 'partial' %}
   <div class="llm-partial">
-    ⚠ LLM analysis was partial. These categories failed, so they have no AI
-    recommendations: {{ analysis_status.failed_categories | join(', ') }}.
+    ⚠ LLM analysis was partial.
+    {% if analysis_status.failed_categories %}These categories failed, so they have no AI
+    recommendations: {{ analysis_status.failed_categories | join(', ') }}.{% else %}Some
+    categories have no AI recommendations.{% endif %}
   </div>
   {% endif %}
   {% if recommendations %}

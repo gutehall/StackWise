@@ -405,7 +405,8 @@ def test_html_shows_a_partial_llm_run(scan_db: ScanDB, settings, report_type, wi
     )
 
     assert "compute, security" in html
-    assert "partial" in html or "incomplete" in html
+    phrase = {"engineering": "LLM analysis was partial", "executive": "AI analysis was incomplete"}
+    assert phrase[report_type] in html
     # The run did happen, so blaming a missing Ollama would be wrong.
     assert "Ollama may not have been available" not in html
     assert ("Encrypt the tables" in html) is with_rec
@@ -429,3 +430,11 @@ def test_html_partial_notice_escapes_category_names(scan_db: ScanDB, settings):
 
     assert "<script>x</script>" not in html
     assert "&lt;script&gt;" in html
+
+
+@pytest.mark.parametrize("report_type", ["engineering", "executive"])
+def test_html_partial_notice_without_named_categories(scan_db: ScanDB, settings, report_type):
+    html = _html_report(scan_db, settings, report_type, ("partial", []), with_rec=False)
+
+    assert "⚠" in html
+    assert "for: ." not in html and "recommendations: ." not in html

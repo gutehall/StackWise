@@ -141,7 +141,7 @@
 <h2>Top Recommendations</h2>
 {% if analysis_status and analysis_status.llm_status == 'partial' %}
 <div style="border: 1px solid #f59e0b; background: #fffbeb; color: #92400e; border-radius: 6px; padding: 0.6em 0.8em; margin-bottom: 0.8em; font-size: 0.9em;">
-  ⚠ AI analysis was incomplete. No recommendations for: {{ analysis_status.failed_categories | join(', ') }}.
+  ⚠ AI analysis was incomplete.{% if analysis_status.failed_categories %} No recommendations for: {{ analysis_status.failed_categories | join(', ') }}.{% endif %}
 </div>
 {% endif %}
 {% if recommendations %}
