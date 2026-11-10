@@ -495,11 +495,15 @@ def list_scans(
                 f"showing all accounts.[/yellow]"
             )
 
+    from stackwise.diff import scan_status
+
     table = Table(title="Scan History")
     table.add_column("Account", style="cyan")
     table.add_column("Timestamp")
+    table.add_column("Status")
     table.add_column("Database")
     table.add_column("Size")
+    status_style = {"complete": "green", "incomplete": "red", "unreadable": "yellow"}
 
     for account_dir in sorted(scans_base.iterdir()):
         if not account_dir.is_dir():
@@ -508,9 +512,11 @@ def list_scans(
             continue
         for db_file in sorted(account_dir.glob("*.db"), reverse=True):
             size_kb = db_file.stat().st_size / 1024
+            status = scan_status(db_file)
             table.add_row(
                 account_dir.name,
-                db_file.stem,
+                _scan_time(db_file.stem),
+                f"[{status_style[status]}]{status}[/{status_style[status]}]",
                 str(db_file),
                 f"{size_kb:.1f} KB",
             )
@@ -547,6 +553,18 @@ def _write_latest_scan(settings, account_id: str, scan_id: str, db_path: Path) -
     last_account = _last_account_file(settings)
     last_account.parent.mkdir(parents=True, exist_ok=True)
     last_account.write_text(account_id)
+
+
+def _scan_time(stem: str) -> str:
+    """Show a scan filename's timestamp without its unique suffix.
+
+    Handles old names (20240101T000000) and new ones (20240101T000000.123456-ab12cd).
+    Anything else is shown as-is.
+    """
+    try:
+        return datetime.strptime(stem[:15], "%Y%m%dT%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return stem
 
 
 def _settings_or_exit(**kwargs):

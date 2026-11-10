@@ -1330,3 +1330,51 @@ def test_diff_of_scans_older_than_the_completeness_tables_has_no_warning(
 
     assert result.exit_code == 0, result.output
     assert "failed or never finished" not in result.output
+
+
+@mock_aws
+def test_list_scans_shows_status_and_a_clean_timestamp(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("STACKWISE_DATA_DIR", str(tmp_path / "data"))
+    _scan_at(0)
+    with patch.object(EC2Scanner, "_scan_region", side_effect=RuntimeError("boom")):
+        _scan_at(1)
+    account_dir = _account_dir(tmp_path)
+    (account_dir / "20240101T000002.db").touch()  # empty file, old-style name
+    legacy = sqlite3.connect(account_dir / "20240101T000003.db")
+    legacy.execute("CREATE TABLE scans (id TEXT, timestamp TEXT, account_id TEXT,"
+                   " regions TEXT, modules TEXT)")
+    legacy.execute("INSERT INTO scans VALUES ('s', '2024-01-01', '1', '[]', '[]')")
+    legacy.commit()
+    legacy.close()
+    before = {p.name: p.stat().st_mtime for p in account_dir.iterdir()}
+
+    result = runner.invoke(app, ["list-scans"], env={"COLUMNS": "250"})
+
+    assert result.exit_code == 0, result.output
+    status = {
+        cells[2].strip(): cells[3].strip()
+        for cells in (line.split("│") for line in result.output.splitlines())
+        if len(cells) >= 6 and "2024-01-01" in cells[2]
+    }
+    assert status == {
+        "2024-01-01 00:00:00": "complete",
+        "2024-01-01 00:00:01": "incomplete",
+        "2024-01-01 00:00:02": "unreadable",
+        "2024-01-01 00:00:03": "complete",  # older than the completeness tables
+    }
+    assert ".000000-" not in result.output.split("Database")[0]
+    assert {p.name: p.stat().st_mtime for p in account_dir.iterdir()} == before
+
+
+@pytest.mark.parametrize(
+    ("stem", "shown"),
+    [
+        ("20240101T000000", "2024-01-01 00:00:00"),
+        ("20261109T125659.568774-079b12", "2026-11-09 12:56:59"),
+        ("my-own-name", "my-own-name"),
+    ],
+)
+def test_scan_time_drops_the_suffix(stem: str, shown: str):
+    from stackwise.cli import _scan_time
+
+    assert _scan_time(stem) == shown
