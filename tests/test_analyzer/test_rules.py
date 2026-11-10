@@ -796,3 +796,37 @@ def test_rule_ids_are_unique():
     ids = [r.id for r in load_rules()]
 
     assert sorted(i for i in set(ids) if ids.count(i) > 1) == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        ({"ReservedConcurrencyCheckFailed": False, "ReservedConcurrentExecutions": None},
+         "CMP-012", True),
+        ({"ReservedConcurrencyCheckFailed": False, "ReservedConcurrentExecutions": 5},
+         "CMP-012", False),
+        # 0 is a real setting: it stops the function from running.
+        ({"ReservedConcurrencyCheckFailed": False, "ReservedConcurrentExecutions": 0},
+         "CMP-012", False),
+        ({"ReservedConcurrencyCheckFailed": True, "ReservedConcurrentExecutions": None},
+         "CMP-012", False),
+        ({"ReservedConcurrencyCheckFailed": True, "ReservedConcurrentExecutions": None},
+         "CMP-025", True),
+        ({"ReservedConcurrencyCheckFailed": False, "ReservedConcurrentExecutions": None},
+         "CMP-025", False),
+    ],
+)
+def test_lambda_concurrency_rules(scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    scan_db.insert_resource(scan.id, "lambda", "function", "f", "us-east-1", metadata=metadata)
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_every_policy_copy_grants_lambda_concurrency_lookup():
+    """The policy is copied into three docs files, so they can drift apart."""
+    docs = Path(__file__).resolve().parents[2] / "docs"
+    for name in ("iam-policy.json", "stackwise-role.yaml", "stackwise-ec2.yaml"):
+        assert "lambda:GetFunctionConcurrency" in (docs / name).read_text(), name

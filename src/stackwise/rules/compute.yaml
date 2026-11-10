@@ -127,7 +127,7 @@
   resource_type: function
   service: lambda
   condition: |
-    resource.get('ReservedConcurrentExecutions') is None
+    not resource.get('ReservedConcurrencyCheckFailed') and resource.get('ReservedConcurrentExecutions') is None
   remediation: >
     Set reserved concurrency to prevent one function from consuming all account concurrency.
 
@@ -261,3 +261,15 @@
   remediation: >
     The describe_nodegroup check failed (permissions or API error), so CMP-018 was
     skipped for this node group. Verify manually.
+
+- id: CMP-025
+  title: "Lambda reserved concurrency could not be verified"
+  severity: INFO
+  resource_type: function
+  service: lambda
+  condition: |
+    resource.get('ReservedConcurrencyCheckFailed')
+  remediation: >
+    The get_function_concurrency check failed (permissions or API error), so CMP-012
+    was skipped for this function. Verify manually, and check for
+    lambda:GetFunctionConcurrency.

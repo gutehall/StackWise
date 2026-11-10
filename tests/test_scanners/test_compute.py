@@ -5,6 +5,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import boto3
+import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from stackwise.scanner.compute import EC2Scanner, ECSScanner, EKSScanner, LambdaScanner
@@ -585,3 +587,57 @@ def test_launch_template_version_without_metadata_options_is_not_a_failed_check(
 
     assert metadata["MetadataOptionsCheckFailed"] is False
     assert metadata["MetadataOptions"] == {}
+
+
+@mock_aws
+def test_lambda_reserved_concurrency_comes_from_get_function_concurrency(scan_db: ScanDB):
+    """ListFunctions never returns reserved concurrency, so it has to be fetched."""
+    session = boto3.Session(region_name="us-east-1")
+    role = session.client("iam").create_role(RoleName="r", AssumeRolePolicyDocument="{}")
+    client = session.client("lambda", region_name="us-east-1")
+    for name in ("plain", "limited"):
+        client.create_function(
+            FunctionName=name, Runtime="python3.12", Role=role["Role"]["Arn"],
+            Handler="h.h", Code={"ZipFile": b"x"},
+        )
+    client.put_function_concurrency(FunctionName="limited", ReservedConcurrentExecutions=5)
+
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    LambdaScanner()._scan_region(session, scan_db, scan.id, "us-east-1")
+
+    rows = {r.resource_id: r.metadata for r in scan_db.get_resources(scan.id, service="lambda")}
+    assert rows["limited"]["ReservedConcurrentExecutions"] == 5
+    assert rows["plain"]["ReservedConcurrentExecutions"] is None
+    assert rows["limited"]["ReservedConcurrencyCheckFailed"] is False
+    assert rows["plain"]["ReservedConcurrencyCheckFailed"] is False
+
+
+@pytest.mark.parametrize(
+    ("error", "failed"),
+    [
+        (ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetFunctionConcurrency"), True),
+        (ClientError({"Error": {"Code": "TooManyRequestsException"}}, "GetFunctionConcurrency"),
+         True),
+        (RuntimeError("connection reset"), True),
+        # Deleted since the list call: nothing is reserved, and nothing failed.
+        (ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "GetFunctionConcurrency"),
+         False),
+    ],
+    ids=["access-denied", "throttled", "other", "not-found"],
+)
+def test_lambda_concurrency_lookup_errors(scan_db: ScanDB, error: Exception, failed: bool):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["compute"])
+    client = MagicMock()
+    client.get_function_concurrency.side_effect = error
+
+    with (
+        patch("stackwise.scanner.compute.regional_client", return_value=client),
+        patch("stackwise.scanner.compute.paginate", return_value=[{"FunctionName": "f"}]),
+    ):
+        count = LambdaScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    assert count == 1
+    row = scan_db.get_resources(scan.id, service="lambda")[0]
+    assert row.metadata["ReservedConcurrencyCheckFailed"] is failed
+    assert row.metadata["ReservedConcurrentExecutions"] is None
+    assert scan_db.get_scan_errors(scan.id) == []
