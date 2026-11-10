@@ -5,12 +5,15 @@ from __future__ import annotations
 import glob
 import logging
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
 
+from stackwise.analyzer import lifecycle as lifecycle_mod
+from stackwise.analyzer.lifecycle import lifecycle_context
 from stackwise.analyzer.rules import (
     Rule,
     RuleConditionError,
@@ -20,6 +23,16 @@ from stackwise.analyzer.rules import (
     load_rules,
 )
 from stackwise.store.db import ScanDB
+
+
+@pytest.fixture(autouse=True)
+def _pin_lifecycle_date(monkeypatch):
+    """Rules see lifecycle facts as of the day they run; pin that day so these tests
+    don't change verdict as AWS dates pass."""
+    monkeypatch.setattr(
+        "stackwise.analyzer.rules.lifecycle_context",
+        lambda: lifecycle_context(lifecycle_mod.AS_OF),
+    )
 
 
 def test_load_rules_includes_priority():
@@ -231,7 +244,7 @@ def test_dat001_does_not_fire_when_versioning_check_failed(scan_db: ScanDB):
 
 
 def test_eks_deprecated_version_rule_does_not_flag_current_versions(scan_db: ScanDB):
-    """CMP-017 must not flag every 1.2x version — only ones below the threshold."""
+    """CMP-017 must flag only versions past EKS standard support."""
     rules = load_rules()
     scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
     scan_db.insert_resource(
@@ -240,7 +253,7 @@ def test_eks_deprecated_version_rule_does_not_flag_current_versions(scan_db: Sca
     )
     scan_db.insert_resource(
         scan.id, "eks", "cluster", "current-cluster", "us-east-1",
-        metadata={"version": "1.30"},
+        metadata={"version": "1.34"},
     )
     evaluate_rules(rules, scan_db, scan.id)
     findings = [f for f in scan_db.get_findings(scan.id) if f.rule_id == "CMP-017"]
@@ -767,12 +780,13 @@ _EKS_NG = ("eks", "nodegroup")
                         "resourcesVpcConfig": {"endpointPublicAccess": True}}, "CMP-016", True),
         (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.21"}, "CMP-017", True),
         (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": None}, "CMP-018", True),
+        # A fixed-size node group is a choice, not a missing config.
         (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": {"minSize": 2, "maxSize": 2}},
-         "CMP-018", True),
+         "CMP-018", False),
         # A correct setting doesn't fire, and neither do the visibility rules.
         (_ECS_TD, {"TaskDefinitionCheckFailed": False, "cpu": 512, "memory": 2048},
          "CMP-015", False),
-        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.31"}, "CMP-017", False),
+        (_EKS_CLUSTER, {"ClusterCheckFailed": False, "version": "1.34"}, "CMP-017", False),
         (_EKS_NG, {"NodegroupCheckFailed": False, "scalingConfig": {"minSize": 1, "maxSize": 3}},
          "CMP-018", False),
         (_ECS_SVC, {"ServiceCheckFailed": False}, "CMP-021", False),
@@ -827,11 +841,163 @@ def test_lambda_concurrency_rules(scan_db: ScanDB, metadata: dict, rule_id: str,
     assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
 
 
-def test_every_policy_copy_grants_lambda_concurrency_lookup():
+@pytest.mark.parametrize(
+    "action", ["lambda:GetFunctionConcurrency", "lambda:GetFunctionEventInvokeConfig"]
+)
+def test_every_policy_copy_grants_lambda_concurrency_lookup(action: str):
     """The policy is copied into three docs files, so they can drift apart."""
     docs = Path(__file__).resolve().parents[2] / "docs"
     for name in ("iam-policy.json", "stackwise-role.yaml", "stackwise-ec2.yaml"):
-        assert "lambda:GetFunctionConcurrency" in (docs / name).read_text(), name
+        assert action in (docs / name).read_text(), name
+
+
+def _fires(scan_db: ScanDB, service: str, kind: str, metadata: dict, rule_id: str) -> bool:
+    scan = scan_db.create_scan("123", ["us-east-1"], ["all"])
+    scan_db.insert_resource(scan.id, service, kind, "r", "us-east-1", metadata=metadata)
+    evaluate_rules(load_rules(), scan_db, scan.id)
+    return any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id))
+
+
+def test_lifecycle_table_is_fresh():
+    assert date.today() - lifecycle_mod.AS_OF <= timedelta(days=90), (
+        f"stackwise/analyzer/lifecycle.py is as of {lifecycle_mod.AS_OF}. Refresh "
+        f"LAMBDA_RUNTIME_DEPRECATION, EKS_END_OF_STANDARD_SUPPORT and AS_OF from "
+        f"{sorted(lifecycle_mod.SOURCES.values())}"
+    )
+
+
+def test_lifecycle_context_flips_scheduled_dates():
+    before = lifecycle_context(date(2027, 6, 29))
+    after = lifecycle_context(date(2027, 6, 30))
+
+    assert "java11" not in before["deprecated_lambda_runtimes"]
+    assert "java11" in after["deprecated_lambda_runtimes"]
+    assert lifecycle_context(date(2026, 11, 10))["eks_min_standard_version"] == [1, 34]
+    assert lifecycle_context(date(2026, 12, 2))["eks_min_standard_version"] == [1, 35]
+    # Past every listed date: only versions newer than the table count as supported.
+    assert lifecycle_context(date(2030, 1, 1))["eks_min_standard_version"] == [1, 38]
+
+
+def test_lifecycle_context_defaults_to_today():
+    assert lifecycle_context() == lifecycle_context(date.today())
+
+
+def test_lifecycle_is_plain_data_to_conditions():
+    with pytest.raises(RuleConditionError):
+        _compile_condition("lifecycle.__class__", "TEST-EVIL")
+
+
+@pytest.mark.parametrize(
+    ("runtime", "fires"),
+    [("python3.9", True), ("nodejs20.x", True), ("python3.10", True), ("java11", False),
+     ("python3.12", False), (None, False)],
+)
+def test_cmp004_uses_lifecycle_table(scan_db: ScanDB, runtime, fires: bool):
+    assert _fires(scan_db, "lambda", "function", {"Runtime": runtime}, "CMP-004") is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        ({"ClusterCheckFailed": False, "version": "1.33"}, "CMP-017", True),
+        ({"ClusterCheckFailed": False, "version": "1.34"}, "CMP-017", False),
+        ({"ClusterCheckFailed": False, "version": "1.40"}, "CMP-017", False),
+        # A missing version is unknown, not old.
+        ({"ClusterCheckFailed": False, "version": None}, "CMP-017", False),
+        ({"ClusterCheckFailed": False, "version": None}, "CMP-026", True),
+        ({"ClusterCheckFailed": False, "version": "1.33"}, "CMP-026", False),
+        ({"ClusterCheckFailed": True}, "CMP-026", False),
+    ],
+)
+def test_eks_version_rules(scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool):
+    assert _fires(scan_db, "eks", "cluster", metadata, rule_id) is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"cpu": 512, "memory": 1024}, False),
+        ({"cpu": 128, "memory": 1024}, True),
+        # No task-level size: the container sums stand in, and a null isn't "low".
+        ({"cpu": None, "memory": None, "ContainerCpu": 512, "ContainerMemory": 1024}, False),
+        ({"cpu": None, "memory": None, "ContainerCpu": 128, "ContainerMemory": 1024}, True),
+        ({"cpu": None, "memory": None, "ContainerCpu": None, "ContainerMemory": 1024}, False),
+        ({"cpu": None, "memory": None, "ContainerCpu": None, "ContainerMemory": 256}, True),
+        # Task level wins over the containers.
+        ({"cpu": 1024, "memory": 2048, "ContainerCpu": 128, "ContainerMemory": 128}, False),
+    ],
+)
+def test_cmp015_uses_container_sizes_when_task_has_none(
+    scan_db: ScanDB, metadata: dict, fires: bool
+):
+    metadata = {"TaskDefinitionCheckFailed": False, **metadata}
+    assert _fires(scan_db, "ecs", "task_definition", metadata, "CMP-015") is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"HasLoadBalancer": True, "HealthCheckType": "EC2"}, True),
+        ({"HasLoadBalancer": True, "HealthCheckType": "ELB"}, False),
+        # EC2 health checks are the right choice without a load balancer.
+        ({"HasLoadBalancer": False, "HealthCheckType": "EC2"}, False),
+        ({"HealthCheckType": "EC2"}, False),
+    ],
+)
+def test_cmp013_only_for_load_balanced_asgs(scan_db: ScanDB, metadata: dict, fires: bool):
+    assert _fires(scan_db, "ec2", "auto_scaling_group", metadata, "CMP-013") is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"launchType": "EC2"}, True),
+        ({"launchType": "FARGATE"}, False),
+        ({"launchType": None, "capacityProviderStrategy": ["my-ec2-provider"]}, True),
+        ({"launchType": None, "capacityProviderStrategy": ["FARGATE", "FARGATE_SPOT"]}, False),
+        ({"launchType": None, "capacityProviderStrategy": []}, False),
+        ({"ServiceCheckFailed": True, "capacityProviderStrategy": ["my-ec2-provider"]}, False),
+    ],
+)
+def test_cmp014_reads_capacity_providers(scan_db: ScanDB, metadata: dict, fires: bool):
+    assert _fires(scan_db, "ecs", "service", metadata, "CMP-014") is fires
+
+
+@pytest.mark.parametrize(
+    ("metadata", "rule_id", "fires"),
+    [
+        ({"DeadLetterConfig": None, "OnFailureDestination": None}, "CMP-011", True),
+        ({"DeadLetterConfig": {"TargetArn": "arn:sqs"}}, "CMP-011", False),
+        ({"DeadLetterConfig": None, "OnFailureDestination": "arn:sqs"}, "CMP-011", False),
+        ({"DestinationCheckFailed": True}, "CMP-011", False),
+        ({"DestinationCheckFailed": True}, "CMP-027", True),
+        ({"DestinationCheckFailed": False}, "CMP-027", False),
+    ],
+)
+def test_lambda_failure_destination_rules(
+    scan_db: ScanDB, metadata: dict, rule_id: str, fires: bool
+):
+    assert _fires(scan_db, "lambda", "function", metadata, rule_id) is fires
+
+
+_ALL_BLOCKED = {
+    "BlockPublicAcls": True, "IgnorePublicAcls": True,
+    "BlockPublicPolicy": True, "RestrictPublicBuckets": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("metadata", "fires"),
+    [
+        ({"PublicAccessBlock": {"BlockPublicAcls": True}}, True),
+        ({"PublicAccessBlock": {**_ALL_BLOCKED, "RestrictPublicBuckets": False}}, True),
+        ({"PublicAccessBlock": _ALL_BLOCKED}, False),
+        ({"PublicAccessBlock": None}, True),
+        ({"PublicAccessBlockCheckFailed": True, "PublicAccessBlock": None}, False),
+    ],
+)
+def test_dat003_requires_all_four_settings(scan_db: ScanDB, metadata: dict, fires: bool):
+    assert _fires(scan_db, "s3", "bucket", metadata, "DAT-003") is fires
 
 
 @pytest.mark.parametrize(

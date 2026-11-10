@@ -15,6 +15,7 @@
         "lambda:GetFunction",
         "lambda:GetFunctionConfiguration",
         "lambda:GetFunctionConcurrency",
+        "lambda:GetFunctionEventInvokeConfig",
         "rds:Describe*",
         "dynamodb:Describe*",
         "dynamodb:List*",

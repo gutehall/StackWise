@@ -30,7 +30,7 @@
   resource_type: bucket
   service: s3
   condition: |
-    not resource.get('PublicAccessBlockCheckFailed') and not (resource.get('PublicAccessBlock') or {}).get('BlockPublicAcls')
+    not resource.get('PublicAccessBlockCheckFailed') and not all(v is True for v in [(resource.get('PublicAccessBlock') or {}).get('BlockPublicAcls'), (resource.get('PublicAccessBlock') or {}).get('IgnorePublicAcls'), (resource.get('PublicAccessBlock') or {}).get('BlockPublicPolicy'), (resource.get('PublicAccessBlock') or {}).get('RestrictPublicBuckets')])
   remediation: >
     Enable Block Public Access to prevent accidental public exposure.
 
