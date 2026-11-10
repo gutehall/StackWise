@@ -98,7 +98,7 @@ def test_load_balancer_listener_protocols_are_collected(scan_db: ScanDB):
     ]
     assert len(lbs) == 1
     listeners = lbs[0].metadata["Listeners"]
-    assert listeners == [{"Protocol": "HTTP", "Port": 80}]
+    assert listeners == [{"Protocol": "HTTP", "Port": 80, "RedirectsToHttps": False}]
 
 
 @mock_aws
@@ -420,4 +420,39 @@ def test_top_level_api_failures_degrade_gracefully(scan_db: ScanDB):
         ("network", "describe_load_balancers"),
         ("network", "describe_nat_gateways"),
         ("network", "get_rest_apis"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("actions", "redirects"),
+    [
+        ([{"Type": "redirect", "RedirectConfig": {"Protocol": "HTTPS"}}], True),
+        ([{"Type": "redirect", "RedirectConfig": {"Protocol": "#{protocol}"}}], False),
+        ([{"Type": "forward"}], False),
+        ([], False),
+    ],
+    ids=["to-https", "keeps-protocol", "forward", "none"],
+)
+def test_listener_redirect_to_https_is_recorded(scan_db: ScanDB, actions: list, redirects: bool):
+    scan = scan_db.create_scan("123456789012", ["us-east-1"], ["network"])
+    elbv2 = MagicMock()
+    elbv2.describe_load_balancer_attributes.return_value = {"Attributes": []}
+
+    def _paginate(client, method, key, **kw):
+        if method == "describe_load_balancers":
+            return [{"LoadBalancerArn": "arn:lb", "LoadBalancerName": "lb",
+                     "Type": "application"}]
+        if method == "describe_listeners":
+            return [{"Protocol": "HTTP", "Port": 80, "DefaultActions": actions}]
+        return []
+
+    with (
+        patch("stackwise.scanner.network.regional_client", return_value=elbv2),
+        patch("stackwise.scanner.network.paginate", side_effect=_paginate),
+    ):
+        NetworkScanner()._scan_region(MagicMock(), scan_db, scan.id, "us-east-1")
+
+    lb = next(r for r in scan_db.get_resources(scan.id) if r.resource_type == "load_balancer")
+    assert lb.metadata["Listeners"] == [
+        {"Protocol": "HTTP", "Port": 80, "RedirectsToHttps": redirects}
     ]

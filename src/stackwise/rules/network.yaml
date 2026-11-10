@@ -24,28 +24,32 @@
 
 # Security Groups
 - id: NET-003
-  title: "Security group allows 0.0.0.0/0 on SSH (port 22)"
+  title: "Security group allows the internet on SSH (port 22)"
   severity: HIGH
   resource_type: security_group
   service: ec2
+  # Any rule whose port range contains 22, or that allows all protocols, from
+  # 0.0.0.0/0 or ::/0.
   condition: |
     any(
-      (perm.get('FromPort') == 22 or perm.get('ToPort') == 22) and
-      any(ipr.get('CidrIp') == '0.0.0.0/0' for ipr in (perm.get('IpRanges') or []))
+      (perm.get('IpProtocol') == '-1' or (perm.get('IpProtocol') in ('tcp', '6') and (perm.get('FromPort') or 0) <= 22 <= (perm.get('ToPort') or 0))) and
+      (any((r or {}).get('CidrIp') == '0.0.0.0/0' for r in (perm.get('IpRanges') or [])) or any((r or {}).get('CidrIpv6') == '::/0' for r in (perm.get('Ipv6Ranges') or [])))
       for perm in (resource.get('IpPermissions') or [])
     )
   remediation: >
     Restrict SSH access to specific IP ranges or use SSM Session Manager.
 
 - id: NET-004
-  title: "Security group allows 0.0.0.0/0 on RDP (port 3389)"
+  title: "Security group allows the internet on RDP (port 3389)"
   severity: HIGH
   resource_type: security_group
   service: ec2
+  # Any rule whose port range contains 3389, or that allows all protocols, from
+  # 0.0.0.0/0 or ::/0.
   condition: |
     any(
-      (perm.get('FromPort') == 3389 or perm.get('ToPort') == 3389) and
-      any(ipr.get('CidrIp') == '0.0.0.0/0' for ipr in (perm.get('IpRanges') or []))
+      (perm.get('IpProtocol') == '-1' or (perm.get('IpProtocol') in ('tcp', '6') and (perm.get('FromPort') or 0) <= 3389 <= (perm.get('ToPort') or 0))) and
+      (any((r or {}).get('CidrIp') == '0.0.0.0/0' for r in (perm.get('IpRanges') or [])) or any((r or {}).get('CidrIpv6') == '::/0' for r in (perm.get('Ipv6Ranges') or [])))
       for perm in (resource.get('IpPermissions') or [])
     )
   remediation: >
@@ -56,11 +60,13 @@
   severity: MEDIUM
   resource_type: security_group
   service: ec2
+  # A rule that also opens SSH or RDP is reported once, by the HIGH rule (NET-003/004).
   condition: |
     any(
-      ipr.get('CidrIp') == '0.0.0.0/0' or ipr.get('CidrIpv6') == '::/0'
+      (any((r or {}).get('CidrIp') == '0.0.0.0/0' for r in (perm.get('IpRanges') or [])) or any((r or {}).get('CidrIpv6') == '::/0' for r in (perm.get('Ipv6Ranges') or []))) and
+      not (perm.get('IpProtocol') == '-1' or (perm.get('IpProtocol') in ('tcp', '6') and (perm.get('FromPort') or 0) <= 22 <= (perm.get('ToPort') or 0))) and
+      not (perm.get('IpProtocol') == '-1' or (perm.get('IpProtocol') in ('tcp', '6') and (perm.get('FromPort') or 0) <= 3389 <= (perm.get('ToPort') or 0)))
       for perm in (resource.get('IpPermissions') or [])
-      for ipr in (perm.get('IpRanges') or []) + (perm.get('Ipv6Ranges') or [])
     )
   remediation: >
     Restrict ingress to minimum required CIDR blocks.
@@ -77,13 +83,16 @@
     Enable access logs for audit and troubleshooting.
 
 - id: NET-007
-  title: "Load balancer listener uses HTTP only"
+  title: "Application load balancer serves HTTP"
   severity: MEDIUM
   resource_type: load_balancer
   service: elbv2
+  # Any HTTP listener counts, even next to an HTTPS one, unless it only redirects to
+  # HTTPS. Network load balancers use TCP/UDP/TLS and aren't in scope.
   condition: |
-    not resource.get('ListenersCheckFailed') and bool(resource.get('Listeners')) and not any(
-      l.get('Protocol') in ('HTTPS', 'TLS') for l in (resource.get('Listeners') or [])
+    not resource.get('ListenersCheckFailed') and resource.get('Type') == 'application' and any(
+      (l or {}).get('Protocol') == 'HTTP' and not (l or {}).get('RedirectsToHttps')
+      for l in (resource.get('Listeners') or [])
     )
   remediation: >
     Use HTTPS listeners with ACM certificates for encrypted traffic.
@@ -119,16 +128,6 @@
     not resource.get('ThrottleCheckFailed') and (resource.get('Throttle') or {}).get('rateLimit') is None and (resource.get('Throttle') or {}).get('burstLimit') is None
   remediation: >
     Configure throttling to protect against abuse and control costs.
-
-- id: NET-011
-  title: "API Gateway REST API has no API key requirement"
-  severity: INFO
-  resource_type: rest_api
-  service: apigateway
-  condition: |
-    not resource.get('ApiKeySource') or resource.get('ApiKeySource') == 'HEADER'
-  remediation: >
-    Consider API keys or IAM auth for internal APIs to track usage.
 
 # Checks that could not run
 - id: NET-012

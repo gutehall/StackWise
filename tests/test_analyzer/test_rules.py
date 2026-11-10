@@ -499,8 +499,8 @@ _API = ("apigateway", "rest_api")
                "Attributes": [{"Key": "access_logs.s3.enabled", "Value": "false"}]},
          "NET-006", True),
         (_LB, {"AttributesCheckFailed": False, "Attributes": []}, "NET-008", True),
-        (_LB, {"ListenersCheckFailed": False, "Listeners": [{"Protocol": "HTTP", "Port": 80}]},
-         "NET-007", True),
+        (_LB, {"ListenersCheckFailed": False, "Type": "application",
+               "Listeners": [{"Protocol": "HTTP", "Port": 80}]}, "NET-007", True),
         (_API, {"ThrottleCheckFailed": False, "Throttle": {}}, "NET-010", True),
         # A correct setting doesn't fire.
         (_VPC, {"FlowLogsCheckFailed": False, "FlowLogsEnabled": True, "FlowLogs": [{}]},
@@ -1003,3 +1003,91 @@ def test_rules_match_the_resource_shape(scan_db: ScanDB, kind, metadata, rule_id
     evaluate_rules(load_rules(), scan_db, scan.id)
 
     assert any(f.rule_id == rule_id for f in scan_db.get_findings(scan.id)) is fires
+
+
+_SG = ("ec2", "security_group")
+
+
+def _perm(protocol: str, from_port=None, to_port=None, v4=True, v6=False) -> dict:
+    perm: dict = {"IpProtocol": protocol}
+    if from_port is not None:
+        perm.update(FromPort=from_port, ToPort=to_port)
+    if v4:
+        perm["IpRanges"] = [{"CidrIp": "0.0.0.0/0"}]
+    if v6:
+        perm["Ipv6Ranges"] = [{"CidrIpv6": "::/0"}]
+    return perm
+
+
+@pytest.mark.parametrize(
+    ("perms", "expected"),
+    [
+        ([_perm("tcp", 22, 22)], {"NET-003"}),
+        ([_perm("tcp", 0, 65535)], {"NET-003", "NET-004"}),
+        ([_perm("-1")], {"NET-003", "NET-004"}),
+        ([_perm("tcp", 22, 22, v4=False, v6=True)], {"NET-003"}),
+        ([_perm("tcp", 3389, 3389)], {"NET-004"}),
+        ([_perm("tcp", 443, 443)], {"NET-005"}),
+        ([_perm("tcp", 443, 443, v4=False, v6=True)], {"NET-005"}),
+        ([_perm("tcp", 22, 22), _perm("tcp", 443, 443)], {"NET-003", "NET-005"}),
+        # UDP 22 isn't SSH, so it's the generic open-ingress finding.
+        ([_perm("udp", 22, 22)], {"NET-005"}),
+        ([{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+           "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}], set()),
+    ],
+    ids=["ssh", "all-ports", "all-protocols", "ssh-ipv6", "rdp", "https", "https-ipv6",
+         "ssh-and-https", "udp-22", "private"],
+)
+def test_internet_ingress_is_reported_once_at_the_right_severity(
+    scan_db: ScanDB, perms: list, expected: set
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    scan_db.insert_resource(
+        scan.id, *_SG, "sg-1", "us-east-1", metadata={"IpPermissions": perms}
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    fired = [f.rule_id for f in scan_db.get_findings(scan.id)
+             if f.rule_id in ("NET-003", "NET-004", "NET-005")]
+    assert sorted(fired) == sorted(expected)
+
+
+@pytest.mark.parametrize(
+    ("lb_type", "listeners", "fires"),
+    [
+        ("network", [{"Protocol": "TCP"}, {"Protocol": "UDP"}], False),
+        ("application", [{"Protocol": "HTTP"}, {"Protocol": "HTTPS"}], True),
+        ("application", [{"Protocol": "HTTPS"}], False),
+        ("application", [{"Protocol": "HTTP", "RedirectsToHttps": True},
+                         {"Protocol": "HTTPS"}], False),
+        ("application", [{"Protocol": "HTTP", "RedirectsToHttps": False}], True),
+    ],
+    ids=["nlb-tcp", "alb-http-and-https", "alb-https", "alb-redirect", "alb-http"],
+)
+def test_net007_flags_alb_http_that_is_not_a_redirect(
+    scan_db: ScanDB, lb_type: str, listeners: list, fires: bool
+):
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    scan_db.insert_resource(
+        scan.id, "elbv2", "load_balancer", "lb", "us-east-1",
+        metadata={"Type": lb_type, "ListenersCheckFailed": False, "Listeners": listeners},
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert any(f.rule_id == "NET-007" for f in scan_db.get_findings(scan.id)) is fires
+
+
+def test_default_api_key_source_is_not_a_finding(scan_db: ScanDB):
+    """HEADER is the default and only says where to read a key, not that none is needed."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["network"])
+    scan_db.insert_resource(
+        scan.id, "apigateway", "rest_api", "api", "us-east-1",
+        metadata={"ApiKeySource": "HEADER", "ThrottleCheckFailed": False,
+                  "Throttle": {"rateLimit": 10, "burstLimit": 5}},
+    )
+
+    evaluate_rules(load_rules(), scan_db, scan.id)
+
+    assert scan_db.get_findings(scan.id) == []

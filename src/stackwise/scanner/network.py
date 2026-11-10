@@ -13,6 +13,15 @@ from stackwise.utils.aws import paginate, regional_client
 logger = logging.getLogger(__name__)
 
 
+def _redirects_to_https(listener: dict) -> bool:
+    actions = listener.get("DefaultActions") or []
+    return bool(actions) and all(
+        a.get("Type") == "redirect"
+        and (a.get("RedirectConfig") or {}).get("Protocol") == "HTTPS"
+        for a in actions
+    )
+
+
 class NetworkScanner(BaseScanner):
     """Scan VPCs, security groups, load balancers, NAT gateways, and API Gateway REST APIs."""
 
@@ -121,7 +130,13 @@ class NetworkScanner(BaseScanner):
                         elbv2, "describe_listeners", "Listeners", LoadBalancerArn=lb_arn
                     )
                     metadata["Listeners"] = [
-                        {"Protocol": lst.get("Protocol"), "Port": lst.get("Port")}
+                        {
+                            "Protocol": lst.get("Protocol"),
+                            "Port": lst.get("Port"),
+                            # The usual port-80 listener only redirects to HTTPS, which
+                            # serves nothing in cleartext.
+                            "RedirectsToHttps": _redirects_to_https(lst),
+                        }
                         for lst in listener_resp
                     ]
                 except Exception:
