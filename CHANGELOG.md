@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.2.0 — 2026-11-10
+
+### Breaking Changes
+- Scans exit 1 when a region or whole-service list call fails, and a failed scan is never published as `.latest` (PR #4)
+- Scan database files are now named `{timestamp}.{microseconds}-{suffix}.db`, and report files include the scan id (PR #4, #8)
+- The first `diff` against a scan from an older version shows every tagged resource as removed and re-added, because they are now keyed by full ARN (PR #6)
+- `analyze` exits 1 on a broken packaged rules file, or when an explicitly requested engine (`--engine mlx`, or `--engine ollama` with Ollama down) can't run (PR #7, #8)
+- `report --format pdf` exits 1 when WeasyPrint can't write a PDF, instead of silently writing HTML (PR #8)
+- Rules `CST-001` and `NET-011` are removed; suppressions of them do nothing (PR #8)
+- New IAM permissions: `lambda:GetFunctionConcurrency` and `lambda:GetFunctionEventInvokeConfig`; redeploy the role from `docs/` (PR #6, #8)
+
+### Changes
+- PR #4: Trust the scan result: fail partial scans and keep them out of diff
+- PR #5: Stop false findings from API errors: flag failed checks instead of reporting them
+- PR #6: Match rules to live AWS fields: read what the API returns, key tagged resources by ARN
+- PR #7: Make analyze safe to re-run: one transaction, and fail on broken packaged rules
+- PR #8: Reliability follow-ups: rules match the real case, reports and commands fail honestly
+- PR #9: Show a partial LLM run in the HTML reports
+
+### Documentation
+- commit: 79a0082 Update CLAUDE.md for the engine selection change in DM3-361
+- commit: 93b9f7b Add the MIT license.
+
+### Chores
+- commit: 9b41f53 Update CHANGELOG.md for v0.1.1
+
 ## v0.1.1 — 2026-08-26
 
 ### Bug Fixes

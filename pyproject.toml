@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stackwise"
-version = "0.1.0"
+version = "0.2.0"
 description = "AWS infrastructure scanner with local AI-powered recommendations"
 readme = "README.md"
 requires-python = ">=3.11"
