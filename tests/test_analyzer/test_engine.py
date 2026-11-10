@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from stackwise.analyzer.engine import _run_llm_analysis, run_analysis
 from stackwise.config import Engine, Settings
@@ -248,3 +251,106 @@ def test_run_analysis_full_success_path_runs_llm(scan_db: ScanDB, tmp_path: Path
 
     assert "llm_recommendations" in result
     mock_client.generate.assert_called()
+
+
+def _scan_with_insecure_instances(scan_db: ScanDB, n: int = 3) -> str:
+    """Instances that allow IMDSv1, so CMP-008 produces one finding each."""
+    scan = scan_db.create_scan("123", ["us-east-1"], ["compute"])
+    for i in range(n):
+        scan_db.insert_resource(
+            scan.id, "ec2", "instance", f"i-{i}", "us-east-1",
+            metadata={"InstanceId": f"i-{i}", "MetadataOptions": {"HttpTokens": "optional"}},
+        )
+    return scan.id
+
+
+def _imds_findings(scan_db: ScanDB, scan_id: str) -> list:
+    return [f for f in scan_db.get_findings(scan_id) if f.rule_id == "CMP-008"]
+
+
+def _llm_client(titles: list[str]) -> MagicMock:
+    client = MagicMock()
+    client.is_available.return_value = True
+    client.ensure_model.return_value = True
+    client.generate.return_value = "raw"
+    client.parse_recommendations.return_value = [{"title": t} for t in titles]
+    return client
+
+
+def test_running_analysis_twice_keeps_one_set_of_findings(scan_db: ScanDB, tmp_path: Path):
+    settings = Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise")
+    scan_id = _scan_with_insecure_instances(scan_db)
+
+    run_analysis(settings, scan_db, scan_id)
+    first = len(scan_db.get_findings(scan_id))
+    run_analysis(settings, scan_db, scan_id)
+
+    assert first > 0
+    assert len(scan_db.get_findings(scan_id)) == first
+    assert len(_imds_findings(scan_db, scan_id)) == 3
+
+
+def test_a_failed_insert_keeps_the_previous_findings(scan_db: ScanDB, tmp_path: Path):
+    settings = Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise")
+    scan_id = _scan_with_insecure_instances(scan_db)
+    run_analysis(settings, scan_db, scan_id)
+    before = sorted(f.id for f in scan_db.get_findings(scan_id))
+
+    real_insert = scan_db.insert_finding
+    calls = []
+
+    def _fail_on_second(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_insert(*args, **kwargs)
+
+    with (
+        patch.object(scan_db, "insert_finding", side_effect=_fail_on_second),
+        pytest.raises(sqlite3.OperationalError, match="disk I/O error"),
+    ):
+        run_analysis(settings, scan_db, scan_id)
+
+    assert sorted(f.id for f in scan_db.get_findings(scan_id)) == before
+
+
+def test_a_failed_llm_phase_keeps_the_previous_findings_and_recommendations(
+    scan_db: ScanDB, tmp_path: Path
+):
+    """The new findings were already written in this transaction; they must go too."""
+    settings = Settings(engine=Engine.OLLAMA, data_dir=tmp_path / "stackwise")
+    scan_id = _scan_with_insecure_instances(scan_db)
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=_llm_client(["Old"])):
+        run_analysis(settings, scan_db, scan_id)
+    before = sorted(f.id for f in scan_db.get_findings(scan_id))
+
+    broken = _llm_client([])
+    broken.generate.side_effect = RuntimeError("connection reset")
+    with (
+        patch("stackwise.analyzer.engine.OllamaClient", return_value=broken),
+        pytest.raises(RuntimeError, match="connection reset"),
+    ):
+        run_analysis(settings, scan_db, scan_id)
+
+    assert sorted(f.id for f in scan_db.get_findings(scan_id)) == before
+    assert [r.title for r in scan_db.get_recommendations(scan_id)] == ["Old"]
+
+
+def test_llm_recommendations_are_replaced_only_when_the_llm_runs(
+    scan_db: ScanDB, tmp_path: Path
+):
+    scan_id = _scan_with_insecure_instances(scan_db)
+    scan_db.insert_recommendation(scan_id=scan_id, source="rule", category="x", title="Rule rec")
+    ollama = Settings(engine=Engine.OLLAMA, data_dir=tmp_path / "stackwise")
+
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=_llm_client(["First"])):
+        run_analysis(ollama, scan_db, scan_id)
+    with patch("stackwise.analyzer.engine.OllamaClient", return_value=_llm_client(["Second"])):
+        run_analysis(ollama, scan_db, scan_id)
+    assert sorted(r.title for r in scan_db.get_recommendations(scan_id)) == ["Rule rec", "Second"]
+
+    # A rules-only run produces no recommendations, so it must not delete these.
+    run_analysis(
+        Settings(engine=Engine.RULES_ONLY, data_dir=tmp_path / "stackwise"), scan_db, scan_id
+    )
+    assert sorted(r.title for r in scan_db.get_recommendations(scan_id)) == ["Rule rec", "Second"]

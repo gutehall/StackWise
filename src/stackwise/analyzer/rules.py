@@ -236,23 +236,26 @@ def evaluate_rules(
                     {"__builtins__": _SAFE_BUILTINS},
                     {"resource": res.metadata},
                 )
-                if result:
-                    db.insert_finding(
-                        scan_id=scan_id,
-                        severity=rule.severity,
-                        title=rule.title,
-                        resource_id=res.id,
-                        rule_id=rule.id,
-                        detail=f"Resource {res.resource_id} in {res.region}",
-                        remediation=rule.remediation,
-                    )
-                    findings_count += 1
             except Exception:
                 logger.warning(
                     "Rule %s failed on resource %s: %s",
                     rule.id, res.resource_id, rule.condition,
                     exc_info=True,
                 )
+                continue
+            # Outside the try: a failed write must abort the analysis, not be logged as
+            # a broken rule while a partial set of findings gets committed.
+            if result:
+                db.insert_finding(
+                    scan_id=scan_id,
+                    severity=rule.severity,
+                    title=rule.title,
+                    resource_id=res.id,
+                    rule_id=rule.id,
+                    detail=f"Resource {res.resource_id} in {res.region}",
+                    remediation=rule.remediation,
+                )
+                findings_count += 1
 
     logger.info("Rule evaluation produced %d findings", findings_count)
     return findings_count
